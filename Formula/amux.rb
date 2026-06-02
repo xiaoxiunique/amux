@@ -1,7 +1,7 @@
 class Amux < Formula
   desc "Run AI coding agents in per-directory persistent tmux sessions"
-  homepage "https://github.com/<you>/amux"
-  url "https://github.com/<you>/amux/archive/refs/tags/v0.1.0.tar.gz"
+  homepage "https://github.com/xiaoxiunique/amux"
+  url "https://github.com/xiaoxiunique/amux/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "<fill-after-tagging>"
   license "MIT"
   depends_on "rust" => :build

@@ -10,7 +10,7 @@ the live session instead of starting a new one.
 ## Install
 
 ```bash
-brew tap <you>/amux
+brew tap xiaoxiunique/amux
 brew install amux
 amux init   # installs cc / cx aliases into your shell rc
 ```
