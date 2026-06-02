@@ -30,9 +30,15 @@ pub fn builtin_agents() -> Vec<Agent> {
     ]
 }
 
-/// Default config path: `$XDG_CONFIG_HOME/amux/config.toml` or `~/.config/amux/config.toml`.
+/// Default config path: `$XDG_CONFIG_HOME/amux/config.toml`, else
+/// `~/.config/amux/config.toml` (XDG layout on all platforms, including macOS).
 pub fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("amux").join("config.toml"))
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("amux").join("config.toml"));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".config").join("amux").join("config.toml"))
 }
 
 pub fn parse_config(toml_str: &str) -> Result<Vec<Agent>> {
