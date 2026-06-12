@@ -20,8 +20,12 @@
     --fg-muted: #008f22;
     --fg-faint: #004d12;
     --surface: #111;
+    --surface2: #1a1a1a;
     --border: #1a3a1a;
     --white: #c8c8c8;
+    --yellow: #ffbd2e;
+    --blue: #61afef;
+    --red: #ff5f57;
     --font: 'JetBrains Mono', 'Fira Mono', 'Cascadia Code', 'SF Mono', monospace;
   }
 
@@ -37,67 +41,184 @@
   }
 
   ::selection { background: var(--fg); color: var(--bg); }
-
   a { color: var(--fg); text-decoration: none; }
   a:hover { text-decoration: underline; }
-
-  .container {
-    max-width: 820px;
-    margin: 0 auto;
-    padding: 0 24px;
-  }
+  .container { max-width: 900px; margin: 0 auto; padding: 0 24px; }
 
   /* ── Nav ── */
   nav {
-    position: sticky;
-    top: 0;
-    z-index: 10;
+    position: sticky; top: 0; z-index: 20;
     background: rgba(10,10,10,0.92);
     backdrop-filter: blur(8px);
     border-bottom: 1px solid var(--border);
     padding: 14px 0;
   }
-  nav .container {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
+  nav .container { display: flex; justify-content: space-between; align-items: center; }
   nav .logo { font-weight: 700; font-size: 18px; letter-spacing: 2px; }
   nav .links { display: flex; gap: 24px; font-size: 13px; }
   nav .links a { color: var(--fg-dim); }
   nav .links a:hover { color: var(--fg); }
 
   /* ── Hero ── */
-  .hero {
-    padding: 100px 0 80px;
-    text-align: center;
-  }
+  .hero { padding: 60px 0 20px; text-align: center; }
   .hero h1 {
-    font-size: clamp(36px, 8vw, 64px);
+    font-size: clamp(36px, 8vw, 56px);
     letter-spacing: 6px;
-    margin-bottom: 16px;
+    margin-bottom: 12px;
     text-shadow: 0 0 30px rgba(0,255,65,0.3);
   }
   .hero .tagline {
-    font-size: clamp(14px, 3vw, 18px);
+    font-size: clamp(13px, 2.5vw, 16px);
     color: var(--fg-dim);
-    margin-bottom: 40px;
+    margin-bottom: 24px;
     max-width: 560px;
-    margin-left: auto;
-    margin-right: auto;
+    margin-left: auto; margin-right: auto;
   }
-  .hero .install-cmd {
-    display: inline-block;
-    background: var(--surface);
+  .hero .hint {
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin-top: 12px;
+  }
+  .hero .hint kbd {
+    background: var(--surface2);
     border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 14px 28px;
-    font-size: 15px;
-    cursor: pointer;
-    transition: border-color 0.2s;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 11px;
   }
-  .hero .install-cmd:hover { border-color: var(--fg-muted); }
-  .hero .install-cmd .prompt { color: var(--fg-muted); }
+
+  /* ── tmux simulation ── */
+  .tmux-window {
+    background: var(--bg);
+    border: 2px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin: 0 auto;
+    max-width: 900px;
+    position: relative;
+  }
+  .tmux-titlebar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px;
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .dot.r { background: #ff5f57; }
+  .dot.y { background: #ffbd2e; }
+  .dot.g { background: #28c840; }
+  .tmux-titlebar .title { flex: 1; text-align: center; font-size: 12px; color: #555; }
+
+  .tmux-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    height: 420px;
+  }
+  .pane {
+    border: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+  .pane.active { border-color: var(--fg-muted); }
+  .pane-body {
+    flex: 1;
+    padding: 12px;
+    font-size: 12px;
+    line-height: 1.6;
+    overflow: hidden;
+    color: var(--fg-dim);
+  }
+  .pane-status {
+    padding: 2px 8px;
+    font-size: 10px;
+    background: var(--surface2);
+    border-top: 1px solid var(--border);
+    color: var(--fg-muted);
+    display: flex;
+    justify-content: space-between;
+  }
+  .pane-status .session-name { color: var(--yellow); }
+
+  .pane-body .p { color: var(--fg-muted); }
+  .pane-body .c { color: var(--fg); }
+  .pane-body .o { color: #555; }
+  .pane-body .h { color: var(--yellow); }
+  .pane-body .b { color: var(--blue); }
+  .pane-body .cursor {
+    display: inline-block; width: 7px; height: 14px;
+    background: var(--fg); vertical-align: text-bottom;
+    animation: blink 1s step-end infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* tmux status bar */
+  .tmux-statusbar {
+    display: flex;
+    justify-content: space-between;
+    padding: 4px 12px;
+    font-size: 11px;
+    background: var(--fg-muted);
+    color: var(--bg);
+  }
+  .tmux-statusbar .tabs span {
+    padding: 0 8px;
+  }
+  .tmux-statusbar .tabs .active-tab {
+    background: var(--fg);
+    color: var(--bg);
+    font-weight: 700;
+  }
+
+  /* ── fzf popup overlay ── */
+  .fzf-overlay {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 320px;
+    background: var(--surface);
+    border: 2px solid var(--fg-muted);
+    border-radius: 8px;
+    z-index: 10;
+    display: none;
+    box-shadow: 0 0 40px rgba(0,255,65,0.15);
+  }
+  .fzf-overlay.visible { display: block; animation: popIn 0.15s ease-out; }
+  @keyframes popIn { from { transform: translate(-50%,-50%) scale(0.92); opacity:0; } }
+
+  .fzf-header {
+    padding: 8px 12px;
+    font-size: 11px;
+    color: var(--fg-dim);
+    border-bottom: 1px solid var(--border);
+  }
+  .fzf-list { padding: 4px 0; }
+  .fzf-item {
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--fg-dim);
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .fzf-item:hover { background: var(--surface2); }
+  .fzf-item.selected {
+    background: var(--fg);
+    color: var(--bg);
+    font-weight: 700;
+  }
+  .fzf-input {
+    padding: 8px 12px;
+    font-size: 11px;
+    color: var(--fg-muted);
+    border-top: 1px solid var(--border);
+  }
+
+  /* ── Sections ── */
+  section { padding: 60px 0; }
+  section h2 { font-size: 24px; margin-bottom: 8px; letter-spacing: 1px; }
+  section h2::before { content: '# '; color: var(--fg-muted); }
+  section .subtitle { color: var(--fg-muted); font-size: 14px; margin-bottom: 32px; }
 
   /* ── Terminal block ── */
   .terminal {
@@ -105,32 +226,17 @@
     border: 1px solid var(--border);
     border-radius: 10px;
     overflow: hidden;
-    margin: 32px 0;
+    margin: 24px 0;
   }
   .terminal-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
+    display: flex; align-items: center; gap: 8px;
     padding: 10px 16px;
-    background: #1a1a1a;
+    background: var(--surface2);
     border-bottom: 1px solid var(--border);
   }
-  .terminal-dot {
-    width: 12px; height: 12px;
-    border-radius: 50%;
-  }
-  .terminal-dot.r { background: #ff5f57; }
-  .terminal-dot.y { background: #ffbd2e; }
-  .terminal-dot.g { background: #28c840; }
-  .terminal-title {
-    flex: 1;
-    text-align: center;
-    font-size: 12px;
-    color: #555;
-  }
   .terminal-body {
-    padding: 20px;
-    font-size: 14px;
+    padding: 16px 20px;
+    font-size: 13px;
     line-height: 1.8;
     overflow-x: auto;
   }
@@ -138,60 +244,27 @@
   .terminal-body .cmd { color: var(--fg); }
   .terminal-body .output { color: #666; }
   .terminal-body .comment { color: #444; }
-  .terminal-body .highlight { color: #ffbd2e; }
-
-  /* ── Cursor blink ── */
-  .cursor {
-    display: inline-block;
-    width: 8px;
-    height: 17px;
-    background: var(--fg);
-    vertical-align: text-bottom;
-    animation: blink 1s step-end infinite;
-  }
-  @keyframes blink { 50% { opacity: 0; } }
-
-  /* ── Sections ── */
-  section { padding: 60px 0; }
-  section h2 {
-    font-size: 24px;
-    margin-bottom: 8px;
-    letter-spacing: 1px;
-  }
-  section h2::before {
-    content: '# ';
-    color: var(--fg-muted);
-  }
-  section .subtitle {
-    color: var(--fg-muted);
-    font-size: 14px;
-    margin-bottom: 32px;
-  }
+  .terminal-body .highlight { color: var(--yellow); }
 
   /* ── Feature grid ── */
-  .features {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 20px;
-  }
+  .features { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   .feature {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 24px;
+    padding: 20px;
     transition: border-color 0.2s;
   }
   .feature:hover { border-color: var(--fg-muted); }
-  .feature .icon { font-size: 24px; margin-bottom: 12px; }
-  .feature h3 { font-size: 15px; margin-bottom: 8px; color: var(--fg); }
-  .feature p { font-size: 13px; color: var(--fg-dim); line-height: 1.6; }
+  .feature .icon { font-size: 20px; margin-bottom: 8px; }
+  .feature h3 { font-size: 14px; margin-bottom: 6px; color: var(--fg); }
+  .feature p { font-size: 12px; color: var(--fg-dim); line-height: 1.6; }
 
-  /* ── Config ── */
-  .config-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 20px;
-  }
+  /* ── Config grid ── */
+  .config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+  /* ── Divider ── */
+  .divider { border: none; border-top: 1px solid var(--border); margin: 0; }
 
   /* ── Footer ── */
   footer {
@@ -203,24 +276,18 @@
   }
   footer a { color: var(--fg-dim); }
 
-  /* ── Divider ── */
-  .divider {
-    border: none;
-    border-top: 1px solid var(--border);
-    margin: 0;
-  }
-
   /* ── Responsive ── */
   @media (max-width: 640px) {
+    .tmux-grid { grid-template-columns: 1fr; grid-template-rows: repeat(4, 1fr); height: 600px; }
     .features, .config-grid { grid-template-columns: 1fr; }
-    .hero { padding: 60px 0 50px; }
-    nav .links { gap: 16px; font-size: 12px; }
+    .hero { padding: 40px 0 16px; }
+    nav .links { gap: 14px; font-size: 12px; }
+    .fzf-overlay { width: 260px; }
   }
 </style>
 </head>
 <body>
 
-<!-- Nav -->
 <nav>
   <div class="container">
     <div class="logo">amux</div>
@@ -237,49 +304,84 @@
 <div class="hero">
   <div class="container">
     <h1>amux</h1>
-    <p class="tagline">
-      Agent Multiplexer — run AI coding agents in persistent,
-      per-directory tmux sessions. One command to start, one command to resume.
-    </p>
-    <div class="install-cmd" onclick="navigator.clipboard.writeText('brew install xiaoxiunique/amux/amux')" title="Click to copy">
-      <span class="prompt">$ </span>brew install xiaoxiunique/amux/amux
-    </div>
+    <p class="tagline">Agent Multiplexer — persistent tmux sessions for AI coding agents.</p>
   </div>
 </div>
 
-<!-- Quick demo -->
+<!-- Interactive tmux demo -->
 <div class="container">
-  <div class="terminal">
-    <div class="terminal-bar">
-      <div class="terminal-dot r"></div>
-      <div class="terminal-dot y"></div>
-      <div class="terminal-dot g"></div>
-      <div class="terminal-title">ghostty — ~/projects/myapp</div>
+  <div class="tmux-window" id="tmux">
+    <div class="tmux-titlebar">
+      <div class="dot r"></div>
+      <div class="dot y"></div>
+      <div class="dot g"></div>
+      <div class="title">ghostty — ~/projects</div>
     </div>
-    <div class="terminal-body">
-      <span class="prompt">$ </span><span class="cmd">amux init</span><br>
-      <span class="output">Installed shell aliases into ~/.zshrc</span><br>
-      <span class="output">Installed tmux keybindings into ~/.tmux.conf.local</span><br>
-      <span class="output">Installed Ghostty keybindings into ~/Library/.../ghostty/config</span><br>
-      <br>
-      <span class="prompt">$ </span><span class="cmd">cc</span>
-      <span class="comment"> # launches Claude Code in a tmux session</span><br>
-      <span class="output">Attaching to session cc_myapp_1a2b3c4d...</span><br>
-      <br>
-      <span class="comment"># detach with Ctrl-b d, come back any time:</span><br>
-      <span class="prompt">$ </span><span class="cmd">cc</span>
-      <span class="comment"> # resumes the exact same session</span><br>
-      <br>
-      <span class="prompt">$ </span><span class="cmd">cx</span>
-      <span class="comment"> # Codex gets its own session, same dir</span><br>
-      <br>
-      <span class="prompt">$ </span><span class="cmd">amux ls</span><br>
-      <span class="output">SESSION                      AGENT</span><br>
-      <span class="output">cc_myapp_1a2b3c4d            claude</span><br>
-      <span class="output">cx_myapp_7e8f9a0b            codex</span><br>
-      <span class="prompt">$ </span><span class="cursor"></span>
+
+    <div class="tmux-grid">
+      <!-- Pane 0: cc_myapp -->
+      <div class="pane active" id="pane0">
+        <div class="pane-body" id="pb0"></div>
+        <div class="pane-status">
+          <span class="session-name" id="sn0">cc_myapp_1a2b3c4d</span>
+          <span>claude</span>
+        </div>
+      </div>
+
+      <!-- Pane 1: cx_myapp -->
+      <div class="pane" id="pane1">
+        <div class="pane-body" id="pb1"></div>
+        <div class="pane-status">
+          <span class="session-name" id="sn1">cx_myapp_7e8f9a0b</span>
+          <span>codex</span>
+        </div>
+      </div>
+
+      <!-- Pane 2: cc_server -->
+      <div class="pane" id="pane2">
+        <div class="pane-body" id="pb2"></div>
+        <div class="pane-status">
+          <span class="session-name" id="sn2">cc_server_e5f6a7b8</span>
+          <span>claude</span>
+        </div>
+      </div>
+
+      <!-- Pane 3: cc_api -->
+      <div class="pane" id="pane3">
+        <div class="pane-body" id="pb3"></div>
+        <div class="pane-status">
+          <span class="session-name" id="sn3">cc_api_d4e5f6a7</span>
+          <span>claude</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- fzf popup overlay -->
+    <div class="fzf-overlay" id="fzf">
+      <div class="fzf-header">switch session</div>
+      <div class="fzf-list" id="fzf-list">
+        <div class="fzf-item selected" data-s="cc_myapp_1a2b3c4d" data-a="claude">❯ cc_myapp_1a2b3c4d</div>
+        <div class="fzf-item" data-s="cx_myapp_7e8f9a0b" data-a="codex">&nbsp; cx_myapp_7e8f9a0b</div>
+        <div class="fzf-item" data-s="cc_server_e5f6a7b8" data-a="claude">&nbsp; cc_server_e5f6a7b8</div>
+        <div class="fzf-item" data-s="cc_api_d4e5f6a7" data-a="claude">&nbsp; cc_api_d4e5f6a7</div>
+      </div>
+      <div class="fzf-input">&gt; <span class="cursor"></span></div>
+    </div>
+
+    <div class="tmux-statusbar">
+      <div class="tabs">
+        <span class="active-tab">0:cc</span>
+        <span>1:cx</span>
+        <span>2:cc</span>
+        <span>3:cc</span>
+      </div>
+      <div>⇧⌘O switch session</div>
     </div>
   </div>
+
+  <p style="text-align:center; margin-top:12px; font-size:12px; color:var(--fg-muted);">
+    Press <kbd style="background:var(--surface2);border:1px solid var(--border);border-radius:4px;padding:2px 6px;font-size:11px;">⇧⌘O</kbd> or click any pane to try the session switcher
+  </p>
 </div>
 
 <!-- Features -->
@@ -296,22 +398,22 @@
       <div class="feature">
         <div class="icon">⌨️</div>
         <h3>Session Switcher</h3>
-        <p>Press <code>Shift+Cmd+O</code> in Ghostty to pop up an fzf selector. Switch any pane to any agent session instantly.</p>
+        <p>Press <code>⇧⌘O</code> in Ghostty to pop up an fzf selector. Switch any pane to any agent session instantly.</p>
       </div>
       <div class="feature">
         <div class="icon">🖥️</div>
         <h3>TUI Session Manager</h3>
-        <p>Run <code>amux</code> for an interactive picker. Filter, attach, kill, or start new agent sessions with vim keys.</p>
+        <p>Run <code>amux</code> for an interactive picker. Filter, attach, kill, or start new sessions with vim keys.</p>
       </div>
       <div class="feature">
         <div class="icon">🔧</div>
         <h3>Custom Agents</h3>
-        <p>Built-in Claude Code & Codex. Add Gemini, Aider, or any CLI agent via a simple TOML config.</p>
+        <p>Built-in Claude Code &amp; Codex. Add Gemini, Aider, or any CLI agent via a simple TOML config.</p>
       </div>
       <div class="feature">
         <div class="icon">📂</div>
         <h3>Per-Directory Isolation</h3>
-        <p>Same agent + same directory = same session. Different directories are fully isolated. No collisions.</p>
+        <p>Same agent + same directory = same session. Different directories are fully isolated.</p>
       </div>
       <div class="feature">
         <div class="icon">⚡</div>
@@ -331,98 +433,31 @@
     <p class="subtitle">Two commands. Under a minute.</p>
     <div class="terminal">
       <div class="terminal-bar">
-        <div class="terminal-dot r"></div>
-        <div class="terminal-dot y"></div>
-        <div class="terminal-dot g"></div>
-        <div class="terminal-title">terminal</div>
+        <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
       </div>
       <div class="terminal-body">
         <span class="comment"># install via Homebrew</span><br>
         <span class="prompt">$ </span><span class="cmd">brew tap xiaoxiunique/amux</span><br>
         <span class="prompt">$ </span><span class="cmd">brew install amux</span><br>
         <br>
-        <span class="comment"># set up aliases + keybindings</span><br>
+        <span class="comment"># set up aliases + tmux/Ghostty keybindings</span><br>
         <span class="prompt">$ </span><span class="cmd">amux init</span><br>
+        <span class="output">Installed shell aliases into ~/.zshrc</span><br>
+        <span class="output">Installed tmux keybindings into ~/.tmux.conf.local</span><br>
+        <span class="output">Installed Ghostty keybindings into ~/Library/.../ghostty/config</span><br>
         <br>
-        <span class="comment"># reload shell and go</span><br>
-        <span class="prompt">$ </span><span class="cmd">source ~/.zshrc</span><br>
-        <span class="prompt">$ </span><span class="cmd">cc</span>
-        <span class="comment"> # Claude Code is running ✓</span><br>
+        <span class="comment"># reload and go</span><br>
+        <span class="prompt">$ </span><span class="cmd">source ~/.zshrc && cc</span>
+        <span class="comment"> # Claude Code is running ✓</span>
       </div>
     </div>
-
-    <div class="terminal" style="margin-top: 16px;">
+    <div class="terminal" style="margin-top:12px;">
       <div class="terminal-bar">
-        <div class="terminal-dot r"></div>
-        <div class="terminal-dot y"></div>
-        <div class="terminal-dot g"></div>
-        <div class="terminal-title">or build from source</div>
+        <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
       </div>
       <div class="terminal-body">
-        <span class="prompt">$ </span><span class="cmd">cargo install --git https://github.com/xiaoxiunique/amux</span><br>
-        <span class="prompt">$ </span><span class="cmd">amux init</span><br>
-      </div>
-    </div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<!-- Session Switcher -->
-<section>
-  <div class="container">
-    <h2>Session Switcher</h2>
-    <p class="subtitle">Split your terminal, switch sessions on any pane.</p>
-
-    <div class="terminal">
-      <div class="terminal-bar">
-        <div class="terminal-dot r"></div>
-        <div class="terminal-dot y"></div>
-        <div class="terminal-dot g"></div>
-        <div class="terminal-title">ghostty — split panes</div>
-      </div>
-      <div class="terminal-body">
-<pre style="color:var(--fg-muted); line-height:1.5;">┌─────────────────────┬─────────────────────┐
-│  cc_myapp_1a2b3c4d  │  cx_myapp_7e8f9a0b  │
-│  <span class="highlight">Claude Code</span>         │  <span class="highlight">Codex</span>               │
-│                     │                     │
-├─────────────────────┼─────────────────────┤
-│  cc_server_e5f6a7b8 │  ┌───────────────┐  │
-│  <span class="highlight">Claude Code</span>         │  │ <span style="color:var(--fg);">switch session</span> │  │
-│                     │  │ <span style="color:var(--fg);">❯ cc_myapp_..  </span>│  │
-│                     │  │   cx_myapp_..  │  │
-│                     │  │   cc_server_.. │  │
-│                     │  └───────────────┘  │
-└─────────────────────┴─────────────────────┘</pre>
-        <br>
-        <span class="comment"># Press <span class="highlight">Shift+Cmd+O</span> in any pane → fzf popup → select → switched</span><br>
-        <span class="comment"># Installed automatically by `amux init` (requires fzf + Ghostty)</span>
-      </div>
-    </div>
-  </div>
-</section>
-
-<hr class="divider">
-
-<!-- Commands -->
-<section>
-  <div class="container">
-    <h2>Commands</h2>
-    <p class="subtitle">Simple CLI, no surprises.</p>
-    <div class="terminal">
-      <div class="terminal-bar">
-        <div class="terminal-dot r"></div>
-        <div class="terminal-dot y"></div>
-        <div class="terminal-dot g"></div>
-        <div class="terminal-title">terminal</div>
-      </div>
-      <div class="terminal-body">
-        <span class="cmd">amux run &lt;agent&gt;</span> <span class="comment"> # launch or reattach agent in cwd</span><br>
-        <span class="cmd">amux init</span>          <span class="comment"> # install aliases + keybindings</span><br>
-        <span class="cmd">amux ls</span>            <span class="comment"> # list managed sessions</span><br>
-        <span class="cmd">amux kill &lt;name&gt;</span>  <span class="comment"> # kill a session</span><br>
-        <span class="cmd">amux config</span>        <span class="comment"> # show resolved config</span><br>
-        <span class="cmd">amux</span>               <span class="comment"> # open TUI session selector</span><br>
+        <span class="comment"># or build from source</span><br>
+        <span class="prompt">$ </span><span class="cmd">cargo install --git https://github.com/xiaoxiunique/amux</span>
       </div>
     </div>
   </div>
@@ -438,13 +473,11 @@
     <div class="config-grid">
       <div class="terminal">
         <div class="terminal-bar">
-          <div class="terminal-dot r"></div>
-          <div class="terminal-dot y"></div>
-          <div class="terminal-dot g"></div>
-          <div class="terminal-title">~/.config/amux/config.toml</div>
+          <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
         </div>
         <div class="terminal-body">
-<span class="comment"># Add a custom agent</span>
+<span class="comment"># ~/.config/amux/config.toml</span>
+
 <span class="highlight">[[agent]]</span>
 name    = <span style="color:#98c379;">"gemini"</span>
 alias   = <span style="color:#98c379;">"cg"</span>
@@ -458,21 +491,17 @@ command = [<span style="color:#98c379;">"aider"</span>]
       </div>
       <div class="terminal">
         <div class="terminal-bar">
-          <div class="terminal-dot r"></div>
-          <div class="terminal-dot y"></div>
-          <div class="terminal-dot g"></div>
-          <div class="terminal-title">built-in agents</div>
+          <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
         </div>
         <div class="terminal-body">
-<span class="comment"># These work with no config:</span>
+<span class="comment"># built-in agents (no config needed)</span>
 
 <span class="highlight">cc</span>  → claude --dangerously-skip-permissions
 <span class="highlight">cx</span>  → codex --yolo
 
-<span class="comment"># Override by adding an [[agent]]</span>
-<span class="comment"># with the same name.</span>
-<span class="comment"># New names are appended.</span>
-<span class="comment"># Re-run `amux init` to update aliases.</span>
+<span class="comment"># same name overrides builtin</span>
+<span class="comment"># new names are appended</span>
+<span class="comment"># re-run `amux init` to update</span>
         </div>
       </div>
     </div>
@@ -481,67 +510,27 @@ command = [<span style="color:#98c379;">"aider"</span>]
 
 <hr class="divider">
 
-<!-- How it works -->
+<!-- Commands -->
 <section>
   <div class="container">
-    <h2>How It Works</h2>
-    <p class="subtitle">Deterministic session naming. No magic.</p>
+    <h2>Commands</h2>
+    <p class="subtitle">Simple CLI, no surprises.</p>
     <div class="terminal">
       <div class="terminal-bar">
-        <div class="terminal-dot r"></div>
-        <div class="terminal-dot y"></div>
-        <div class="terminal-dot g"></div>
-        <div class="terminal-title">session naming</div>
+        <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
       </div>
       <div class="terminal-body">
-<span class="comment"># Session name = &lt;alias&gt;_&lt;dirslug&gt;_&lt;sha256[:8]&gt;</span>
-
-<span class="prompt">~/projects/myapp $ </span><span class="cmd">cc</span>
-<span class="output">→ session: cc_myapp_1a2b3c4d</span>
-
-<span class="prompt">~/projects/myapp $ </span><span class="cmd">cx</span>
-<span class="output">→ session: cx_myapp_7e8f9a0b</span>
-
-<span class="prompt">~/projects/server $ </span><span class="cmd">cc</span>
-<span class="output">→ session: cc_server_e5f6a7b8</span>
-
-<span class="comment"># Same agent + same directory = same session, always.</span>
-<span class="comment"># SHA-256 of the absolute path guarantees no collisions.</span>
+        <span class="cmd">amux run &lt;agent&gt;</span> <span class="comment"> # launch or reattach agent in cwd</span><br>
+        <span class="cmd">amux init</span>          <span class="comment"> # install aliases + keybindings</span><br>
+        <span class="cmd">amux ls</span>            <span class="comment"> # list managed sessions</span><br>
+        <span class="cmd">amux kill &lt;name&gt;</span>  <span class="comment"> # kill a session</span><br>
+        <span class="cmd">amux config</span>        <span class="comment"> # show resolved config</span><br>
+        <span class="cmd">amux</span>               <span class="comment"> # open TUI session selector</span>
       </div>
     </div>
   </div>
 </section>
 
-<hr class="divider">
-
-<!-- TUI keys -->
-<section>
-  <div class="container">
-    <h2>TUI</h2>
-    <p class="subtitle">Run `amux` with no arguments to open the interactive session manager.</p>
-    <div class="terminal">
-      <div class="terminal-bar">
-        <div class="terminal-dot r"></div>
-        <div class="terminal-dot y"></div>
-        <div class="terminal-dot g"></div>
-        <div class="terminal-title">amux — TUI</div>
-      </div>
-      <div class="terminal-body">
-<pre style="color:var(--fg-dim); line-height:1.5;"><span style="color:var(--fg);">amux sessions</span>                    <span class="comment">filter: _</span>
-
-<span style="background:var(--fg);color:var(--bg);padding:0 4px;"> cc_myapp_1a2b3c4d     claude  </span>
-  cx_myapp_7e8f9a0b     codex
-  cc_server_e5f6a7b8    claude
-  cc_api_d4e5f6a7       claude
-
-<span class="comment">↑↓/jk move · enter attach · d kill · n new · q quit</span>
-</pre>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- Footer -->
 <footer>
   <div class="container">
     <p>
@@ -551,6 +540,173 @@ command = [<span style="color:#98c379;">"aider"</span>]
     </p>
   </div>
 </footer>
+
+<script>
+// ── Pane content & typing animation ──
+const panes = [
+  { id: 'pb0', lines: [
+    {t:'p', s:'~/projects/myapp $ '}, {t:'c', s:'cc'}, {t:'br'},
+    {t:'o', s:'╭─ Claude Code ─────────────────────╮'}, {t:'br'},
+    {t:'o', s:'│  Analyzing src/main.rs...          │'}, {t:'br'},
+    {t:'o', s:'╰────────────────────────────────────╯'}, {t:'br'},
+    {t:'br'},
+    {t:'h', s:'● Read src/commands/run.rs'}, {t:'br'},
+    {t:'h', s:'● Read src/tmux.rs'}, {t:'br'},
+    {t:'h', s:'● Read src/session.rs'}, {t:'br'},
+    {t:'br'},
+    {t:'o', s:'Found 3 issues in session handling.'}, {t:'br'},
+    {t:'o', s:'Proposing fixes...'}, {t:'br'},
+  ]},
+  { id: 'pb1', lines: [
+    {t:'p', s:'~/projects/myapp $ '}, {t:'c', s:'cx'}, {t:'br'},
+    {t:'o', s:'Codex (yolo mode)'}, {t:'br'},
+    {t:'o', s:'Reading project structure...'}, {t:'br'},
+    {t:'br'},
+    {t:'b', s:'> Add input validation to API'}, {t:'br'},
+    {t:'o', s:'Scanning endpoints...'}, {t:'br'},
+    {t:'h', s:'  POST /api/users  — missing email check'}, {t:'br'},
+    {t:'h', s:'  PUT  /api/config — no auth middleware'}, {t:'br'},
+    {t:'br'},
+    {t:'o', s:'Generating patches...'}, {t:'br'},
+  ]},
+  { id: 'pb2', lines: [
+    {t:'p', s:'~/projects/server $ '}, {t:'c', s:'cc'}, {t:'br'},
+    {t:'o', s:'╭─ Claude Code ─────────────────────╮'}, {t:'br'},
+    {t:'o', s:'│  Working on database migration     │'}, {t:'br'},
+    {t:'o', s:'╰────────────────────────────────────╯'}, {t:'br'},
+    {t:'br'},
+    {t:'h', s:'● Created migration 20260612_add_idx'}, {t:'br'},
+    {t:'o', s:'  ALTER TABLE sessions'}, {t:'br'},
+    {t:'o', s:'  ADD INDEX idx_agent_dir (agent, dir);'}, {t:'br'},
+    {t:'br'},
+    {t:'o', s:'Testing migration...'}, {t:'br'},
+    {t:'h', s:'✓ Migration applied successfully'}, {t:'br'},
+  ]},
+  { id: 'pb3', lines: [
+    {t:'p', s:'~/projects/api $ '}, {t:'c', s:'cc'}, {t:'br'},
+    {t:'o', s:'╭─ Claude Code ─────────────────────╮'}, {t:'br'},
+    {t:'o', s:'│  Implementing rate limiter          │'}, {t:'br'},
+    {t:'o', s:'╰────────────────────────────────────╯'}, {t:'br'},
+    {t:'br'},
+    {t:'h', s:'● Wrote src/middleware/rate_limit.rs'}, {t:'br'},
+    {t:'o', s:'  100 req/min per IP, sliding window'}, {t:'br'},
+    {t:'br'},
+    {t:'o', s:'Running cargo test...'}, {t:'br'},
+    {t:'h', s:'  12 passed, 0 failed'}, {t:'br'},
+    {t:'h', s:'✓ All tests passing'}, {t:'br'},
+  ]},
+];
+
+// Type out pane content with staggered timing
+function typePane(pane, delay) {
+  const el = document.getElementById(pane.id);
+  let i = 0;
+  function next() {
+    if (i >= pane.lines.length) {
+      el.innerHTML += '<span class="cursor"></span>';
+      return;
+    }
+    const line = pane.lines[i++];
+    if (line.t === 'br') {
+      el.innerHTML += '<br>';
+    } else {
+      el.innerHTML += `<span class="${line.t}">${line.s}</span>`;
+    }
+    setTimeout(next, 30 + Math.random() * 40);
+  }
+  setTimeout(next, delay);
+}
+
+panes.forEach((p, i) => typePane(p, i * 400));
+
+// ── fzf popup interaction ──
+const fzf = document.getElementById('fzf');
+const items = document.querySelectorAll('.fzf-item');
+let fzfOpen = false;
+let activePane = null;
+let selectedIdx = 0;
+
+function openFzf(paneIdx) {
+  activePane = paneIdx;
+  fzfOpen = true;
+  selectedIdx = 0;
+  updateFzfSelection();
+  fzf.classList.add('visible');
+}
+
+function closeFzf() {
+  fzfOpen = false;
+  fzf.classList.remove('visible');
+}
+
+function updateFzfSelection() {
+  items.forEach((item, i) => {
+    item.classList.toggle('selected', i === selectedIdx);
+    item.innerHTML = (i === selectedIdx ? '❯ ' : '&nbsp; ') + item.dataset.s;
+  });
+}
+
+function switchSession() {
+  const item = items[selectedIdx];
+  const sessionName = item.dataset.s;
+  const agentName = item.dataset.a;
+  if (activePane !== null) {
+    document.getElementById('sn' + activePane).textContent = sessionName;
+    const statusAgent = document.querySelectorAll('.pane')[activePane].querySelector('.pane-status span:last-child');
+    statusAgent.textContent = agentName;
+  }
+  closeFzf();
+}
+
+// Click panes to open fzf
+document.querySelectorAll('.pane').forEach((p, i) => {
+  p.addEventListener('click', () => openFzf(i));
+});
+
+// Click fzf items
+items.forEach((item, i) => {
+  item.addEventListener('click', (e) => {
+    e.stopPropagation();
+    selectedIdx = i;
+    updateFzfSelection();
+    setTimeout(switchSession, 150);
+  });
+});
+
+// Keyboard: Shift+Cmd+O, arrows, enter, escape
+document.addEventListener('keydown', (e) => {
+  // Shift+Cmd+O to toggle
+  if (e.key === 'O' && e.shiftKey && e.metaKey) {
+    e.preventDefault();
+    if (fzfOpen) closeFzf();
+    else openFzf(0);
+    return;
+  }
+  if (!fzfOpen) return;
+
+  if (e.key === 'ArrowDown' || e.key === 'j') {
+    e.preventDefault();
+    selectedIdx = Math.min(selectedIdx + 1, items.length - 1);
+    updateFzfSelection();
+  } else if (e.key === 'ArrowUp' || e.key === 'k') {
+    e.preventDefault();
+    selectedIdx = Math.max(selectedIdx - 1, 0);
+    updateFzfSelection();
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    switchSession();
+  } else if (e.key === 'Escape') {
+    closeFzf();
+  }
+});
+
+// Close fzf on outside click
+document.addEventListener('click', (e) => {
+  if (fzfOpen && !fzf.contains(e.target) && !e.target.closest('.pane')) {
+    closeFzf();
+  }
+});
+</script>
 
 </body>
 </html>
