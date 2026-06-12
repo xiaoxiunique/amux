@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod config;
 mod provider;
+mod serve;
 mod session;
 mod tmux;
 mod tui;
@@ -88,6 +89,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Serve {
+            port,
+            host,
+            token,
+            foreground,
+        }) => serve::serve(port, host.as_deref(), token.as_deref(), foreground),
+        Some(Command::Stop) => serve::stop(),
         None => tui::run_tui(&agents),
     }
 }

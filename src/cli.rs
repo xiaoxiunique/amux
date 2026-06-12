@@ -29,4 +29,21 @@ pub enum Command {
     Kill { name: String },
     /// Show resolved config and its path.
     Config,
+    /// Start the agent monitor server (daemon by default).
+    Serve {
+        /// Port to listen on.
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+        /// Bind address.
+        #[arg(long)]
+        host: Option<String>,
+        /// Auth token (optional).
+        #[arg(long)]
+        token: Option<String>,
+        /// Run in foreground instead of daemonizing.
+        #[arg(long, short)]
+        foreground: bool,
+    },
+    /// Stop the agent monitor daemon.
+    Stop,
 }
