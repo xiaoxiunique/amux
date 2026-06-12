@@ -101,7 +101,7 @@ fn new_agent_in_cwd(agents: &[Agent]) -> Result<()> {
     std::io::stdin().read_line(&mut line)?;
     let idx: usize = line.trim().parse().unwrap_or(0);
     if idx >= 1 && idx <= agents.len() {
-        commands::run::run(&agents[idx - 1], &[])
+        commands::run::run(&agents[idx - 1], &[], None)
     } else {
         Ok(())
     }

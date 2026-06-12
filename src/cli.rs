@@ -13,6 +13,9 @@ pub enum Command {
     Run {
         /// Agent name or alias (e.g. claude, cc).
         agent: String,
+        /// Use a CC Switch provider (e.g. glm, sub, deepseek).
+        #[arg(long)]
+        provider: Option<String>,
         /// Extra args forwarded to the agent command.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
