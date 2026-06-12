@@ -8,26 +8,18 @@ fn db_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".cc-switch").join("cc-switch.db"))
 }
 
-/// Resolve a user-friendly provider name to a CC Switch DB provider ID.
-/// Checks hardcoded aliases first, then queries the DB by name.
-fn resolve_provider_id(name: &str, conn: &Connection) -> Result<String> {
-    let lower = name.to_lowercase();
-
-    // Hardcoded aliases (mirrors ccs-claude-switch-open)
-    let hardcoded = match lower.as_str() {
-        "sub" | "company" | "gongsi" => Some("5ed3e66f-1e9f-4bba-b891-156e612cdfcd"),
-        "aigocode" | "ai-go-code" | "ai_go_code" | "aigo" => {
-            Some("1f66fe75-8966-463d-8b1b-60b90775af20")
-        }
-        "glm" | "zhipu" => Some("84fe4f50-0f82-4db1-bfe9-550c043edf27"),
-        "deepseek" | "ds" => Some("01521cab-1d77-4183-adcf-a2ec13646b6e"),
-        _ => None,
-    };
-
-    if let Some(id) = hardcoded {
-        return Ok(id.to_string());
+/// Open the CC Switch DB read-only. Returns None if DB doesn't exist.
+fn open_db() -> Option<Connection> {
+    let p = db_path()?;
+    if !p.exists() {
+        return None;
     }
+    Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
+}
 
+/// Resolve a provider name/id to a DB provider ID.
+/// Tries: exact ID match → case-insensitive name match.
+fn resolve_provider_id(name: &str, conn: &Connection) -> Result<String> {
     // Try exact ID match
     let count: i64 = conn
         .query_row(
@@ -52,39 +44,33 @@ fn resolve_provider_id(name: &str, conn: &Connection) -> Result<String> {
         return Ok(id);
     }
 
-    bail!("unknown provider: {name}");
+    // List available providers for a helpful error message
+    let mut stmt = conn
+        .prepare("SELECT name FROM providers WHERE app_type='claude' ORDER BY name")
+        .ok();
+    let names: Vec<String> = stmt
+        .as_mut()
+        .and_then(|s| {
+            s.query_map([], |r| r.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    if names.is_empty() {
+        bail!("unknown provider: {name} (no providers found in CC Switch DB)");
+    } else {
+        bail!(
+            "unknown provider: {name}\navailable providers: {}",
+            names.join(", ")
+        );
+    }
 }
 
-/// Check whether `name` is a known provider (hardcoded alias or in DB).
+/// Check whether `name` is a known provider in the CC Switch DB.
+/// Returns false silently if DB doesn't exist.
 pub fn is_known_provider(name: &str) -> bool {
-    let lower = name.to_lowercase();
-
-    // Check hardcoded aliases
-    let hardcoded = matches!(
-        lower.as_str(),
-        "sub"
-            | "company"
-            | "gongsi"
-            | "aigocode"
-            | "ai-go-code"
-            | "ai_go_code"
-            | "aigo"
-            | "glm"
-            | "zhipu"
-            | "deepseek"
-            | "ds"
-    );
-    if hardcoded {
-        return true;
-    }
-
-    // Check DB
-    let Some(p) = db_path() else { return false };
-    if !p.exists() {
-        return false;
-    }
-    let Ok(conn) = Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-    else {
+    let Some(conn) = open_db() else {
         return false;
     };
 
@@ -101,9 +87,15 @@ pub fn is_known_provider(name: &str) -> bool {
 /// Resolve provider name → write settings to a temp file → return the file path.
 /// The temp file is intentionally NOT cleaned up (tmux session outlives this process).
 pub fn resolve_and_write_settings(name: &str) -> Result<String> {
-    let p = db_path().context("cannot determine home directory")?;
+    let Some(p) = db_path() else {
+        bail!("cannot determine home directory");
+    };
     if !p.exists() {
-        bail!("CC Switch DB not found: {}", p.display());
+        bail!(
+            "CC Switch is not installed (DB not found: {})\n\
+             Install CC Switch from https://github.com/nicepkg/cc-switch to use --provider",
+            p.display()
+        );
     }
 
     let conn = Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -149,34 +141,18 @@ pub fn resolve_and_write_settings(name: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
-    fn hardcoded_aliases_are_known() {
-        // These should always return true (no DB needed)
-        assert!(matches!(
-            resolve_provider_id_hardcoded("glm"),
-            Some(_)
-        ));
-        assert!(matches!(
-            resolve_provider_id_hardcoded("sub"),
-            Some(_)
-        ));
-        assert!(matches!(
-            resolve_provider_id_hardcoded("deepseek"),
-            Some(_)
-        ));
-        assert!(resolve_provider_id_hardcoded("unknown").is_none());
+    fn no_db_means_not_known() {
+        // When DB doesn't exist, is_known_provider should return false, not panic
+        assert!(!is_known_provider("anything"));
     }
 
-    fn resolve_provider_id_hardcoded(name: &str) -> Option<&'static str> {
-        match name.to_lowercase().as_str() {
-            "sub" | "company" | "gongsi" => Some("5ed3e66f-1e9f-4bba-b891-156e612cdfcd"),
-            "aigocode" | "ai-go-code" | "ai_go_code" | "aigo" => {
-                Some("1f66fe75-8966-463d-8b1b-60b90775af20")
-            }
-            "glm" | "zhipu" => Some("84fe4f50-0f82-4db1-bfe9-550c043edf27"),
-            "deepseek" | "ds" => Some("01521cab-1d77-4183-adcf-a2ec13646b6e"),
-            _ => None,
-        }
+    #[test]
+    fn open_db_returns_none_when_missing() {
+        // This test relies on the DB not existing at a weird path, but
+        // open_db() uses the real home dir. At minimum it should not panic.
+        let _ = open_db();
     }
 }
