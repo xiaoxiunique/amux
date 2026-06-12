@@ -26,9 +26,10 @@ fn main() -> Result<()> {
 
             // Smart provider detection: if no --provider but first arg is a known
             // provider name, treat it as the provider.
+            let app_type = provider::agent_app_type(&a.name);
             let provider = provider.or_else(|| {
                 if let Some(first) = args.first() {
-                    if !first.starts_with('-') && provider::is_known_provider(first) {
+                    if !first.starts_with('-') && provider::is_known_provider(first, app_type) {
                         return Some(args.remove(0));
                     }
                 }

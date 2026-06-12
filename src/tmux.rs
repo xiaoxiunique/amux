@@ -1,5 +1,5 @@
 /// POSIX-quote one argument for safe insertion into a shell command line.
-fn shell_quote(s: &str) -> String {
+pub fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c));
     if safe {
