@@ -12,7 +12,7 @@ the live session instead of starting a new one.
 ```bash
 brew tap xiaoxiunique/amux
 brew install amux
-amux init   # installs cc / cx aliases into your shell rc
+amux init   # installs shell aliases + tmux/Ghostty keybindings
 ```
 
 Reload your shell, then:
@@ -31,7 +31,7 @@ amux ls     # list sessions
 | Command | Behavior |
 |---------|----------|
 | `amux run <agent> [args…]` | Launch or reattach `<agent>` in the current directory. Extra args are forwarded to the agent. |
-| `amux init` | Install shell aliases (`cc`, `cx`, …) into your rc file. |
+| `amux init` | Install shell aliases (`cc`, `cx`, …), tmux keybindings, and Ghostty keybindings. |
 | `amux ls` | List amux-managed sessions across all directories. |
 | `amux kill <name>` | Kill a session by name. |
 | `amux config` | Show resolved config and its path. |
@@ -41,6 +41,18 @@ amux ls     # list sessions
 
 `/` type to filter · `↑`/`↓` (or `j`/`k`) move · `Enter` attach · `d` kill ·
 `n` start a new agent in the current directory · `q` quit.
+
+## Session switcher (Ghostty + tmux)
+
+`amux init` also installs a quick session switcher for Ghostty split-pane
+workflows:
+
+- **Shift+Cmd+O** — pops up an fzf selector listing all amux sessions. Pick one
+  to switch the current pane to that session.
+
+This works by having Ghostty send `ESC O` on the key combo, which tmux picks up
+as `M-O` and runs the fzf popup. Requires `fzf`; skipped automatically if fzf or
+Ghostty is not installed.
 
 ## Configuration
 
@@ -67,6 +79,8 @@ session, so re-running attaches instead of duplicating.
 ## Requires
 
 - tmux (Linux or macOS). Without tmux, amux runs the agent directly.
+- fzf (optional, for session switcher keybinding)
+- Ghostty (optional, for Shift+Cmd+O keybinding)
 
 ## License
 
