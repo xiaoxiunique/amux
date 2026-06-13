@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "amux", version, about = "Run AI agents in per-directory tmux sessions")]
@@ -46,4 +47,14 @@ pub enum Command {
     },
     /// Stop the agent monitor daemon.
     Stop,
+    /// Save the current session list to a file.
+    Save {
+        /// Output file (default: ~/.amux/sessions.json).
+        file: Option<PathBuf>,
+    },
+    /// Restore sessions from a saved file.
+    Restore {
+        /// Input file (default: ~/.amux/sessions.json).
+        file: Option<PathBuf>,
+    },
 }

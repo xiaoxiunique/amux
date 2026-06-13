@@ -1,6 +1,7 @@
 use crate::config::Agent;
 use crate::tmux;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::path::PathBuf;
 
 /// A parsed amux-managed session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,22 +10,35 @@ pub struct ManagedSession {
     pub alias: String,
 }
 
-/// Return managed sessions: those whose name begins with `<alias>_` for a known
-/// alias and match the `<alias>_<slug>_<8hex>` shape.
+/// Return managed sessions: those whose name begins with `<alias>_` or
+/// `<alias>-<provider>_` for a known alias and match the
+/// `[<alias>-<provider>_]<slug>_<8hex>` shape.
 pub fn managed_sessions(all: &[String], agents: &[Agent]) -> Vec<ManagedSession> {
     let mut out = Vec::new();
     for name in all {
         for a in agents {
-            let prefix = format!("{}_", a.alias);
-            if let Some(rest) = name.strip_prefix(&prefix) {
-                // rest must end with `_<8 hex>`
-                if let Some(idx) = rest.rfind('_') {
-                    let tail = &rest[idx + 1..];
-                    let is_hash = tail.len() == 8 && tail.chars().all(|c| c.is_ascii_hexdigit());
-                    if is_hash && idx > 0 {
-                        out.push(ManagedSession { name: name.clone(), alias: a.alias.clone() });
-                        break;
-                    }
+            let Some(after_alias) = name.strip_prefix(&a.alias) else {
+                continue;
+            };
+            // Determine the "slug_hash" portion after alias[_|-provider_]
+            let slug_hash = if let Some(r) = after_alias.strip_prefix('_') {
+                // Pattern: <alias>_<slug>_<hash>
+                r
+            } else if let Some(r) = after_alias.strip_prefix('-') {
+                // Pattern: <alias>-<provider>_<slug>_<hash>
+                // Find the first '_' after the provider name
+                let Some(underscore) = r.find('_') else { continue };
+                if underscore == 0 { continue; }
+                &r[underscore + 1..]
+            } else {
+                continue;
+            };
+            // slug_hash must be `<slug>_<8hex>` with non-empty slug
+            if let Some(idx) = slug_hash.rfind('_') {
+                let tail = &slug_hash[idx + 1..];
+                if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_hexdigit()) && idx > 0 {
+                    out.push(ManagedSession { name: name.clone(), alias: a.alias.clone() });
+                    break;
                 }
             }
         }
@@ -49,6 +63,189 @@ pub fn list(agents: &[Agent]) -> Result<()> {
 pub fn kill(name: &str) -> Result<()> {
     tmux::kill_session(name)?;
     println!("killed {name}");
+    Ok(())
+}
+
+/// Parsed info from a session name: the agent alias and optional provider.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionEntry {
+    agent: String,
+    directory: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+}
+
+fn default_save_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".amux").join("sessions.json"))
+}
+
+/// Extract agent alias and optional provider from a session name.
+/// E.g. `cc-openai_myproject_1a2b3c4d` → ("cc", Some("openai"))
+fn parse_session_alias(name: &str) -> Option<(&str, Option<&str>)> {
+    // Find the first '_' which separates the alias (or alias-provider) from the slug
+    let underscore = name.find('_')?;
+    let prefix = &name[..underscore];
+    if let Some(dash) = prefix.find('-') {
+        let alias = &prefix[..dash];
+        let provider = &prefix[dash + 1..];
+        if !alias.is_empty() && !provider.is_empty() {
+            return Some((alias, Some(provider)));
+        }
+    }
+    if !prefix.is_empty() {
+        return Some((prefix, None));
+    }
+    None
+}
+
+/// Map an alias back to the agent name.
+fn alias_to_name<'a>(agents: &'a [Agent], alias: &str) -> Option<&'a str> {
+    agents.iter().find(|a| a.alias == alias).map(|a| a.name.as_str())
+}
+
+/// Save the current session list to the default path. Silent on success.
+/// Called automatically after `amux run` to keep the snapshot fresh.
+pub fn auto_save(agents: &[Agent]) {
+    let _ = save_silent(None, agents);
+}
+
+fn save_silent(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<usize> {
+    let path = match file {
+        Some(p) => p.to_path_buf(),
+        None => default_save_path()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?,
+    };
+
+    let all = tmux::list_session_names()?;
+    let managed = managed_sessions(&all, agents);
+
+    if managed.is_empty() {
+        return Ok(0);
+    }
+
+    let mut entries = Vec::new();
+    for s in &managed {
+        let cwd = tmux::session_cwd(&s.name)?;
+        let (alias, provider) = parse_session_alias(&s.name)
+            .unwrap_or((&s.alias, None));
+        let agent_name = alias_to_name(agents, alias).unwrap_or(alias);
+        entries.push(SessionEntry {
+            agent: agent_name.to_string(),
+            directory: cwd,
+            provider: provider.map(|p| p.to_string()),
+        });
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&entries)?;
+    std::fs::write(&path, &json)
+        .with_context(|| format!("writing {}", path.display()))?;
+
+    Ok(entries.len())
+}
+
+pub fn save(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<()> {
+    let path = match file {
+        Some(p) => p.to_path_buf(),
+        None => default_save_path()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?,
+    };
+    let count = save_silent(Some(&path), agents)?;
+    if count == 0 {
+        println!("No amux sessions to save.");
+    } else {
+        println!("Saved {} session(s) to {}", count, path.display());
+    }
+    Ok(())
+}
+
+pub fn restore(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<()> {
+    let path = match file {
+        Some(p) => p.to_path_buf(),
+        None => default_save_path()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?,
+    };
+
+    let json = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let entries: Vec<SessionEntry> = serde_json::from_str(&json)
+        .with_context(|| format!("parsing {}", path.display()))?;
+
+    if entries.is_empty() {
+        println!("No sessions in {}.", path.display());
+        return Ok(());
+    }
+
+    let mut created = 0;
+    let mut skipped = 0;
+    let mut errors = 0;
+    let mut attach_to: Option<String> = None;
+
+    for entry in &entries {
+        let agent = match agents.iter().find(|a| a.name == entry.agent) {
+            Some(a) => a,
+            None => {
+                eprintln!("  skip: unknown agent '{}'", entry.agent);
+                errors += 1;
+                continue;
+            }
+        };
+
+        let cwd = PathBuf::from(&entry.directory);
+        if !cwd.exists() {
+            eprintln!("  skip {}: directory not found: {}", entry.agent, entry.directory);
+            errors += 1;
+            continue;
+        }
+
+        // Build alias (same logic as run.rs)
+        let alias = match &entry.provider {
+            Some(p) => format!("{}-{}", agent.alias, p),
+            None => agent.alias.clone(),
+        };
+        let name = crate::session::session_name(&alias, &cwd);
+
+        if tmux::has_session(&name) {
+            skipped += 1;
+            continue;
+        }
+
+        // Resolve provider settings if needed
+        let mut argv = agent.command.clone();
+        let mut env_vars: Vec<(String, String)> = Vec::new();
+        if let Some(p) = &entry.provider {
+            let app_type = crate::provider::agent_app_type(&agent.name);
+            let settings = crate::provider::resolve_settings(p, app_type)?;
+            argv.extend(settings.extra_argv);
+            env_vars = settings.env_vars;
+        }
+
+        tmux::new_session_detached(&name, &cwd.to_string_lossy())?;
+        let shell_cmd = if env_vars.is_empty() {
+            tmux::shell_join(&argv)
+        } else {
+            let env_prefix: String = env_vars
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, tmux::shell_quote(v)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{} {}", env_prefix, tmux::shell_join(&argv))
+        };
+        tmux::send_command(&name, &shell_cmd)?;
+        created += 1;
+        if attach_to.is_none() {
+            attach_to = Some(name.clone());
+        }
+    }
+
+    println!("Restored: {created} created, {skipped} already running, {errors} errors");
+
+    // Attach to the first newly created session
+    if let Some(name) = attach_to {
+        tmux::attach_or_switch(&name)?;
+    }
     Ok(())
 }
 
@@ -77,5 +274,27 @@ mod tests {
         assert!(names.contains(&"cx_api_deadbeef"));
         assert!(!names.contains(&"random_session"));
         assert!(!names.contains(&"cc_nohash"));
+    }
+
+    #[test]
+    fn parse_session_alias_works() {
+        assert_eq!(parse_session_alias("cc_myproject_1a2b3c4d"), Some(("cc", None)));
+        assert_eq!(parse_session_alias("cc-openai_myproject_1a2b3c4d"), Some(("cc", Some("openai"))));
+        assert_eq!(parse_session_alias("cx-deepseek_api_deadbeef"), Some(("cx", Some("deepseek"))));
+        assert_eq!(parse_session_alias("_weird"), None);
+    }
+
+    #[test]
+    fn detects_provider_sessions() {
+        let all = vec![
+            "cc-openai_myproject_1a2b3c4d".to_string(),
+            "cx-anthropic_api_deadbeef".to_string(),
+            "cc_myproject_1a2b3c4d".to_string(),
+        ];
+        let m = managed_sessions(&all, &agents());
+        let names: Vec<_> = m.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"cc-openai_myproject_1a2b3c4d"));
+        assert!(names.contains(&"cx-anthropic_api_deadbeef"));
+        assert!(names.contains(&"cc_myproject_1a2b3c4d"));
     }
 }

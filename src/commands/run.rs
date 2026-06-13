@@ -6,7 +6,8 @@ use std::process::Command;
 /// Launch-or-reattach the agent's session for the current directory.
 /// Extra args are appended to the agent's command.
 /// If `provider` is given, a CC Switch provider is resolved and injected.
-pub fn run(agent: &Agent, extra: &[String], provider_name: Option<&str>) -> Result<()> {
+/// Automatically saves the session list before attaching.
+pub fn run(agent: &Agent, extra: &[String], provider_name: Option<&str>, agents: &[Agent]) -> Result<()> {
     let cwd = std::env::current_dir()
         .context("cannot read current directory")?
         .canonicalize()
@@ -57,5 +58,7 @@ pub fn run(agent: &Agent, extra: &[String], provider_name: Option<&str>) -> Resu
         };
         tmux::send_command(&name, &shell_cmd)?;
     }
+    // Auto-save session list before attaching (exec replaces the process)
+    super::sessions::auto_save(agents);
     tmux::attach_or_switch(&name)
 }

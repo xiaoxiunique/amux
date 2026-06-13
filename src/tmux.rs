@@ -71,6 +71,17 @@ pub fn list_session_names() -> Result<Vec<String>> {
         .collect())
 }
 
+/// Get the current working directory of a tmux session's active pane.
+pub fn session_cwd(name: &str) -> Result<String> {
+    let out = Command::new("tmux")
+        .args(["display-message", "-p", "-t", name, "#{pane_current_path}"])
+        .output()?;
+    if !out.status.success() {
+        bail!("failed to get cwd for tmux session '{name}'");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub fn kill_session(name: &str) -> Result<()> {
     let status = Command::new("tmux")
         .args(["kill-session", "-t", name])

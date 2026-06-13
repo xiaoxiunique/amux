@@ -37,7 +37,7 @@ fn main() -> Result<()> {
                 None
             });
 
-            commands::run::run(&a, &args, provider.as_deref())
+            commands::run::run(&a, &args, provider.as_deref(), &agents)
         }
         Some(Command::Init) => {
             let path = commands::init::rc_path()
@@ -96,6 +96,12 @@ fn main() -> Result<()> {
             foreground,
         }) => serve::serve(port, host.as_deref(), token.as_deref(), foreground),
         Some(Command::Stop) => serve::stop(),
+        Some(Command::Save { file }) => {
+            commands::sessions::save(file.as_deref(), &agents)
+        }
+        Some(Command::Restore { file }) => {
+            commands::sessions::restore(file.as_deref(), &agents)
+        }
         None => tui::run_tui(&agents),
     }
 }

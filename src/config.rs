@@ -20,12 +20,12 @@ pub fn builtin_agents() -> Vec<Agent> {
         Agent {
             name: "claude".into(),
             alias: "cc".into(),
-            command: vec!["claude".into(), "--dangerously-skip-permissions".into()],
+            command: vec!["claude".into(), "--dangerously-skip-permissions".into(), "--continue".into()],
         },
         Agent {
             name: "codex".into(),
             alias: "cx".into(),
-            command: vec!["codex".into(), "--yolo".into()],
+            command: vec!["codex".into(), "--yolo".into(), "resume".into(), "--last".into()],
         },
     ]
 }
