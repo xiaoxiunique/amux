@@ -58,11 +58,33 @@ session (status + live logs) and can send input to them.
     amux stop                                   # stop the daemon
     #   logs: ~/.amux/serve.log
 
-Then point the Agent Port app (iOS / Android / desktop) at
-`http://<this-machine-ip>:8787` over your LAN or Tailscale. The phone app is
-OPTIONAL — the terminal workflow above stands on its own.
-SECURITY: `amux serve` binds 0.0.0.0. On any shared or untrusted network, always
-pass `--token`, and prefer Tailscale/LAN over exposing it to the public internet.
+On the same machine, reach it at `http://localhost:8787`; on your LAN, at
+`http://<this-machine-ip>:8787`. Clients: the Agent Port app (iOS / Android /
+desktop) or a web browser. All of this is OPTIONAL — the terminal workflow above
+stands on its own.
+
+### Remote access — use amux from your phone or another network
+`amux serve` only listens on the local machine's network. To reach it from your
+phone or a different network, expose it one of two ways:
+
+Tailscale — recommended (private mesh VPN; nothing is exposed to the public net):
+  1. Install on THIS machine and on the remote device, and sign both into the
+     same account: macOS `brew install --cask tailscale`
+     (or https://tailscale.com/download), then `tailscale up`.
+  2. Get this machine's tailnet address: `tailscale ip -4` (a 100.x.y.z), or use
+     its MagicDNS name.
+  3. From the remote device open `http://<that-address>:8787` (app or browser).
+
+ngrok — quick public tunnel (good for a one-off demo or sharing a link):
+  1. Install: `brew install ngrok` (or https://ngrok.com/download), then
+     `ngrok config add-authtoken <your-token>`.
+  2. Start amux serve WITH a token: `amux serve --token <secret>`.
+  3. `ngrok http 8787` → use the printed https URL from any device.
+  SECURITY: ngrok publishes your server to the public internet. ALWAYS run with
+  `--token` in this mode, and treat the ngrok URL as a secret.
+
+SECURITY (general): `amux serve` binds 0.0.0.0. On any shared or untrusted
+network pass `--token`, and prefer Tailscale over a public tunnel.
 
 ## Custom agents (optional)
 Edit `~/.config/amux/config.toml`:
