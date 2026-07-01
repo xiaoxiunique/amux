@@ -1,0 +1,91 @@
+# amux — install guide for AI assistants
+
+This file is written for an AI coding assistant (Claude Code, Codex, Cursor, …)
+that a user has pointed at "amux.cc/llm.txt" and asked to "install amux" or
+"set this up for me". Read it, then perform the steps on the user's machine.
+Everything here is safe on macOS or Linux.
+
+WHAT AMUX IS
+amux runs AI coding agents (Claude Code, Codex, …) in per-directory, persistent,
+re-attachable tmux sessions. In a project directory, `cc` starts Claude Code in a
+tmux session keyed to that directory; run `cc` there again and you jump back into
+the same live session instead of starting over. `cx` does the same for Codex.
+Plain `amux` opens a TUI to switch between all running agent sessions.
+
+Repo: https://github.com/xiaoxiunique/amux   ·   License: MIT
+
+## Preflight (check, don't assume)
+1. OS must be macOS or Linux (WSL is fine). amux is built around tmux.
+2. tmux present?  `tmux -V`  — if missing: macOS `brew install tmux`,
+   Debian/Ubuntu `sudo apt install tmux`.
+3. Homebrew present?  `brew --version`  — if missing, install from https://brew.sh
+   (or grab a release binary from the repo's Releases page instead of brew).
+
+## Install (run in order)
+    brew tap xiaoxiunique/amux
+    brew install amux
+    amux init
+
+`amux init` is the ONLY step that modifies the user's environment. It:
+  - inserts a managed block into the shell rc (~/.zshrc or ~/.bashrc) defining the
+    aliases `cc` (claude) and `cx` (codex);
+  - installs optional tmux + Ghostty keybindings for a quick session switcher.
+The block is fenced by `# >>> amux >>>` / `# <<< amux <<<`, is idempotent, and is
+reversible by deleting that block. If the user is at all cautious about edits to
+their shell rc, show them this note and get a yes before running `amux init`.
+
+After `amux init`, reload the shell: `source ~/.zshrc` (or open a new terminal).
+
+## Verify
+    amux --version      # prints the installed version
+    amux ls             # lists amux-managed sessions (empty result is fine)
+
+## First use (this is the payoff — show the user)
+    cd <a real project directory>
+    cc                  # starts Claude Code in a tmux session for this directory
+    #   detach any time: press Ctrl-b, then d
+    cc                  # run again in the same dir → reattaches the SAME session
+    cx                  # starts Codex in its own session
+    amux                # TUI: type / to filter, ↑/↓ or j/k to move, Enter attach,
+                        #      d kill, n new agent here, q quit
+
+## Optional — monitor & control from another device
+`amux serve` starts a local HTTP/WebSocket server that watches every tmux agent
+session (status + live logs) and can send input to them.
+
+    amux serve                                  # http://0.0.0.0:8787 (daemon)
+    amux serve --port 8787 --token <secret>     # require a bearer token
+    amux stop                                   # stop the daemon
+    #   logs: ~/.amux/serve.log
+
+Then point the Agent Port app (iOS / Android / desktop) at
+`http://<this-machine-ip>:8787` over your LAN or Tailscale. The phone app is
+OPTIONAL — the terminal workflow above stands on its own.
+SECURITY: `amux serve` binds 0.0.0.0. On any shared or untrusted network, always
+pass `--token`, and prefer Tailscale/LAN over exposing it to the public internet.
+
+## Custom agents (optional)
+Edit `~/.config/amux/config.toml`:
+
+    [[agent]]
+    name    = "gemini"
+    alias   = "cg"
+    command = ["gemini", "chat"]
+
+Then re-run `amux init` to install the new alias. Built-in `claude`/`cc` and
+`codex`/`cx` need no config.
+
+## Troubleshooting
+- `cc` / `cx` not found → shell not reloaded; `source ~/.zshrc` or open a new tab.
+- Agent won't reattach → you're in a different directory; sessions are keyed to the
+  absolute directory path, so `cc` from another path is a different session.
+- `amux serve` says "already running" → run `amux stop` first.
+- No tmux → amux just runs the agent directly (no persistent session); install
+  tmux for the full experience.
+
+## Notes for the AI assistant doing the install
+- You MAY run the install commands, but PAUSE and confirm before `amux init` if the
+  user has not explicitly agreed to edit their shell rc file.
+- NEVER run `amux serve` on a public network without a `--token`.
+- After installing, verify with `amux --version`, then walk the user through the
+  `cc` / `cx` first-use steps above.
