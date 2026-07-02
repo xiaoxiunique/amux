@@ -44,6 +44,9 @@ pub enum Command {
         /// Run in foreground instead of daemonizing.
         #[arg(long, short)]
         foreground: bool,
+        /// Open the web UI in your browser after starting.
+        #[arg(long)]
+        open: bool,
     },
     /// Stop the agent monitor daemon.
     Stop,

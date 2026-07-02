@@ -57,13 +57,22 @@ fn read_pid() -> Option<u32> {
 }
 
 /// Start the agent monitor server.
-pub fn serve(port: u16, host: Option<&str>, token: Option<&str>, foreground: bool) -> Result<()> {
+pub fn serve(
+    port: u16,
+    host: Option<&str>,
+    token: Option<&str>,
+    foreground: bool,
+    open: bool,
+) -> Result<()> {
     let host = host.unwrap_or(DEFAULT_HOST);
     let port = if port == 0 { DEFAULT_PORT } else { port };
     let token = token.unwrap_or("");
 
     if foreground {
         // Run directly in this process with a tokio runtime
+        if open {
+            open_browser(port);
+        }
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         rt.block_on(server::run_server(host, port, token));
         return Ok(());
@@ -106,8 +115,30 @@ pub fn serve(port: u16, host: Option<&str>, token: Option<&str>, foreground: boo
     fs::write(&pf, pid.to_string()).with_context(|| format!("writing {}", pf.display()))?;
 
     println!("Agent monitor started on http://{}:{} (pid: {})", host, port, pid);
+    println!("Web UI:  http://localhost:{port}");
     println!("Logs: {}", log.display());
+    if open {
+        open_browser(port);
+    }
     Ok(())
+}
+
+/// Open the web UI in the user's default browser (best-effort).
+fn open_browser(port: u16) {
+    let url = format!("http://127.0.0.1:{port}");
+    #[cfg(target_os = "macos")]
+    let opener: Option<&str> = Some("open");
+    #[cfg(target_os = "linux")]
+    let opener: Option<&str> = Some("xdg-open");
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let opener: Option<&str> = None;
+
+    match opener {
+        Some(cmd) => {
+            let _ = Command::new(cmd).arg(&url).spawn();
+        }
+        None => println!("Open {url} in your browser."),
+    }
 }
 
 /// Stop the agent monitor daemon.

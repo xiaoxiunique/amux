@@ -94,7 +94,8 @@ fn main() -> Result<()> {
             host,
             token,
             foreground,
-        }) => serve::serve(port, host.as_deref(), token.as_deref(), foreground),
+            open,
+        }) => serve::serve(port, host.as_deref(), token.as_deref(), foreground, open),
         Some(Command::Stop) => serve::stop(),
         Some(Command::Save { file }) => {
             commands::sessions::save(file.as_deref(), &agents)

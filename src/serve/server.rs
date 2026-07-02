@@ -12,17 +12,18 @@ use std::{
 };
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
-    http::{header, HeaderMap, Response, StatusCode},
+    http::{header, HeaderMap, Response, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use include_dir::{include_dir, Dir};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -325,6 +326,52 @@ enum TerminalEvent {
     Exit,
 }
 
+/// The embedded Flutter web client (built from agent-port, pruned to a single
+/// local canvaskit renderer). Served at `/` so `amux serve` gives a zero-install
+/// browser UI with no external files or network fetches.
+static WEBUI: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/webui");
+
+fn web_content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        Some("json") => "application/json; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Serve the embedded web client, falling back to index.html for SPA routes.
+/// This is the router fallback, so it only runs for paths no `/api` or `/ws`
+/// route matched.
+async fn serve_webui(uri: Uri) -> Response<Body> {
+    let raw = uri.path().trim_start_matches('/');
+    let path = if raw.is_empty() { "index.html" } else { raw };
+    let (contents, ctype) = match WEBUI.get_file(path) {
+        Some(file) => (file.contents(), web_content_type(path)),
+        None => match WEBUI.get_file("index.html") {
+            Some(index) => (index.contents(), "text/html; charset=utf-8"),
+            None => {
+                return Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from("web client not bundled"))
+                    .unwrap()
+            }
+        },
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, ctype)
+        .body(Body::from(Bytes::from_static(contents)))
+        .unwrap()
+}
+
 /// Start the agent-monitor HTTP+WS server.
 /// This is the entry point called from `amux serve --foreground`.
 pub async fn run_server(host: &str, port: u16, token: &str) {
@@ -357,6 +404,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         .route("/ws", get(snapshot_ws))
         .route("/pane-log/ws", get(pane_log_ws))
         .route("/terminal/ws", get(terminal_ws))
+        .fallback(serve_webui)
         .with_state(state.clone());
 
     let bind_addr = format!("{host}:{port}");
@@ -368,6 +416,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
 
     println!("Agent monitor listening on http://{addr}");
+    println!("Web UI:  http://localhost:{port}");
     if token.is_empty() {
         println!("Token auth is disabled. Set --token to require a token.");
     } else {
