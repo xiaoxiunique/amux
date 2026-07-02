@@ -42,6 +42,22 @@ amux ls     # list sessions
 `/` type to filter · `↑`/`↓` (or `j`/`k`) move · `Enter` attach · `d` kill ·
 `n` start a new agent in the current directory · `q` quit.
 
+## Web dashboard
+
+`amux serve` runs a local server with a built-in web UI — every agent session
+with live status and logs, plus input you can send — in your browser, no app to
+install.
+
+```bash
+amux serve --open    # start and open http://localhost:8787
+amux serve           # start in the background (daemon)
+amux stop            # stop it
+```
+
+Add `--token <secret>` to require a bearer token, and reach it from another
+device over Tailscale or an ngrok tunnel. The same server also backs the Agent
+Port mobile app.
+
 ## Session switcher (Ghostty + tmux)
 
 `amux init` also installs a quick session switcher for Ghostty split-pane

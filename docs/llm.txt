@@ -49,19 +49,20 @@ After `amux init`, reload the shell: `source ~/.zshrc` (or open a new terminal).
     amux                # TUI: type / to filter, ↑/↓ or j/k to move, Enter attach,
                         #      d kill, n new agent here, q quit
 
-## Optional — monitor & control from another device
-`amux serve` starts a local HTTP/WebSocket server that watches every tmux agent
-session (status + live logs) and can send input to them.
+## Optional — the web dashboard (browser UI, no app needed)
+`amux serve` starts a local server with a built-in web dashboard: every tmux
+agent session with live status and logs, plus the ability to send input — all in
+your browser.
 
-    amux serve                                  # http://0.0.0.0:8787 (daemon)
-    amux serve --port 8787 --token <secret>     # require a bearer token
-    amux stop                                   # stop the daemon
+    amux serve --open                         # start, then open the browser
+    amux serve                                # start in the background (daemon)
+    amux serve --port 8787 --token <secret>   # custom port / require a token
+    amux stop                                 # stop the daemon
     #   logs: ~/.amux/serve.log
 
-On the same machine, reach it at `http://localhost:8787`; on your LAN, at
-`http://<this-machine-ip>:8787`. Clients: the Agent Port app (iOS / Android /
-desktop) or a web browser. All of this is OPTIONAL — the terminal workflow above
-stands on its own.
+On this machine open `http://localhost:8787`; on your LAN,
+`http://<this-machine-ip>:8787`. The same server also backs the Agent Port mobile
+app. All of this is OPTIONAL — the terminal workflow above stands on its own.
 
 ### Remote access — use amux from your phone or another network
 `amux serve` only listens on the local machine's network. To reach it from your
