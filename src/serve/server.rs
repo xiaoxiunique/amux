@@ -848,60 +848,13 @@ fn agent_kind_for_pane(pane: &BasePane, tail: &str) -> Option<&'static str> {
 }
 
 fn project_session_name(agent: &str, path: &str) -> Result<String, String> {
-    let prefix = match agent {
-        "codex" => "cx",
-        _ => "cc",
-    };
-    let hash = short_sha1(path)?;
-    let mut name = project_name_from_path(path)
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if name.ends_with('_') {
-        name.pop();
-    }
-    Ok(format!("{prefix}_{name}_{hash}"))
-}
-
-fn short_sha1(value: &str) -> Result<String, String> {
-    let mut child = Command::new("/usr/bin/shasum")
-        .args(["-a", "1"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to start shasum: {error}"))?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(value.as_bytes())
-            .map_err(|error| format!("failed to hash project path: {error}"))?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("failed to read shasum output: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("shasum exited with {}", output.status));
-    }
-
-    let hash = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .chars()
-        .take(8)
-        .collect::<String>();
-    if hash.len() == 8 {
-        Ok(hash)
-    } else {
-        Err("shasum returned an invalid digest".to_string())
-    }
+    let alias = if agent == "codex" { "cx" } else { "cc" };
+    // Reuse the CLI's naming (crate::session) so a project launched from the web
+    // UI / app lands on the SAME tmux session `amux run` would create for that
+    // directory. Canonicalize first to match run.rs's cwd handling and its
+    // SHA-256 hash (this used to be a separate SHA-1 path, which never matched).
+    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
+    Ok(crate::session::session_name(alias, &abs))
 }
 
 fn agent_launch_command(agent: &str) -> Result<String, String> {
