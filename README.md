@@ -11,6 +11,7 @@ the live session instead of starting a new one.
 
 ```bash
 brew tap xiaoxiunique/amux
+brew trust xiaoxiunique/amux   # Homebrew 6+ requires trusting third-party taps
 brew install amux
 amux init   # installs shell aliases + tmux/Ghostty keybindings
 ```
