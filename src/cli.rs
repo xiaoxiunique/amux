@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -60,4 +61,8 @@ pub enum Command {
         /// Input file (default: ~/.amux/sessions.json).
         file: Option<PathBuf>,
     },
+    /// Fuzzy-match a session by directory name and attach to it.
+    /// E.g. `amux mbox` attaches to a session whose directory matches "mbox".
+    #[command(external_subcommand)]
+    Goto(Vec<OsString>),
 }

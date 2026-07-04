@@ -103,6 +103,10 @@ fn main() -> Result<()> {
         Some(Command::Restore { file }) => {
             commands::sessions::restore(file.as_deref(), &agents)
         }
+        Some(Command::Goto(args)) => {
+            let query = args.first().and_then(|s| s.to_str()).unwrap_or("");
+            commands::sessions::goto(query, &agents)
+        }
         None => tui::run_tui(&agents),
     }
 }

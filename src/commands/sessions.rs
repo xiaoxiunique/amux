@@ -66,6 +66,60 @@ pub fn kill(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Extract the directory slug from a session name.
+/// E.g. `cc_myproject_1a2b3c4d` → "myproject", `cc-openai_my_proj_deadbeef` → "my_proj".
+fn session_slug(name: &str) -> Option<&str> {
+    // slug is everything between the first `_` (after alias[-provider]) and the last `_<hash>`.
+    let first = name.find('_')?;
+    let last = name.rfind('_')?;
+    if last <= first + 1 {
+        return None;
+    }
+    Some(&name[first + 1..last])
+}
+
+/// Fuzzy-match a managed session by its directory slug and attach to it.
+/// Unique match → attach directly. Multiple → numbered picker.
+pub fn goto(query: &str, agents: &[Agent]) -> Result<()> {
+    let all = tmux::list_session_names()?;
+    let managed = managed_sessions(&all, agents);
+
+    let q = query.to_lowercase();
+    let matches: Vec<&ManagedSession> = managed
+        .iter()
+        .filter(|s| {
+            session_slug(&s.name)
+                .map(|slug| slug.to_lowercase().contains(&q))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            anyhow::bail!("no session matches '{query}'");
+        }
+        [only] => tmux::attach_or_switch(&only.name),
+        many => {
+            println!("Multiple sessions match '{query}':");
+            for (i, s) in many.iter().enumerate() {
+                println!("  {}) {}", i + 1, s.name);
+            }
+            print!("Select [1-{}]: ", many.len());
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let idx: usize = line.trim().parse().unwrap_or(0);
+            if idx >= 1 && idx <= many.len() {
+                tmux::attach_or_switch(&many[idx - 1].name)
+            } else {
+                anyhow::bail!("invalid selection");
+            }
+        }
+    }
+}
+
 /// Parsed info from a session name: the agent alias and optional provider.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SessionEntry {
@@ -282,6 +336,14 @@ mod tests {
         assert_eq!(parse_session_alias("cc-openai_myproject_1a2b3c4d"), Some(("cc", Some("openai"))));
         assert_eq!(parse_session_alias("cx-deepseek_api_deadbeef"), Some(("cx", Some("deepseek"))));
         assert_eq!(parse_session_alias("_weird"), None);
+    }
+
+    #[test]
+    fn session_slug_extracts_directory() {
+        assert_eq!(session_slug("cc_myproject_1a2b3c4d"), Some("myproject"));
+        assert_eq!(session_slug("cc-openai_my_proj_deadbeef"), Some("my_proj"));
+        assert_eq!(session_slug("cx_api_deadbeef"), Some("api"));
+        assert_eq!(session_slug("cc_nohash"), None);
     }
 
     #[test]
