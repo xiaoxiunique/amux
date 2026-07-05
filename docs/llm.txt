@@ -47,6 +47,8 @@ After `amux init`, reload the shell: `source ~/.zshrc` (or open a new terminal).
     #   detach any time: press Ctrl-b, then d
     cc                  # run again in the same dir → reattaches the SAME session
     cx                  # starts Codex in its own session
+    amux <dir>          # from anywhere: fuzzy-jump to a session by directory name
+                        #      e.g. `amux myapp` (prompts if several match)
     amux                # TUI: type / to filter, ↑/↓ or j/k to move, Enter attach,
                         #      d kill, n new agent here, q quit
 

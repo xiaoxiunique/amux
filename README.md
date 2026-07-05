@@ -23,6 +23,7 @@ cd ~/projects/myapp
 cc          # starts Claude Code in a tmux session for this dir
 # detach with Ctrl-b d; run `cc` again here to jump back
 cx          # starts Codex in its own session
+amux myapp  # from anywhere: fuzzy-jump back to this dir's session
 amux        # TUI: switch between all running agent sessions
 amux ls     # list sessions
 ```
@@ -32,9 +33,11 @@ amux ls     # list sessions
 | Command | Behavior |
 |---------|----------|
 | `amux run <agent> [args…]` | Launch or reattach `<agent>` in the current directory. Extra args are forwarded to the agent. |
+| `amux <dir>` | Fuzzy-match a running session by directory name and jump to it from anywhere — e.g. `amux mbox`. Prompts if several match. |
 | `amux init` | Install shell aliases (`cc`, `cx`, …), tmux keybindings, and Ghostty keybindings. |
 | `amux ls` | List amux-managed sessions across all directories. |
 | `amux kill <name>` | Kill a session by name. |
+| `amux save [file]` / `amux restore [file]` | Save the running session list and restore it later (default `~/.amux/sessions.json`). |
 | `amux config` | Show resolved config and its path. |
 | `amux` | Open the TUI session selector. |
 
