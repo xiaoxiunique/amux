@@ -32,6 +32,10 @@ use tokio::sync::{broadcast, mpsc};
 const DEFAULT_PORT: u16 = 8787;
 const DEFAULT_HOST: &str = "0.0.0.0";
 const FIELD_SEPARATOR: &str = "\t";
+/// A pane's agent session file written within this many seconds counts as
+/// "actively working" (poll cadence is 2.5s; small enough to flip to idle
+/// promptly, large enough not to flap across brief think/tool gaps).
+const RUNNING_WINDOW_SECS: f64 = 8.0;
 
 static BUFFER_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PANE_ACTIVITY: LazyLock<Mutex<HashMap<String, PaneActivity>>> =
@@ -135,7 +139,7 @@ struct AppState {
     pane_log_refreshes: broadcast::Sender<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum PaneStatus {
     Running,
@@ -163,6 +167,10 @@ struct Pane {
     status: PaneStatus,
     reason: String,
     updated_at: String,
+    /// Seconds since the agent's session file was last written (`null` if no
+    /// session file was found). Small = actively working. Real activity signal
+    /// for the UI, independent of the coarse status enum.
+    activity_age_secs: Option<f64>,
     messages: Vec<InteractionMessage>,
 }
 
@@ -835,12 +843,23 @@ fn project_name_from_path(path: &str) -> String {
 }
 
 fn agent_kind_for_pane(pane: &BasePane, tail: &str) -> Option<&'static str> {
+    // The amux session-name prefix is authoritative — a `cc_` pane is Claude
+    // even when its terminal is full of the word "codex" (e.g. a conversation
+    // *about* codex), and vice versa. Content sniffing is only a fallback for
+    // panes not launched by amux.
+    if pane.session.starts_with("cx_") {
+        return Some("codex");
+    }
+    if pane.session.starts_with("cc_") {
+        return Some("claude");
+    }
+
     if is_codex_pane(pane, tail) {
         return Some("codex");
     }
 
     let haystack = format!("{}\n{}\n{}", pane.session, pane.command, pane.title).to_lowercase();
-    if pane.session.starts_with("cc_") || pane.command == "claude" || haystack.contains("claude") {
+    if pane.command == "claude" || haystack.contains("claude") {
         return Some("claude");
     }
 
@@ -883,8 +902,30 @@ fn is_codex_pane(pane: &BasePane, tail: &str) -> bool {
         || haystack.contains("gpt-")
 }
 
-fn infer_status(pane: &BasePane, tail: &str, changed_recently: bool) -> (PaneStatus, String) {
+/// Seconds since the pane's agent session file (codex rollout / claude jsonl)
+/// was last written. `None` when no matching file is found. A small value means
+/// the agent is actively appending output → working.
+fn session_activity_age(agent: &str, cwd: &str) -> Option<f64> {
+    let path = crate::commands::session_ids::session_file_for(agent, Path::new(cwd))?;
+    let modified = path.metadata().ok()?.modified().ok()?;
+    let secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    Some((now - secs).max(0.0))
+}
+
+fn infer_status(
+    pane: &BasePane,
+    tail: &str,
+    changed_recently: bool,
+    file_age: Option<f64>,
+) -> (PaneStatus, String) {
     let lower = tail.to_lowercase();
+    let agent_like = agent_kind_for_pane(pane, tail).is_some();
+
+    // `recent` (last 18 lines) is used only for the spinner/liveness check.
     let recent = tail
         .lines()
         .rev()
@@ -896,8 +937,26 @@ fn infer_status(pane: &BasePane, tail: &str, changed_recently: bool) -> (PaneSta
         .join("\n")
         .to_lowercase();
 
+    // `prompt_zone` = the last few non-empty lines, i.e. the bottom of the
+    // screen where a real prompt / result / error actually sits. Keyword checks
+    // run against THIS, not the whole scrollback, so a conversation that merely
+    // *mentions* "proceed?" / "error:" / "done" doesn't flip the status.
+    let prompt_zone = tail
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+
+    // A crash or an on-screen prompt at the bottom of the pane needs the user's
+    // attention and takes priority even over active work — check these first,
+    // but only against `prompt_zone` so scrollback that merely mentions the
+    // words doesn't trip them.
     if contains_any(
-        &recent,
+        &prompt_zone,
         &[
             "failed",
             "error:",
@@ -923,7 +982,7 @@ fn infer_status(pane: &BasePane, tail: &str, changed_recently: bool) -> (PaneSta
     }
 
     if contains_any(
-        &recent,
+        &prompt_zone,
         &[
             "do you want",
             "proceed?",
@@ -939,8 +998,27 @@ fn infer_status(pane: &BasePane, tail: &str, changed_recently: bool) -> (PaneSta
         return (PaneStatus::Waiting, "looks like it needs input".to_string());
     }
 
+    // Liveness: an agent actively writing its session file (or showing the live
+    // "esc to interrupt" spinner) is Running. When no session file is found,
+    // fall back to the terminal change signal.
+    let file_fresh = file_age.map(|a| a < RUNNING_WINDOW_SECS).unwrap_or(false);
+    let live_agent_work = contains_any(&recent, &["esc to interrupt", "/stop to close"])
+        && contains_any(&recent, &["working (", "thinking (", "running ("]);
+    let file_fallback = file_age.is_none() && changed_recently;
+
+    if agent_like && (file_fresh || live_agent_work || file_fallback) {
+        let why = if file_fresh {
+            "session file is actively being written"
+        } else if live_agent_work {
+            "agent reports active work"
+        } else {
+            "recent output changed"
+        };
+        return (PaneStatus::Running, why.to_string());
+    }
+
     if contains_any(
-        &recent,
+        &prompt_zone,
         &[
             "success",
             "completed",
@@ -953,27 +1031,18 @@ fn infer_status(pane: &BasePane, tail: &str, changed_recently: bool) -> (PaneSta
         return (PaneStatus::Done, "recent output looks complete".to_string());
     }
 
-    // Identify agent panes by session/command/title (the `cc_`/`cx_` prefix),
-    // not by the visible screen. A finished Claude pane often shows no literal
-    // "claude" on its last screen, which used to drop it to the generic
-    // "process is active → Running" branch below.
-    let agent_like = agent_kind_for_pane(pane, tail).is_some();
-    let live_agent_work = contains_any(&recent, &["esc to interrupt", "/stop to close"])
-        && contains_any(&recent, &["working (", "thinking (", "running ("]);
-
-    if agent_like && live_agent_work {
-        return (PaneStatus::Running, "agent reports active work".to_string());
-    }
-
-    if changed_recently {
-        return (PaneStatus::Running, "recent output changed".to_string());
-    }
-
+    // Agent pane that isn't actively writing and shows no prompt → idle,
+    // waiting for the user's next message.
     if agent_like {
         return (
             PaneStatus::Idle,
-            "agent pane has no recent output".to_string(),
+            "agent session is quiet — waiting for you".to_string(),
         );
+    }
+
+    // Non-agent processes: fall back to terminal output changes.
+    if changed_recently {
+        return (PaneStatus::Running, "recent output changed".to_string());
     }
 
     if lower.is_empty() || ["zsh", "bash", "fish", "nu"].contains(&pane.command.as_str()) {
@@ -1919,7 +1988,9 @@ fn build_snapshot() -> Snapshot {
         .map(|pane| {
             let tail = capture_pane(&pane.id);
             let changed_recently = track_pane_activity(&pane.id, &tail);
-            let (status, reason) = infer_status(&pane, &tail, changed_recently);
+            let activity_age_secs = agent_kind_for_pane(&pane, &tail)
+                .and_then(|agent| session_activity_age(agent, &pane.path));
+            let (status, reason) = infer_status(&pane, &tail, changed_recently, activity_age_secs);
             let messages = interaction_messages_for_pane(&pane, &tail, &status, &reason, &now);
 
             Pane {
@@ -1938,6 +2009,7 @@ fn build_snapshot() -> Snapshot {
                 status,
                 reason,
                 updated_at: now.clone(),
+                activity_age_secs,
                 messages,
             }
         })
@@ -3917,4 +3989,69 @@ async fn send_terminal_error(socket: &mut WebSocket, error: String) {
         ))
         .await;
     let _ = socket.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane(session: &str) -> BasePane {
+        BasePane {
+            id: "%1".into(),
+            target: "t".into(),
+            session: session.into(),
+            window_index: "0".into(),
+            window_name: "w".into(),
+            pane_index: "0".into(),
+            command: "node".into(),
+            path: "/work/proj".into(),
+            active: true,
+            pid: Some(1),
+            title: "".into(),
+        }
+    }
+
+    #[test]
+    fn fresh_session_file_means_running() {
+        let (s, _) = infer_status(&pane("cx_proj_1a2b3c4d"), "", false, Some(2.0));
+        assert_eq!(s, PaneStatus::Running);
+    }
+
+    #[test]
+    fn stale_session_file_means_idle() {
+        let (s, _) = infer_status(&pane("cx_proj_1a2b3c4d"), "just some quiet output", false, Some(600.0));
+        assert_eq!(s, PaneStatus::Idle);
+    }
+
+    #[test]
+    fn no_file_falls_back_to_terminal_change() {
+        // Unknown file age → use the terminal change signal.
+        let (running, _) = infer_status(&pane("cx_proj_1a2b3c4d"), "output", true, None);
+        assert_eq!(running, PaneStatus::Running);
+        let (idle, _) = infer_status(&pane("cx_proj_1a2b3c4d"), "output", false, None);
+        assert_eq!(idle, PaneStatus::Idle);
+    }
+
+    #[test]
+    fn permission_prompt_always_waiting() {
+        // Even with a fresh file, an on-screen prompt wins (needs the user).
+        let (s, _) = infer_status(&pane("cc_proj_1a2b3c4d"), "Do you want to proceed? (y/n)", false, Some(1.0));
+        assert_eq!(s, PaneStatus::Waiting);
+    }
+
+    #[test]
+    fn error_output_means_failed() {
+        let (s, _) = infer_status(&pane("cx_proj_1a2b3c4d"), "thread panicked\nerror: boom", false, Some(1.0));
+        assert_eq!(s, PaneStatus::Failed);
+    }
+
+    #[test]
+    fn session_prefix_wins_over_tail_content() {
+        // A Claude pane whose terminal is full of "codex"/"gpt-" must still be
+        // classified as claude, so status looks at the right session file.
+        let cc = pane("cc_proj_1a2b3c4d");
+        assert_eq!(agent_kind_for_pane(&cc, "talking about codex and gpt-5"), Some("claude"));
+        let cx = pane("cx_proj_1a2b3c4d");
+        assert_eq!(agent_kind_for_pane(&cx, "mentions claude a lot"), Some("codex"));
+    }
 }

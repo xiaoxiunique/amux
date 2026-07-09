@@ -134,18 +134,19 @@ fn codex_meta(path: &Path) -> Option<(String, String)> {
     Some((cwd, id))
 }
 
-/// Newest codex rollout whose recorded cwd matches. Returns its id.
-/// Only scans the most recent files for speed.
-fn newest_codex_rollout_for(root: &Path, cwd: &Path) -> Option<String> {
+/// Newest codex rollout file whose recorded cwd matches. Scans recent files only.
+fn newest_codex_rollout_path(root: &Path, cwd: &Path) -> Option<PathBuf> {
     let target = cwd.to_string_lossy();
-    for f in jsonl_files_by_mtime(root).into_iter().take(60) {
-        if let Some((rcwd, id)) = codex_meta(&f) {
-            if rcwd == target {
-                return Some(id);
-            }
-        }
-    }
-    None
+    jsonl_files_by_mtime(root)
+        .into_iter()
+        .take(60)
+        .find(|f| codex_meta(f).map(|(rcwd, _)| rcwd == target).unwrap_or(false))
+}
+
+/// Newest codex rollout whose recorded cwd matches. Returns its id.
+fn newest_codex_rollout_for(root: &Path, cwd: &Path) -> Option<String> {
+    let p = newest_codex_rollout_path(root, cwd)?;
+    codex_meta(&p).map(|(_, id)| id)
 }
 
 fn codex_rollout_with_id(root: &Path, id: &str) -> Option<PathBuf> {
@@ -155,22 +156,37 @@ fn codex_rollout_with_id(root: &Path, id: &str) -> Option<PathBuf> {
         .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&needle)))
 }
 
-/// Newest claude session id for a cwd (its project dir).
-fn newest_claude_session(root: &Path, cwd: &Path) -> Option<String> {
+/// Newest claude session file for a cwd (its project dir).
+fn newest_claude_session_path(root: &Path, cwd: &Path) -> Option<PathBuf> {
     let dir = claude_project_dir(root, cwd);
-    let mut best: Option<(String, f64)> = None;
+    let mut best: Option<(PathBuf, f64)> = None;
     for e in std::fs::read_dir(&dir).ok()?.flatten() {
         let p = e.path();
         if p.extension().is_some_and(|x| x == "jsonl") {
             let m = mtime_epoch(&p);
-            if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) {
-                if best.as_ref().map(|(_, bm)| m > *bm).unwrap_or(true) {
-                    best = Some((stem, m));
-                }
+            if best.as_ref().map(|(_, bm)| m > *bm).unwrap_or(true) {
+                best = Some((p, m));
             }
         }
     }
-    best.map(|(id, _)| id)
+    best.map(|(p, _)| p)
+}
+
+/// Newest claude session id for a cwd (its project dir).
+fn newest_claude_session(root: &Path, cwd: &Path) -> Option<String> {
+    newest_claude_session_path(root, cwd)
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+}
+
+/// Path to the newest agent session file for `cwd` (codex rollout / claude
+/// jsonl). Its mtime is a robust "actively working" signal for the monitor.
+pub fn session_file_for(agent_name: &str, cwd: &Path) -> Option<PathBuf> {
+    let root = agent_session_root(agent_name)?;
+    match agent_name {
+        "codex" => newest_codex_rollout_path(&root, cwd),
+        "claude" => newest_claude_session_path(&root, cwd),
+        _ => None,
+    }
 }
 
 /// The id of the newest session file for `cwd` right now. Used both to resolve a
