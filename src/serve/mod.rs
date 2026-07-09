@@ -9,6 +9,10 @@
 )]
 pub mod server;
 
+#[cfg(feature = "full")]
+#[allow(clippy::all, dead_code)]
+pub(crate) mod full;
+
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;

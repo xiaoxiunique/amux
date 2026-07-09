@@ -32,4 +32,18 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], def
 libc = "0.2"
 include_dir = "0.7"
 
+# Optional — only pulled in by the `full` feature (agent-port host build).
+jsonwebtoken = { version = "9", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Optional (full feature): per-window screenshot needs the CG window list.
+core-graphics = { version = "0.24", optional = true }
+core-foundation = { version = "0.10", optional = true }
+
+[features]
+# `amux serve --features full` = the full agent-port host service: adds the
+# macOS control-center (apps + screenshots), token-usage, and APNs push
+# endpoints on top of the core session monitor.
+full = ["dep:jsonwebtoken", "dep:core-graphics", "dep:core-foundation", "reqwest/http2"]
+
 [dev-dependencies]

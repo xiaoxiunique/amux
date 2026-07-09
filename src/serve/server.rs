@@ -147,7 +147,7 @@ struct InteractionMessage {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     token: String,
     snapshots: broadcast::Sender<serde_json::Value>,
     pane_log_refreshes: broadcast::Sender<String>,
@@ -155,7 +155,7 @@ struct AppState {
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum PaneStatus {
+pub(crate) enum PaneStatus {
     Running,
     Waiting,
     Idle,
@@ -165,20 +165,20 @@ enum PaneStatus {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct Pane {
-    id: String,
+pub(crate) struct Pane {
+    pub(crate) id: String,
     target: String,
-    session: String,
+    pub(crate) session: String,
     window_index: String,
     window_name: String,
     pane_index: String,
-    command: String,
-    path: String,
+    pub(crate) command: String,
+    pub(crate) path: String,
     active: bool,
     pid: Option<u32>,
-    title: String,
+    pub(crate) title: String,
     tail: String,
-    status: PaneStatus,
+    pub(crate) status: PaneStatus,
     reason: String,
     updated_at: String,
     /// Seconds since the agent's session file was last written (`null` if no
@@ -438,6 +438,13 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         pane_log_refreshes,
     };
 
+    // Full build: load persisted APNs device tokens + per-pane notify config.
+    #[cfg(feature = "full")]
+    {
+        crate::serve::full::push::load_device_tokens();
+        crate::serve::full::push::load_notify_config();
+    }
+
     spawn_snapshot_loop(state.clone());
 
     let app = Router::new()
@@ -461,9 +468,32 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         .route("/api/cc-switch/switch", post(api_cc_switch_switch))
         .route("/ws", get(snapshot_ws))
         .route("/pane-log/ws", get(pane_log_ws))
-        .route("/terminal/ws", get(terminal_ws))
-        .fallback(serve_webui)
-        .with_state(state.clone());
+        .route("/terminal/ws", get(terminal_ws));
+
+    // Full build (`--features full`) adds the agent-port host extras:
+    // macOS control-center, token-usage, and APNs push.
+    #[cfg(feature = "full")]
+    let app = {
+        use crate::serve::full::{control_center as cc, push, usage};
+        app.route("/api/apps", get(cc::api_apps))
+            .route("/api/apps/installed", get(cc::api_apps_installed))
+            .route("/api/apps/open", post(cc::api_apps_open))
+            .route("/api/apps/icon", get(cc::api_apps_icon))
+            .route("/api/apps/quit", post(cc::api_apps_quit))
+            .route("/api/apps/screenshot", get(cc::api_app_screenshot))
+            .route("/api/screen", get(cc::api_screen))
+            .route("/api/usage", get(usage::api_usage))
+            .route("/api/usage/daily", get(usage::api_usage_daily))
+            .route("/api/push/register", post(push::api_push_register))
+            .route("/api/push/test", post(push::api_push_test))
+            .route("/api/push/status", get(push::api_push_status))
+            .route(
+                "/api/pane/notify-config",
+                get(push::api_notify_config_get).post(push::api_notify_config_set),
+            )
+    };
+
+    let app = app.fallback(serve_webui).with_state(state.clone());
 
     let bind_addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -484,7 +514,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
     axum::serve(listener, app).await.expect("server failed");
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -2242,6 +2272,9 @@ fn clean_command_output(output: String) -> Option<String> {
 fn broadcast_snapshot(state: &AppState) -> Snapshot {
     let snapshot = build_snapshot();
     flush_pending_messages(state, &snapshot.panes);
+    // Full build: fire status-change push notifications for phone-initiated turns.
+    #[cfg(feature = "full")]
+    crate::serve::full::push::notify_status_changes(&snapshot.panes);
     let _ = state.snapshots.send(json!({
         "type": "snapshot",
         "snapshot": snapshot,
@@ -2336,7 +2369,7 @@ fn spawn_snapshot_loop(state: AppState) {
     });
 }
 
-fn is_authed(state: &AppState, headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
+pub(crate) fn is_authed(state: &AppState, headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
     if state.token.is_empty() {
         return true;
     }
@@ -2349,7 +2382,7 @@ fn is_authed(state: &AppState, headers: &HeaderMap, query: &HashMap<String, Stri
             == Some(bearer.as_str())
 }
 
-fn json_response<T: Serialize>(status: StatusCode, value: T) -> Response<Body> {
+pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: T) -> Response<Body> {
     let body = serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"error\":\"json\"}".to_vec());
     Response::builder()
         .status(status)
@@ -2403,7 +2436,7 @@ async fn api_pane_context(
 /// Field-based Claude detection mirroring `agent_kind_for_pane`: the `cc_`/`cx_`
 /// session prefix is authoritative, so a Claude pane whose terminal mentions
 /// "codex" is still Claude (and its queue isn't stranded).
-fn pane_is_claude(session: &str, command: &str, title: &str) -> bool {
+pub(crate) fn pane_is_claude(session: &str, command: &str, title: &str) -> bool {
     if session.starts_with("cc_") {
         return true;
     }
@@ -2654,6 +2687,13 @@ async fn api_send(
             }
         })
         .or(requested_submit_key);
+
+    // Full build: record who kicked off this turn (phone vs computer) so
+    // status-change push notifications only fire for phone-initiated turns.
+    #[cfg(feature = "full")]
+    if let Some(pane) = target_pane.as_ref() {
+        crate::serve::full::push::mark_send_source(&headers, &pane.path);
+    }
 
     // Pending queue (Claude Code only): if the agent is currently busy, hold the
     // message and let `flush_pending_messages` deliver it once the pane is idle.
