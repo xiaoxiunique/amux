@@ -96,6 +96,15 @@ The tmux session name is `<alias>_<dirslug>_<hash8>`, e.g.
 the absolute directory path. Same agent + same directory always maps to the same
 session, so re-running attaches instead of duplicating.
 
+### Conversation resume
+
+When a session's tmux window is gone (reboot, `amux kill`), re-running the agent
+resumes the *exact* conversation it was on, not just "the latest". amux records
+each session's real agent session id (Claude/Codex) in `~/.amux/session-ids.json`
+and relaunches with `codex resume <id>` / `claude --resume <id>`. This stays
+correct even after switching model providers, so a conversation started under one
+provider continues seamlessly under another.
+
 ## Requires
 
 - tmux (Linux or macOS). Without tmux, amux runs the agent directly.
