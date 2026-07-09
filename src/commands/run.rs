@@ -85,6 +85,16 @@ pub fn run(agent: &Agent, extra: &[String], provider_name: Option<&str>, agents:
             format!("{} {}", env_prefix, tmux::shell_join(&argv))
         };
         tmux::send_command(&name, &shell_cmd)?;
+
+        // Auto-confirm codex's directory-trust prompt. Codex re-prompts on every
+        // launch even for trusted dirs (regression: config/--yolo don't suppress
+        // it), so send an Enter — it selects the default "Yes, continue". The
+        // key is buffered in the pty until codex reads it; if no prompt appears
+        // it lands on the empty composer and is a harmless no-op.
+        if agent.name == "codex" {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let _ = tmux::send_enter(&name);
+        }
     } else {
         // Session is alive: the running agent is writing the newest rollout for
         // this cwd. Record its id so a later relaunch resumes this exact session

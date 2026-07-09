@@ -57,6 +57,14 @@ pub fn send_command(name: &str, shell_cmd: &str) -> Result<()> {
     Ok(())
 }
 
+/// Send a bare Enter keypress to a session's active pane.
+pub fn send_enter(name: &str) -> Result<()> {
+    Command::new("tmux")
+        .args(["send-keys", "-t", name, "Enter"])
+        .status()?;
+    Ok(())
+}
+
 /// Names of all sessions; empty vec if no server is running.
 pub fn list_session_names() -> Result<Vec<String>> {
     let out = Command::new("tmux")
