@@ -58,6 +58,10 @@ static PANE_STATUS_CACHE: LazyLock<Mutex<HashMap<String, PaneStatus>>> =
 static PENDING_FLUSH_AT: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PENDING_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Persistent sysinfo handle for cross-platform CPU/memory sampling. Kept alive
+/// so CPU% is measured as the delta between snapshot polls.
+static SYSINFO: LazyLock<Mutex<sysinfo::System>> =
+    LazyLock::new(|| Mutex::new(sysinfo::System::new()));
 static PANE_LOG_REFRESH_BURST_IDS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CC_SWITCH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -2120,14 +2124,34 @@ fn build_snapshot() -> Snapshot {
 }
 
 fn collect_system_stats() -> Option<SystemStats> {
-    let cpu_usage = collect_cpu_usage();
-    let memory_usage = collect_memory_usage();
-    if cpu_usage.is_none() && memory_usage.is_none() {
+    // Cross-platform CPU + memory via sysinfo (works on macOS, Linux, Windows).
+    // A persistent System instance lets CPU% measure the delta since the last
+    // snapshot (~2.5s), so readings are meaningful after the first tick.
+    let mut sys = SYSINFO.lock().ok()?;
+    sys.refresh_cpu_usage();
+    sys.refresh_memory();
+
+    let cpu = {
+        let usage = sys.global_cpu_usage();
+        if usage.is_finite() {
+            Some((usage as f64).clamp(0.0, 100.0))
+        } else {
+            None
+        }
+    };
+    let total = sys.total_memory() as f64;
+    let memory = if total > 0.0 {
+        Some((sys.used_memory() as f64 / total * 100.0).clamp(0.0, 100.0))
+    } else {
+        None
+    };
+
+    if cpu.is_none() && memory.is_none() {
         return None;
     }
     Some(SystemStats {
-        cpu_usage,
-        memory_usage,
+        cpu_usage: cpu,
+        memory_usage: memory,
     })
 }
 
@@ -2136,6 +2160,7 @@ fn collect_device_info() -> Option<DeviceInfo> {
     info.clone()
 }
 
+#[cfg(target_os = "macos")]
 fn collect_device_info_uncached() -> Option<DeviceInfo> {
     let name = command_stdout("scutil", &["--get", "ComputerName"])
         .or_else(|| command_stdout("hostname", &[]))
@@ -2159,6 +2184,27 @@ fn collect_device_info_uncached() -> Option<DeviceInfo> {
         model_identifier,
         kind: kind.to_string(),
         model_name: reported_model_name.unwrap_or_else(|| fallback_model_name.to_string()),
+    })
+}
+
+/// Non-macOS (Linux, Windows): hostname + OS name via sysinfo.
+#[cfg(not(target_os = "macos"))]
+fn collect_device_info_uncached() -> Option<DeviceInfo> {
+    let name = sysinfo::System::host_name();
+    let os_name = sysinfo::System::long_os_version().or_else(sysinfo::System::name);
+    if name.is_none() && os_name.is_none() {
+        return None;
+    }
+    let kind = if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+    Some(DeviceInfo {
+        name,
+        model_identifier: None,
+        kind: kind.to_string(),
+        model_name: os_name.unwrap_or_else(|| kind.to_string()),
     })
 }
 
@@ -2194,73 +2240,6 @@ fn system_profiler_model_name(output: String) -> Option<String> {
             .map(ToString::to_string)
             .and_then(clean_command_output)
     })
-}
-
-fn collect_cpu_usage() -> Option<f64> {
-    let output = Command::new("ps")
-        .args(["-A", "-o", "%cpu="])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let total: f64 = stdout
-        .lines()
-        .filter_map(|line| line.trim().parse::<f64>().ok())
-        .sum();
-    let cores = command_stdout("sysctl", &["-n", "hw.logicalcpu"])
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| *value > 0.0)
-        .unwrap_or(1.0);
-    Some((total / cores).clamp(0.0, 100.0))
-}
-
-fn collect_memory_usage() -> Option<f64> {
-    let total_bytes = command_stdout("sysctl", &["-n", "hw.memsize"])?
-        .trim()
-        .parse::<f64>()
-        .ok()?;
-    let vm_stat = command_stdout("vm_stat", &[])?;
-    let mut page_size = 4096.0;
-    let mut free_pages = 0.0;
-    let mut inactive_pages = 0.0;
-    let mut speculative_pages = 0.0;
-
-    for line in vm_stat.lines() {
-        if let Some(size) = line
-            .split("page size of ")
-            .nth(1)
-            .and_then(|tail| tail.split_whitespace().next())
-            .and_then(|value| value.parse::<f64>().ok())
-        {
-            page_size = size;
-            continue;
-        }
-
-        let pages = parse_vm_stat_pages(line);
-        if line.starts_with("Pages free:") {
-            free_pages = pages?;
-        } else if line.starts_with("Pages inactive:") {
-            inactive_pages = pages?;
-        } else if line.starts_with("Pages speculative:") {
-            speculative_pages = pages?;
-        }
-    }
-
-    let available_bytes = (free_pages + inactive_pages + speculative_pages) * page_size;
-    let used_ratio = ((total_bytes - available_bytes).max(0.0) / total_bytes).clamp(0.0, 1.0);
-    Some(used_ratio * 100.0)
-}
-
-fn parse_vm_stat_pages(line: &str) -> Option<f64> {
-    line.split(':')
-        .nth(1)?
-        .trim()
-        .trim_end_matches('.')
-        .replace(',', "")
-        .parse::<f64>()
-        .ok()
 }
 
 fn command_stdout(command: &str, args: &[&str]) -> Option<String> {

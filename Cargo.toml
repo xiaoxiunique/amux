@@ -30,6 +30,7 @@ futures-util = "0.3"
 portable-pty = "0.9"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 include_dir = "0.7"
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # Optional — only pulled in by the `full` feature (agent-port host build).
 jsonwebtoken = { version = "9", optional = true }
