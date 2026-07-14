@@ -1,6 +1,6 @@
 [package]
 name = "amux"
-version = "0.5.3"
+version = "0.5.4"
 edition = "2021"
 description = "Run AI coding agents in per-directory persistent tmux sessions"
 license = "MIT"
