@@ -842,10 +842,11 @@ fn safe_upload_pane_name(pane_id: &str) -> String {
 }
 
 fn upload_output_dir() -> PathBuf {
-    env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("output")
-        .join("mobile-uploads")
+    // Use the stable state dir, not the process CWD: when the bundled app
+    // launches `amux serve` from Finder/Dock the CWD is `/`, so a CWD-relative
+    // `output/mobile-uploads` would try to mkdir under `/` and fail
+    // (read-only file system). ~/.agent-monitor is always writable.
+    agent_monitor_state_dir().join("mobile-uploads")
 }
 
 fn user_home_dir() -> PathBuf {
