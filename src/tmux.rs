@@ -111,7 +111,7 @@ pub fn kill_session(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Attach (outside a mux, via exec) or switch-client (inside one).
+/// Attach (outside a mux, replacing this process) or switch-client (inside one).
 pub fn attach_or_switch(name: &str) -> Result<()> {
     if in_tmux() {
         Command::new(mux_bin())
@@ -119,11 +119,23 @@ pub fn attach_or_switch(name: &str) -> Result<()> {
             .status()?;
         Ok(())
     } else {
-        use std::os::unix::process::CommandExt;
-        let err = Command::new(mux_bin())
-            .args(["attach-session", "-t", name])
-            .exec();
-        bail!("failed to exec attach-session: {err}")
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = Command::new(mux_bin())
+                .args(["attach-session", "-t", name])
+                .exec();
+            bail!("failed to exec attach-session: {err}")
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows has no exec(): run attach to completion, then exit with
+            // its status so the shell behaves as if we'd been replaced.
+            let status = Command::new(mux_bin())
+                .args(["attach-session", "-t", name])
+                .status()?;
+            std::process::exit(status.code().unwrap_or(0));
+        }
     }
 }
 

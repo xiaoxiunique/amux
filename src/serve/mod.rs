@@ -41,9 +41,42 @@ fn log_file() -> Result<PathBuf> {
 }
 
 /// Check if a process with the given PID is alive.
+#[cfg(unix)]
 fn is_running(pid: u32) -> bool {
     // kill -0 checks existence without sending a signal
     unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+fn is_running(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
+}
+
+/// Ask the process to terminate (graceful), then force-kill.
+#[cfg(unix)]
+fn signal_terminate(pid: u32) {
+    unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+}
+#[cfg(unix)]
+fn signal_kill(pid: u32) {
+    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+}
+
+#[cfg(windows)]
+fn signal_terminate(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .output();
+}
+#[cfg(windows)]
+fn signal_kill(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .output();
 }
 
 /// Read PID from file, return None if missing or stale.
@@ -154,10 +187,8 @@ pub fn stop() -> Result<()> {
         return Ok(());
     };
 
-    // Send SIGTERM
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
+    // Ask it to terminate gracefully
+    signal_terminate(pid);
 
     // Wait up to 5 seconds
     for _ in 0..50 {
@@ -170,9 +201,7 @@ pub fn stop() -> Result<()> {
     }
 
     // Force kill
-    unsafe {
-        libc::kill(pid as i32, libc::SIGKILL);
-    }
+    signal_kill(pid);
     let _ = fs::remove_file(&pf);
     println!("Agent monitor killed (pid: {}).", pid);
     Ok(())

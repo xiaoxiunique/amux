@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Core build must compile on all three OSes (Windows is the point: rmux is
+      # cross-platform, so the CLI/serve should build there too).
+      - run: cargo build --verbose
+      # Tests skip the live multiplexer round-trip when no rmux/tmux is present,
+      # so they run cleanly on bare CI runners.
+      - run: cargo test --verbose
+      # The `full` feature bundles macOS-only host extras; only build it there.
+      - if: matrix.os == 'macos-latest'
+        run: cargo build --features full --verbose
