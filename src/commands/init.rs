@@ -17,10 +17,15 @@ pub fn render_block(agents: &[Agent]) -> String {
     s
 }
 
-/// Render the rmux keybinding block (fzf session switcher on M-O).
+/// Render the rmux setup block: mouse text-selection → clipboard, plus the fzf
+/// session switcher on M-O (Ghostty Shift+Cmd+O).
 pub fn render_mux_block() -> String {
     format!(
         "{BEGIN}\n\
+         # mouse text selection copies to the macOS clipboard\n\
+         set -g mouse on\n\
+         bind -T copy-mode-vi y send -X copy-pipe-and-cancel \"pbcopy\"\n\
+         bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n\
          # amux session switcher (triggered by Ghostty Shift+Cmd+O → ESC O)\n\
          bind -n M-O display-popup -E \"rmux list-sessions -F '#{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs rmux switch-client -t\"\n\
          {END}"
