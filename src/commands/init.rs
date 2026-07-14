@@ -121,6 +121,116 @@ pub fn install_to(path: &Path, agents: &[Agent]) -> Result<()> {
     install_block(path, &render_block(agents))
 }
 
+/// Where CLI binaries + shims are installed so a terminal can use amux/rmux/cc/cx.
+fn cli_bin_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        dirs::data_local_dir().map(|d| d.join("amux").join("bin"))
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::home_dir().map(|h| h.join(".local").join("bin"))
+    }
+}
+
+/// First `name` found on PATH.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Symlink (unix) or copy (windows) `src` → `dst`, replacing any existing file.
+fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(dst);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, dst)
+            .with_context(|| format!("linking {}", dst.display()))?;
+    }
+    #[cfg(windows)]
+    {
+        std::fs::copy(src, dst).with_context(|| format!("copying to {}", dst.display()))?;
+    }
+    Ok(())
+}
+
+/// Make amux + rmux and the `cc`/`cx` shortcuts available to a terminal, from a
+/// bundled or installed binary. Idempotent.
+pub fn install_cli(agents: &[Agent]) -> Result<()> {
+    let exe = std::env::current_exe().context("cannot find current executable")?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let exe_dir = exe.parent().map(Path::to_path_buf);
+
+    let rmux_name = if cfg!(windows) { "rmux.exe" } else { "rmux" };
+    let amux_name = if cfg!(windows) { "amux.exe" } else { "amux" };
+
+    // rmux: prefer a sibling of amux (bundled apps ship them together), else PATH.
+    let rmux = exe_dir
+        .as_ref()
+        .map(|d| d.join(rmux_name))
+        .filter(|p| p.exists())
+        .or_else(|| which(rmux_name));
+
+    let bindir = cli_bin_dir().context("cannot determine an install directory")?;
+    std::fs::create_dir_all(&bindir)
+        .with_context(|| format!("creating {}", bindir.display()))?;
+
+    link_or_copy(&exe, &bindir.join(amux_name))?;
+    println!("Installed amux → {}", bindir.join(amux_name).display());
+    match &rmux {
+        Some(r) => {
+            link_or_copy(r, &bindir.join(rmux_name))?;
+            println!("Installed rmux → {}", bindir.join(rmux_name).display());
+        }
+        None => eprintln!(
+            "note: rmux not found next to amux or on PATH — install it from https://rmux.io"
+        ),
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(rc) = rc_path() {
+            install_to(&rc, agents)?;
+            println!("Installed cc/cx aliases into {}", rc.display());
+        }
+        let on_path = std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).any(|d| d == bindir))
+            .unwrap_or(false);
+        if !on_path {
+            eprintln!(
+                "note: {} is not on PATH — add `export PATH=\"{}:$PATH\"` to your shell rc.",
+                bindir.display(),
+                bindir.display()
+            );
+        }
+        println!("Done. Open a new terminal (or `source` your rc) to use amux, rmux, cc, cx.");
+    }
+    #[cfg(windows)]
+    {
+        // `<alias>.cmd` shims so `cc`/`cx` work in cmd/PowerShell.
+        let amux_path = bindir.join(amux_name);
+        for a in agents {
+            let shim = bindir.join(format!("{}.cmd", a.alias));
+            std::fs::write(&shim, format!("@\"{}\" run {} %*\r\n", amux_path.display(), a.name))
+                .with_context(|| format!("writing {}", shim.display()))?;
+        }
+        // Add bindir to the user PATH if absent (persisted for new terminals).
+        let dir = bindir.display().to_string();
+        let ps = format!(
+            "$d='{dir}'; $p=[Environment]::GetEnvironmentVariable('PATH','User'); \
+             if(-not (($p -split ';') -contains $d)){{ \
+               [Environment]::SetEnvironmentVariable('PATH', ($p.TrimEnd(';') + ';' + $d), 'User') }}"
+        );
+        let _ = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
+            .status();
+        println!("Done. Open a new terminal to use amux, rmux, cc, cx.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

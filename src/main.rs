@@ -97,6 +97,7 @@ fn main() -> Result<()> {
             open,
         }) => serve::serve(port, host.as_deref(), token.as_deref(), foreground, open),
         Some(Command::Stop) => serve::stop(),
+        Some(Command::InstallCli) => commands::init::install_cli(&agents),
         Some(Command::Save { file }) => {
             commands::sessions::save(file.as_deref(), &agents)
         }

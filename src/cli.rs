@@ -24,6 +24,9 @@ pub enum Command {
     },
     /// Install shell aliases (cc, cx, ...) into your rc file.
     Init,
+    /// Install amux + rmux and the cc/cx shortcuts onto your PATH (self-contained
+    /// setup from a bundled or installed binary).
+    InstallCli,
     /// List amux-managed sessions.
     #[command(alias = "list")]
     Ls,
