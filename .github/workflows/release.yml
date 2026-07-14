@@ -27,6 +27,10 @@ jobs:
             target: aarch64-apple-darwin
             bin: amux
             archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: amux
+            archive: tar.gz
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bin: amux
@@ -35,6 +39,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
@@ -59,3 +65,71 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ASSET }}
+
+  # Rewrite the Homebrew tap's formula to install the just-built macOS binaries
+  # (no local `cargo` compile). Requires a HOMEBREW_TAP_TOKEN secret: a PAT with
+  # `contents:write` on xiaoxiunique/homebrew-amux.
+  formula:
+    name: update Homebrew tap
+    needs: binaries
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: xiaoxiunique/homebrew-amux
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Render formula from release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          base="https://github.com/$repo/releases/download/$TAG"
+          arm="amux-$TAG-aarch64-apple-darwin.tar.gz"
+          intel="amux-$TAG-x86_64-apple-darwin.tar.gz"
+          gh release download "$TAG" -R "$repo" -p "$arm" -p "$intel" -D dl
+          arm_sha=$(sha256sum "dl/$arm" | awk '{print $1}')
+          intel_sha=$(sha256sum "dl/$intel" | awk '{print $1}')
+          ver="${TAG#v}"
+          cat > Formula/amux.rb <<EOF
+          class Amux < Formula
+            desc "Run AI coding agents in per-directory persistent rmux sessions"
+            homepage "https://github.com/xiaoxiunique/amux"
+            version "$ver"
+            license "MIT"
+            depends_on "rmux"
+
+            on_macos do
+              on_arm do
+                url "$base/$arm"
+                sha256 "$arm_sha"
+              end
+              on_intel do
+                url "$base/$intel"
+                sha256 "$intel_sha"
+              end
+            end
+
+            def install
+              bin.install "amux"
+            end
+
+            test do
+              assert_match "amux", shell_output("#{bin}/amux --version")
+            end
+          end
+          EOF
+          echo "--- rendered ---"; cat Formula/amux.rb
+
+      - name: Commit & push
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/amux.rb
+          git commit -m "amux ${{ github.ref_name }} (auto)" || { echo "no changes"; exit 0; }
+          git push
+
