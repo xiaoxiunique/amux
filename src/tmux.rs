@@ -17,8 +17,19 @@ pub fn shell_join(argv: &[String]) -> String {
 use anyhow::{bail, Result};
 use std::process::Command;
 
+/// The terminal-multiplexer binary to drive. Defaults to `rmux` (tmux-compatible
+/// CLI, own daemon, cross-platform). Override with `AMUX_MUX` (or the legacy
+/// `AGENT_MONITOR_TMUX_PATH`) — e.g. `AMUX_MUX=tmux` to fall back to tmux.
+pub fn mux_bin() -> String {
+    std::env::var("AMUX_MUX")
+        .or_else(|_| std::env::var("AGENT_MONITOR_TMUX_PATH"))
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "rmux".to_string())
+}
+
 pub fn is_available() -> bool {
-    Command::new("tmux")
+    Command::new(mux_bin())
         .arg("-V")
         .output()
         .map(|o| o.status.success())
@@ -30,7 +41,7 @@ pub fn in_tmux() -> bool {
 }
 
 pub fn has_session(name: &str) -> bool {
-    Command::new("tmux")
+    Command::new(mux_bin())
         .args(["has-session", "-t", name])
         .output()
         .map(|o| o.status.success())
@@ -38,20 +49,20 @@ pub fn has_session(name: &str) -> bool {
 }
 
 pub fn new_session_detached(name: &str, cwd: &str) -> Result<()> {
-    let status = Command::new("tmux")
+    let status = Command::new(mux_bin())
         .args(["new-session", "-d", "-s", name, "-c", cwd])
         .status()?;
     if !status.success() {
-        bail!("failed to create tmux session '{name}'");
+        bail!("failed to create session '{name}'");
     }
     Ok(())
 }
 
 pub fn send_command(name: &str, shell_cmd: &str) -> Result<()> {
-    Command::new("tmux")
+    Command::new(mux_bin())
         .args(["send-keys", "-t", name, "-l", shell_cmd])
         .status()?;
-    Command::new("tmux")
+    Command::new(mux_bin())
         .args(["send-keys", "-t", name, "Enter"])
         .status()?;
     Ok(())
@@ -59,7 +70,7 @@ pub fn send_command(name: &str, shell_cmd: &str) -> Result<()> {
 
 /// Send a bare Enter keypress to a session's active pane.
 pub fn send_enter(name: &str) -> Result<()> {
-    Command::new("tmux")
+    Command::new(mux_bin())
         .args(["send-keys", "-t", name, "Enter"])
         .status()?;
     Ok(())
@@ -67,7 +78,7 @@ pub fn send_enter(name: &str) -> Result<()> {
 
 /// Names of all sessions; empty vec if no server is running.
 pub fn list_session_names() -> Result<Vec<String>> {
-    let out = Command::new("tmux")
+    let out = Command::new(mux_bin())
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()?;
     if !out.status.success() {
@@ -79,40 +90,40 @@ pub fn list_session_names() -> Result<Vec<String>> {
         .collect())
 }
 
-/// Get the current working directory of a tmux session's active pane.
+/// Get the current working directory of a session's active pane.
 pub fn session_cwd(name: &str) -> Result<String> {
-    let out = Command::new("tmux")
+    let out = Command::new(mux_bin())
         .args(["display-message", "-p", "-t", name, "#{pane_current_path}"])
         .output()?;
     if !out.status.success() {
-        bail!("failed to get cwd for tmux session '{name}'");
+        bail!("failed to get cwd for session '{name}'");
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 pub fn kill_session(name: &str) -> Result<()> {
-    let status = Command::new("tmux")
+    let status = Command::new(mux_bin())
         .args(["kill-session", "-t", name])
         .status()?;
     if !status.success() {
-        bail!("failed to kill tmux session '{name}'");
+        bail!("failed to kill session '{name}'");
     }
     Ok(())
 }
 
-/// Attach (outside tmux, via exec) or switch-client (inside tmux).
+/// Attach (outside a mux, via exec) or switch-client (inside one).
 pub fn attach_or_switch(name: &str) -> Result<()> {
     if in_tmux() {
-        Command::new("tmux")
+        Command::new(mux_bin())
             .args(["switch-client", "-t", name])
             .status()?;
         Ok(())
     } else {
         use std::os::unix::process::CommandExt;
-        let err = Command::new("tmux")
+        let err = Command::new(mux_bin())
             .args(["attach-session", "-t", name])
             .exec();
-        bail!("failed to exec tmux attach-session: {err}")
+        bail!("failed to exec attach-session: {err}")
     }
 }
 
@@ -136,7 +147,7 @@ mod tests {
     #[test]
     fn create_detect_and_kill_session() {
         if !is_available() {
-            eprintln!("skipping: tmux not installed");
+            eprintln!("skipping: no multiplexer installed");
             return;
         }
         let name = format!("amuxtest_{}", std::process::id());

@@ -30,11 +30,11 @@ Two major subsystems live in the same binary: the **CLI** (tmux session manager)
 
 **Config** (`src/config.rs`): Built-in agents (claude/cc, codex/cx) are merged with `~/.config/amux/config.toml`. File agents with the same `name` override builtins; new names are appended. `find()` matches by name or alias.
 
-**Tmux wrapper** (`src/tmux.rs`): Wraps tmux as a subprocess (`new-session`, `send-keys`, `attach-session`/`switch-client`, `kill-session`, `list-sessions`). `attach_or_switch` detects whether we're already inside tmux and uses `switch-client` vs `attach-session` accordingly. Also contains the shell-quoting helper used to safely construct `send-keys` command lines.
+**Multiplexer wrapper** (`src/tmux.rs`): Wraps the terminal multiplexer as a subprocess (`new-session`, `send-keys`, `attach-session`/`switch-client`, `kill-session`, `list-sessions`). The binary is resolved by `mux_bin()` — defaults to **rmux** (tmux-compatible CLI, own daemon, cross-platform; avoids tmux's multi-session mouse-scroll crash), overridable via `AMUX_MUX` (or legacy `AGENT_MONITOR_TMUX_PATH`), e.g. `AMUX_MUX=tmux`. `attach_or_switch` detects whether we're already inside a session (via the `TMUX` env var, which rmux also sets) and uses `switch-client` vs `attach-session` accordingly. Also contains the shell-quoting helper used to safely construct `send-keys` command lines. (File is still named `tmux.rs`.)
 
-**`run` command** (`src/commands/run.rs`): Canonicalizes cwd, generates session name, creates detached session if missing and sends the agent command, then attaches/switches. Falls back to running the agent directly if tmux is unavailable.
+**`run` command** (`src/commands/run.rs`): Canonicalizes cwd, generates session name, creates detached session if missing and sends the agent command, then attaches/switches. Falls back to running the agent directly if no multiplexer is available.
 
-**`init` command** (`src/commands/init.rs`): Inserts a managed block (`# >>> amux ... >>>` / `# <<< amux ... <<<`) with `alias X='amux run agent'` lines into the shell rc file. Idempotent — re-running replaces the block, preserving surrounding user content. Also installs tmux keybindings and Ghostty keybindings.
+**`init` command** (`src/commands/init.rs`): Inserts a managed block (`# >>> amux ... >>>` / `# <<< amux ... <<<`) with `alias X='amux run agent'` lines into the shell rc file. Idempotent — re-running replaces the block, preserving surrounding user content. Also installs rmux keybindings (into `~/.config/rmux/rmux.conf`, via `mux_conf_path()`/`render_mux_block()`) and Ghostty keybindings.
 
 **TUI** (`src/tui.rs`): ratatui + crossterm. Lists managed sessions (filtered by alias prefix + hash suffix pattern), supports vim keys, filter-as-you-type, attach/kill/new operations.
 
@@ -63,7 +63,8 @@ Auth: optional `--token` flag (checked via Bearer header or query param).
 ### Environment variables
 
 - `DEEPSEEK_API_KEY` — enables AI-powered interaction message enrichment in the server
-- `AGENT_MONITOR_TMUX_PATH` — override tmux binary path
+- `AGENT_MONITOR_TMUX_PATH` — override the multiplexer binary path (legacy; prefer `AMUX_MUX`)
+- `AMUX_MUX` — multiplexer binary to drive (default `rmux`; set to `tmux` to fall back)
 - `AGENT_MONITOR_STATE_DIR` — override state directory (default `~/.agent-monitor`)
 - `CC_SWITCH_DB_PATH` — override CC Switch SQLite database path
 

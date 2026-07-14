@@ -544,6 +544,7 @@ fn tmux_program_path() -> &'static str {
 }
 
 fn resolve_tmux_program_path() -> String {
+    // An explicit full path (must be a real file) always wins.
     if let Some(path) = env::var_os("AGENT_MONITOR_TMUX_PATH")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -551,7 +552,16 @@ fn resolve_tmux_program_path() -> String {
         return path.to_string_lossy().into_owned();
     }
 
-    discover_tmux_server_program_path().unwrap_or_else(|| "tmux".to_string())
+    // Default multiplexer (rmux), or whatever AMUX_MUX / AGENT_MONITOR_TMUX_PATH
+    // names. The lsof-based server discovery below is a tmux-only macOS hack, so
+    // only run it when we're actually driving tmux.
+    let bin = crate::tmux::mux_bin();
+    if bin.ends_with("tmux") {
+        if let Some(path) = discover_tmux_server_program_path() {
+            return path;
+        }
+    }
+    bin
 }
 
 fn discover_tmux_server_program_path() -> Option<String> {

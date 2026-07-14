@@ -1,11 +1,15 @@
 # amux
 
 Run AI coding agents (Claude Code, Codex, …) in per-directory, persistent,
-re-attachable tmux sessions.
+re-attachable [rmux](https://rmux.io) sessions.
 
-Run an agent from a directory and amux starts it in a tmux session keyed to that
+Run an agent from a directory and amux starts it in an rmux session keyed to that
 directory. Run it again from the same directory and you jump straight back into
 the live session instead of starting a new one.
+
+> amux uses **rmux** (a tmux-compatible multiplexer) as its session backend —
+> it avoids tmux's multi-session mouse-scroll crash and runs on Linux, macOS and
+> Windows. Set `AMUX_MUX=tmux` to fall back to tmux.
 
 ## Install
 
@@ -13,14 +17,14 @@ the live session instead of starting a new one.
 brew tap xiaoxiunique/amux
 brew trust xiaoxiunique/amux   # Homebrew 6+ requires trusting third-party taps
 brew install amux
-amux init   # installs shell aliases + tmux/Ghostty keybindings
+amux init   # installs shell aliases + rmux/Ghostty keybindings
 ```
 
 Reload your shell, then:
 
 ```bash
 cd ~/projects/myapp
-cc          # starts Claude Code in a tmux session for this dir
+cc          # starts Claude Code in an rmux session for this dir
 # detach with Ctrl-b d; run `cc` again here to jump back
 cx          # starts Codex in its own session
 amux myapp  # from anywhere: fuzzy-jump back to this dir's session
@@ -34,7 +38,7 @@ amux ls     # list sessions
 |---------|----------|
 | `amux run <agent> [args…]` | Launch or reattach `<agent>` in the current directory. Extra args are forwarded to the agent. |
 | `amux <dir>` | Fuzzy-match a running session by directory name and jump to it from anywhere — e.g. `amux mbox`. Prompts if several match. |
-| `amux init` | Install shell aliases (`cc`, `cx`, …), tmux keybindings, and Ghostty keybindings. |
+| `amux init` | Install shell aliases (`cc`, `cx`, …), rmux keybindings, and Ghostty keybindings. |
 | `amux ls` | List amux-managed sessions across all directories. |
 | `amux kill <name>` | Kill a session by name. |
 | `amux save [file]` / `amux restore [file]` | Save the running session list and restore it later (default `~/.amux/sessions.json`). |
@@ -62,7 +66,7 @@ Add `--token <secret>` to require a bearer token, and reach it from another
 device over Tailscale or an ngrok tunnel. The same server also backs the Agent
 Port mobile app.
 
-## Session switcher (Ghostty + tmux)
+## Session switcher (Ghostty + rmux)
 
 `amux init` also installs a quick session switcher for Ghostty split-pane
 workflows:
@@ -70,7 +74,7 @@ workflows:
 - **Shift+Cmd+O** — pops up an fzf selector listing all amux sessions. Pick one
   to switch the current pane to that session.
 
-This works by having Ghostty send `ESC O` on the key combo, which tmux picks up
+This works by having Ghostty send `ESC O` on the key combo, which rmux picks up
 as `M-O` and runs the fzf popup. Requires `fzf`; skipped automatically if fzf or
 Ghostty is not installed.
 
@@ -91,14 +95,14 @@ install their aliases.
 
 ## How it works
 
-The tmux session name is `<alias>_<dirslug>_<hash8>`, e.g.
+The rmux session name is `<alias>_<dirslug>_<hash8>`, e.g.
 `cc_myproject_1a2b3c4d`, where `hash8` is the first 8 hex chars of the SHA-256 of
 the absolute directory path. Same agent + same directory always maps to the same
 session, so re-running attaches instead of duplicating.
 
 ### Conversation resume
 
-When a session's tmux window is gone (reboot, `amux kill`), re-running the agent
+When a session's rmux window is gone (reboot, `amux kill`), re-running the agent
 resumes the *exact* conversation it was on, not just "the latest". amux records
 each session's real agent session id (Claude/Codex) in `~/.amux/session-ids.json`
 and relaunches with `codex resume <id>` / `claude --resume <id>`. This stays
@@ -107,7 +111,7 @@ provider continues seamlessly under another.
 
 ## Requires
 
-- tmux (Linux or macOS). Without tmux, amux runs the agent directly.
+- rmux (Linux, macOS, or Windows). Without a multiplexer, amux runs the agent directly. `AMUX_MUX=tmux` falls back to tmux.
 - fzf (optional, for session switcher keybinding)
 - Ghostty (optional, for Shift+Cmd+O keybinding)
 

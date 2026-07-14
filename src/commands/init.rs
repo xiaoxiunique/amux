@@ -17,21 +17,21 @@ pub fn render_block(agents: &[Agent]) -> String {
     s
 }
 
-/// Render tmux keybinding block (fzf session switcher on M-O).
-pub fn render_tmux_block() -> String {
+/// Render the rmux keybinding block (fzf session switcher on M-O).
+pub fn render_mux_block() -> String {
     format!(
         "{BEGIN}\n\
          # amux session switcher (triggered by Ghostty Shift+Cmd+O → ESC O)\n\
-         bind -n M-O display-popup -E \"tmux list-sessions -F '#{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs tmux switch-client -t\"\n\
+         bind -n M-O display-popup -E \"rmux list-sessions -F '#{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs rmux switch-client -t\"\n\
          {END}"
     )
 }
 
-/// Render Ghostty keybinding block (Shift+Cmd+O sends ESC O to tmux).
+/// Render Ghostty keybinding block (Shift+Cmd+O sends ESC O to the multiplexer).
 pub fn render_ghostty_block() -> String {
     format!(
         "{BEGIN}\n\
-         # Shift+Cmd+O → send ESC O to tmux (amux session switcher)\n\
+         # Shift+Cmd+O → send ESC O to the multiplexer (amux session switcher)\n\
          keybind = shift+super+o=text:\\x1bO\n\
          {END}"
     )
@@ -78,16 +78,10 @@ pub fn rc_path() -> Option<PathBuf> {
     }
 }
 
-/// Pick the tmux config file to write keybindings into.
-/// Prefers `~/.tmux.conf.local` (oh-my-tmux) if it exists, else `~/.tmux.conf`.
-pub fn tmux_conf_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    let local = home.join(".tmux.conf.local");
-    if local.exists() {
-        Some(local)
-    } else {
-        Some(home.join(".tmux.conf"))
-    }
+/// Pick the rmux config file to write keybindings into
+/// (`~/.config/rmux/rmux.conf`).
+pub fn mux_conf_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".config/rmux/rmux.conf"))
 }
 
 /// Pick the Ghostty config file path.
@@ -109,8 +103,13 @@ pub fn ghostty_config_path() -> Option<PathBuf> {
     }
 }
 
-/// Write a managed block into the file at `path`, creating it if absent.
+/// Write a managed block into the file at `path`, creating it (and parent
+/// directories) if absent.
 pub fn install_block(path: &Path, block: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let updated = upsert_block(&existing, block);
     std::fs::write(path, updated).with_context(|| format!("writing {}", path.display()))?;
@@ -143,13 +142,13 @@ mod tests {
     }
 
     #[test]
-    fn render_tmux_block_contains_keybinding() {
-        let b = render_tmux_block();
+    fn render_mux_block_contains_keybinding() {
+        let b = render_mux_block();
         assert!(b.starts_with(BEGIN));
         assert!(b.trim_end().ends_with(END));
         assert!(b.contains("bind -n M-O display-popup"));
         assert!(b.contains("fzf"));
-        assert!(b.contains("switch-client"));
+        assert!(b.contains("rmux switch-client"));
     }
 
     #[test]
@@ -179,8 +178,8 @@ mod tests {
     }
 
     #[test]
-    fn upsert_tmux_block_is_idempotent() {
-        let block = render_tmux_block();
+    fn upsert_mux_block_is_idempotent() {
+        let block = render_mux_block();
         let existing = "set -g mouse on\n";
         let once = upsert_block(existing, &block);
         let twice = upsert_block(&once, &block);
@@ -214,8 +213,9 @@ mod tests {
     #[test]
     fn install_block_creates_and_updates_file() {
         let dir = tempfile::tempdir().unwrap();
-        let conf = dir.path().join(".tmux.conf");
-        let block = render_tmux_block();
+        // nested path exercises parent-dir creation (like ~/.config/rmux/)
+        let conf = dir.path().join("rmux/rmux.conf");
+        let block = render_mux_block();
         install_block(&conf, &block).unwrap();
         let content = std::fs::read_to_string(&conf).unwrap();
         assert!(content.contains("bind -n M-O"));

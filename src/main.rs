@@ -45,7 +45,7 @@ fn main() -> Result<()> {
             commands::init::install_to(&path, &agents)?;
             println!("Installed shell aliases into {}", path.display());
 
-            // tmux keybindings (requires fzf)
+            // rmux keybindings (requires fzf)
             let has_fzf = std::process::Command::new("fzf")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -54,11 +54,11 @@ fn main() -> Result<()> {
                 .is_ok_and(|s| s.success());
 
             if !has_fzf {
-                eprintln!("Skipped tmux keybindings: fzf not found (brew install fzf)");
-            } else if let Some(tp) = commands::init::tmux_conf_path() {
-                match commands::init::install_block(&tp, &commands::init::render_tmux_block()) {
-                    Ok(()) => println!("Installed tmux keybindings into {}", tp.display()),
-                    Err(e) => eprintln!("Skipped tmux keybindings: {e}"),
+                eprintln!("Skipped rmux keybindings: fzf not found (brew install fzf)");
+            } else if let Some(tp) = commands::init::mux_conf_path() {
+                match commands::init::install_block(&tp, &commands::init::render_mux_block()) {
+                    Ok(()) => println!("Installed rmux keybindings into {}", tp.display()),
+                    Err(e) => eprintln!("Skipped rmux keybindings: {e}"),
                 }
             }
 

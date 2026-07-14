@@ -5,7 +5,7 @@ class Amux < Formula
   sha256 "8eda204c6b232d4434fc5cdfda15ad2e83af5b3ac60b4a9a5a95db5dbf92f787"
   license "MIT"
   depends_on "rust" => :build
-  depends_on "tmux"
+  depends_on "rmux"
 
   def install
     system "cargo", "install", "--locked", "--root", prefix, "--path", "."
