@@ -18,7 +18,7 @@ pub fn render_block(agents: &[Agent]) -> String {
 }
 
 /// Render the rmux setup block: mouse text-selection → clipboard, plus the fzf
-/// session switcher on M-O (Ghostty Shift+Cmd+O).
+/// session switcher on M-o (Ghostty Shift+Cmd+O).
 pub fn render_mux_block() -> String {
     format!(
         "{BEGIN}\n\
@@ -26,18 +26,20 @@ pub fn render_mux_block() -> String {
          set -g mouse on\n\
          bind -T copy-mode-vi y send -X copy-pipe-and-cancel \"pbcopy\"\n\
          bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n\
-         # amux session switcher (triggered by Ghostty Shift+Cmd+O → ESC O)\n\
-         bind -n M-O display-popup -E \"rmux list-sessions -F '#{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs rmux switch-client -t\"\n\
+         # amux session switcher (Ghostty Shift+Cmd+O → ESC o). Lowercase `o`:\n\
+         # ESC-O (uppercase) is the SS3 introducer and won't fire the binding.\n\
+         bind -n M-o display-popup -E \"rmux list-sessions -F '#{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs rmux switch-client -t\"\n\
          {END}"
     )
 }
 
-/// Render Ghostty keybinding block (Shift+Cmd+O sends ESC O to the multiplexer).
+/// Render Ghostty keybinding block (Shift+Cmd+O sends ESC o to the multiplexer).
 pub fn render_ghostty_block() -> String {
     format!(
         "{BEGIN}\n\
-         # Shift+Cmd+O → send ESC O to the multiplexer (amux session switcher)\n\
-         keybind = shift+super+o=text:\\x1bO\n\
+         # Shift+Cmd+O → send ESC o to the multiplexer (amux session switcher).\n\
+         # Lowercase `o`: ESC-O (uppercase) is the SS3 introducer and gets eaten.\n\
+         keybind = shift+super+o=text:\\x1bo\n\
          {END}"
     )
 }
@@ -261,7 +263,7 @@ mod tests {
         let b = render_mux_block();
         assert!(b.starts_with(BEGIN));
         assert!(b.trim_end().ends_with(END));
-        assert!(b.contains("bind -n M-O display-popup"));
+        assert!(b.contains("bind -n M-o display-popup"));
         assert!(b.contains("fzf"));
         assert!(b.contains("rmux switch-client"));
     }
@@ -271,7 +273,7 @@ mod tests {
         let b = render_ghostty_block();
         assert!(b.starts_with(BEGIN));
         assert!(b.trim_end().ends_with(END));
-        assert!(b.contains("keybind = shift+super+o=text:\\x1bO"));
+        assert!(b.contains("keybind = shift+super+o=text:\\x1bo"));
     }
 
     #[test]
@@ -333,7 +335,7 @@ mod tests {
         let block = render_mux_block();
         install_block(&conf, &block).unwrap();
         let content = std::fs::read_to_string(&conf).unwrap();
-        assert!(content.contains("bind -n M-O"));
+        assert!(content.contains("bind -n M-o"));
         // idempotent
         install_block(&conf, &block).unwrap();
         let content2 = std::fs::read_to_string(&conf).unwrap();
