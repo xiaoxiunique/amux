@@ -28,7 +28,10 @@ pub fn render_mux_block() -> String {
          bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n\
          # amux session switcher (Ghostty Shift+Cmd+O → ESC o). Lowercase `o`:\n\
          # ESC-O (uppercase) is the SS3 introducer and won't fire the binding.\n\
-         bind -n M-o display-popup -E \"rmux list-sessions -F '#{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs rmux switch-client -t\"\n\
+         # `##` escapes the format so it survives display-popup's own expansion\n\
+         # and reaches the inner `rmux` as `#{{session_name}}` (else every line\n\
+         # collapses to the current session's name).\n\
+         bind -n M-o display-popup -E \"rmux list-sessions -F '##{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs rmux switch-client -t\"\n\
          {END}"
     )
 }
@@ -266,6 +269,10 @@ mod tests {
         assert!(b.contains("bind -n M-o display-popup"));
         assert!(b.contains("fzf"));
         assert!(b.contains("rmux switch-client"));
+        // `##` must survive so display-popup doesn't pre-expand the format and
+        // collapse every session line to the current session's name.
+        assert!(b.contains("-F '##{session_name}'"));
+        assert!(!b.contains("-F '#{session_name}'"));
     }
 
     #[test]
