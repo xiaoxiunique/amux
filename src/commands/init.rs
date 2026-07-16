@@ -29,13 +29,12 @@ pub fn render_mux_block() -> String {
          # Size a session to its smallest attached client, so switching into a\n\
          # session that a taller window owns doesn't clip its bottom rows.\n\
          set -g window-size smallest\n\
-         # amux session switcher (Ghostty Shift+Cmd+O → ESC o). Lowercase `o`:\n\
-         # ESC-O (uppercase) is the SS3 introducer and won't fire the binding.\n\
-         # `##` escapes the format so it survives display-popup's own expansion\n\
-         # and reaches the inner `rmux` as `#{{session_name}}` (else every line\n\
-         # collapses to the current session's name). j/k or ↑/↓ move, Enter\n\
-         # switches; type to fuzzy-search (any char except j/k, which navigate).\n\
-         bind -n M-o display-popup -E \"rmux list-sessions -F '##{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' --bind 'j:down,k:up' | xargs -I{{}} rmux switch-client -t {{}}\"\n\
+         # amux session switcher (Ghostty Shift+Cmd+O → ESC o). Native choose-tree:\n\
+         # j/k or ↑/↓ move, Enter switches, q/Esc cancels. We can't use an fzf\n\
+         # popup here — rmux's display-popup has no client context (client_name\n\
+         # etc. expand empty), so switch-client from the popup can't move the\n\
+         # right client on a multi-client server. choose-tree switches natively.\n\
+         bind -n M-o choose-tree -Zs\n\
          {END}"
     )
 }
@@ -270,14 +269,8 @@ mod tests {
         let b = render_mux_block();
         assert!(b.starts_with(BEGIN));
         assert!(b.trim_end().ends_with(END));
-        assert!(b.contains("bind -n M-o display-popup"));
-        assert!(b.contains("fzf"));
-        assert!(b.contains("rmux switch-client"));
+        assert!(b.contains("bind -n M-o choose-tree -Zs"));
         assert!(b.contains("set -g window-size smallest"));
-        // `##` must survive so display-popup doesn't pre-expand the format and
-        // collapse every session line to the current session's name.
-        assert!(b.contains("-F '##{session_name}'"));
-        assert!(!b.contains("-F '#{session_name}'"));
     }
 
     #[test]
