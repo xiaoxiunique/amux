@@ -26,12 +26,16 @@ pub fn render_mux_block() -> String {
          set -g mouse on\n\
          bind -T copy-mode-vi y send -X copy-pipe-and-cancel \"pbcopy\"\n\
          bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n\
+         # Size a session to its smallest attached client, so switching into a\n\
+         # session that a taller window owns doesn't clip its bottom rows.\n\
+         set -g window-size smallest\n\
          # amux session switcher (Ghostty Shift+Cmd+O → ESC o). Lowercase `o`:\n\
          # ESC-O (uppercase) is the SS3 introducer and won't fire the binding.\n\
          # `##` escapes the format so it survives display-popup's own expansion\n\
          # and reaches the inner `rmux` as `#{{session_name}}` (else every line\n\
-         # collapses to the current session's name).\n\
-         bind -n M-o display-popup -E \"rmux list-sessions -F '##{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs rmux switch-client -t\"\n\
+         # collapses to the current session's name). Type to fuzzy-search; ↑/↓ or\n\
+         # Ctrl-N/P to move; Enter to switch (vim j/k type into the search box).\n\
+         bind -n M-o display-popup -E \"rmux list-sessions -F '##{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs -I{{}} rmux switch-client -t {{}}\"\n\
          {END}"
     )
 }
@@ -269,6 +273,7 @@ mod tests {
         assert!(b.contains("bind -n M-o display-popup"));
         assert!(b.contains("fzf"));
         assert!(b.contains("rmux switch-client"));
+        assert!(b.contains("set -g window-size smallest"));
         // `##` must survive so display-popup doesn't pre-expand the format and
         // collapse every session line to the current session's name.
         assert!(b.contains("-F '##{session_name}'"));
