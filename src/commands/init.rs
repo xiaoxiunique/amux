@@ -33,9 +33,9 @@ pub fn render_mux_block() -> String {
          # ESC-O (uppercase) is the SS3 introducer and won't fire the binding.\n\
          # `##` escapes the format so it survives display-popup's own expansion\n\
          # and reaches the inner `rmux` as `#{{session_name}}` (else every line\n\
-         # collapses to the current session's name). Type to fuzzy-search; ↑/↓ or\n\
-         # Ctrl-N/P to move; Enter to switch (vim j/k type into the search box).\n\
-         bind -n M-o display-popup -E \"rmux list-sessions -F '##{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' | xargs -I{{}} rmux switch-client -t {{}}\"\n\
+         # collapses to the current session's name). j/k or ↑/↓ move, Enter\n\
+         # switches; type to fuzzy-search (any char except j/k, which navigate).\n\
+         bind -n M-o display-popup -E \"rmux list-sessions -F '##{{session_name}}' | grep -E '_[a-f0-9]{{8}}$' | fzf --reverse --header='switch session' --bind 'j:down,k:up' | xargs -I{{}} rmux switch-client -t {{}}\"\n\
          {END}"
     )
 }
