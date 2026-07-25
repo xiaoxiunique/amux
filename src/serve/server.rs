@@ -937,16 +937,27 @@ fn project_name_from_path(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+fn session_agent_alias(session: &str) -> Option<&str> {
+    let prefix = session.split_once('_')?.0;
+    let alias = prefix
+        .split_once('-')
+        .map(|(alias, _)| alias)
+        .unwrap_or(prefix);
+    match alias {
+        "cc" | "cx" => Some(alias),
+        _ => None,
+    }
+}
+
 fn agent_kind_for_pane(pane: &BasePane, tail: &str) -> Option<&'static str> {
     // The amux session-name prefix is authoritative — a `cc_` pane is Claude
     // even when its terminal is full of the word "codex" (e.g. a conversation
     // *about* codex), and vice versa. Content sniffing is only a fallback for
     // panes not launched by amux.
-    if pane.session.starts_with("cx_") {
-        return Some("codex");
-    }
-    if pane.session.starts_with("cc_") {
-        return Some("claude");
+    match session_agent_alias(&pane.session) {
+        Some("cx") => return Some("codex"),
+        Some("cc") => return Some("claude"),
+        _ => {}
     }
 
     if is_codex_pane(pane, tail) {
@@ -991,10 +1002,28 @@ fn is_codex_pane(pane: &BasePane, tail: &str) -> bool {
     )
     .to_lowercase();
 
-    pane.session.starts_with("cx_")
+    session_agent_alias(&pane.session) == Some("cx")
         || pane.command == "codex"
         || haystack.contains("codex")
         || haystack.contains("gpt-")
+}
+
+fn hook_status_for_pane(pane: &BasePane) -> Option<(PaneStatus, String)> {
+    let event = crate::state::current_status(&pane.id, &pane.session)?;
+    let status = match event.state {
+        crate::state::HookState::Running => PaneStatus::Running,
+        crate::state::HookState::Waiting => PaneStatus::Waiting,
+        crate::state::HookState::Idle => PaneStatus::Idle,
+        crate::state::HookState::Failed => PaneStatus::Failed,
+        crate::state::HookState::Done => PaneStatus::Done,
+    };
+    let reason = event.message.unwrap_or_else(|| {
+        format!(
+            "explicit status from {} at {}",
+            event.source, event.created_at
+        )
+    });
+    Some((status, reason))
 }
 
 /// Seconds since the pane's agent session file (codex rollout / claude jsonl)
@@ -1011,16 +1040,12 @@ fn session_activity_age(agent: &str, cwd: &str) -> Option<f64> {
     Some((now - secs).max(0.0))
 }
 
-fn infer_status(
-    pane: &BasePane,
-    tail: &str,
-    changed_recently: bool,
-    file_age: Option<f64>,
-) -> (PaneStatus, String) {
-    let lower = tail.to_lowercase();
-    let agent_like = agent_kind_for_pane(pane, tail).is_some();
-
-    // `recent` (last 18 lines) is used only for the spinner/liveness check.
+/// True when the pane's bottom shows a live "actively working" indicator — the
+/// agent's spinner with an interrupt hint (codex `• Working (… esc to interrupt)`,
+/// claude `thinking (… esc to interrupt)`). This is authoritative for Running:
+/// it overrides a stale completion hook (codex-notify / claude-stop), which is
+/// necessarily out of date once the agent has begun a new turn.
+fn agent_actively_working(tail: &str) -> bool {
     let recent = tail
         .lines()
         .rev()
@@ -1031,6 +1056,45 @@ fn infer_status(
         .collect::<Vec<_>>()
         .join("\n")
         .to_lowercase();
+    // Interruptible spinner: codex "• Working (… esc to interrupt)", Claude
+    // "✻ thinking (… esc to interrupt)".
+    if contains_any(&recent, &["esc to interrupt", "/stop to close"])
+        && contains_any(&recent, &["working (", "thinking (", "running ("])
+    {
+        return true;
+    }
+    // Claude Code streaming spinner, e.g. "✽ Baking… (3m 13s · ↓ 10.9k tokens)".
+    // After the turn ends the line changes to "✻ Cooked for 30s" — no ellipsis-
+    // paren, no token-stream arrow, so this correctly goes false once done.
+    // The "… (" + "tokens)" pair covers even the brief pre-stream window.
+    recent.contains("· ↓") || (recent.contains("… (") && recent.contains("tokens)"))
+}
+
+/// Claude Code at its end-of-turn idle input prompt — the agent has finished and
+/// is awaiting the next message, distinct from a mid-task permission / y-n prompt.
+/// The `/clear to save … tokens` hint Claude prints ONLY at the idle prompt, never
+/// while it's actively working or asking a y-n question.
+fn claude_idle_ready(tail: &str) -> bool {
+    let low = tail.to_lowercase();
+    let idle_hint = low.contains("/clear to save") || low.contains("new task? /clear");
+    let yn = contains_any(
+        &low,
+        &[
+            "yes/no", "(y/n)", " y/n", "proceed?", "do you want", "allow once",
+            "allow always", "yes, continue", "no, skip",
+        ],
+    );
+    idle_hint && !yn
+}
+
+fn infer_status(
+    pane: &BasePane,
+    tail: &str,
+    changed_recently: bool,
+    file_age: Option<f64>,
+) -> (PaneStatus, String) {
+    let lower = tail.to_lowercase();
+    let agent_like = agent_kind_for_pane(pane, tail).is_some();
 
     // `prompt_zone` = the last few non-empty lines, i.e. the bottom of the
     // screen where a real prompt / result / error actually sits. Keyword checks
@@ -1097,8 +1161,7 @@ fn infer_status(
     // "esc to interrupt" spinner) is Running. When no session file is found,
     // fall back to the terminal change signal.
     let file_fresh = file_age.map(|a| a < RUNNING_WINDOW_SECS).unwrap_or(false);
-    let live_agent_work = contains_any(&recent, &["esc to interrupt", "/stop to close"])
-        && contains_any(&recent, &["working (", "thinking (", "running ("]);
+    let live_agent_work = agent_actively_working(tail);
     let file_fallback = file_age.is_none() && changed_recently;
 
     if agent_like && (file_fresh || live_agent_work || file_fallback) {
@@ -2085,7 +2148,23 @@ fn build_snapshot() -> Snapshot {
             let changed_recently = track_pane_activity(&pane.id, &tail);
             let activity_age_secs = agent_kind_for_pane(&pane, &tail)
                 .and_then(|agent| session_activity_age(agent, &pane.path));
-            let (status, reason) = infer_status(&pane, &tail, changed_recently, activity_age_secs);
+            let inferred = infer_status(&pane, &tail, changed_recently, activity_age_secs);
+            let (status, reason) = match hook_status_for_pane(&pane) {
+                // A completion hook (codex-notify / claude-stop) latches Done/
+                // Idle/Waiting at turn-end, but the agent may have started a new
+                // turn since. If the pane is live-working right now, trust that
+                // over the stale hook so a running task isn't shown as done.
+                Some(_) if agent_actively_working(&tail) => inferred,
+                // Stale claude-notification: Claude finished its turn and is back
+                // at the idle input prompt (shows "/clear to save … tokens"),
+                // but the Waiting hook was never cleared. The stranded status
+                // blocks the pending-message flush (Idle/Done only). We lock
+                // this override behind a strong idle signal that is absent
+                // during mid-task y-n prompts so we never flush into one.
+                Some((PaneStatus::Waiting, _)) if claude_idle_ready(&tail) => inferred,
+                Some(hooked) => hooked,
+                None => inferred,
+            };
             PANE_STATUS_CACHE
                 .lock()
                 .expect("pane status cache mutex poisoned")
@@ -2427,10 +2506,12 @@ async fn api_pane_context(
 /// session prefix is authoritative, so a Claude pane whose terminal mentions
 /// "codex" is still Claude (and its queue isn't stranded).
 pub(crate) fn pane_is_claude(session: &str, command: &str, title: &str) -> bool {
-    if session.starts_with("cc_") {
-        return true;
+    match session_agent_alias(session) {
+        Some("cc") => return true,
+        Some("cx") => return false,
+        _ => {}
     }
-    if session.starts_with("cx_") || command == "codex" {
+    if command == "codex" {
         return false;
     }
     let hay = format!("{session}\n{command}\n{title}").to_lowercase();
@@ -2438,6 +2519,16 @@ pub(crate) fn pane_is_claude(session: &str, command: &str, title: &str) -> bool 
         return false;
     }
     command == "claude" || hay.contains("claude")
+}
+
+pub(crate) fn pane_is_codex(session: &str, command: &str, title: &str) -> bool {
+    match session_agent_alias(session) {
+        Some("cx") => return true,
+        Some("cc") => return false,
+        _ => {}
+    }
+    let hay = format!("{session}\n{command}\n{title}").to_lowercase();
+    command == "codex" || hay.contains("codex") || hay.contains("gpt-")
 }
 
 /// The status `build_snapshot` last computed for a pane.
@@ -4371,5 +4462,102 @@ mod tests {
         assert_eq!(agent_kind_for_pane(&cc, "talking about codex and gpt-5"), Some("claude"));
         let cx = pane("cx_proj_1a2b3c4d");
         assert_eq!(agent_kind_for_pane(&cx, "mentions claude a lot"), Some("codex"));
+    }
+
+    #[test]
+    fn provider_session_prefix_is_agent_identity() {
+        let cc = pane("cc-glm_proj_1a2b3c4d");
+        assert_eq!(
+            agent_kind_for_pane(&cc, "talking about codex and gpt-5"),
+            Some("claude")
+        );
+        assert!(pane_is_claude(&cc.session, &cc.command, &cc.title));
+
+        let cx = pane("cx-openai_proj_1a2b3c4d");
+        assert_eq!(
+            agent_kind_for_pane(&cx, "mentions claude a lot"),
+            Some("codex")
+        );
+        assert!(!pane_is_claude(&cx.session, &cx.command, &cx.title));
+        assert!(is_codex_pane(&cx, ""));
+    }
+
+    #[test]
+    fn hook_status_overrides_terminal_inference() {
+        let _guard = crate::state::TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("AMUX_STATE_DIR", tmp.path());
+        crate::state::record_status(
+            Some("%1".to_string()),
+            Some("cc-glm_proj_1a2b3c4d".to_string()),
+            crate::state::HookState::Done,
+            Some("test".to_string()),
+            None,
+            Some("hook says complete".to_string()),
+        )
+        .unwrap();
+
+        let pane = pane("cc-glm_proj_1a2b3c4d");
+        let (status, reason) = hook_status_for_pane(&pane).unwrap();
+        assert_eq!(status, PaneStatus::Done);
+        assert_eq!(reason, "hook says complete");
+
+        std::env::remove_var("AMUX_STATE_DIR");
+    }
+
+    #[test]
+    fn live_work_signal_detected() {
+        // codex spinner
+        assert!(agent_actively_working(
+            "some scrollback\n• Working (11m 14s • esc to interrupt)\n› prompt"
+        ));
+        // claude interruptible spinner
+        assert!(agent_actively_working(
+            "✻ Thinking (5s · esc to interrupt)\n"
+        ));
+        // claude streaming spinner: "✽ Baking… (3m 13s · ↓ 10.9k tokens)"
+        assert!(agent_actively_working(
+            "scrollback\n✽ Baking… (3m 13s · ↓ 10.9k tokens)\n"
+        ));
+        // claude streaming without the down-arrow (ellipsis-paren + tokens))
+        assert!(agent_actively_working(
+            "✽ Pondering… (15s · output 42 tokens)\n"
+        ));
+        // a finished / idle pane must NOT read as working
+        assert!(!agent_actively_working(
+            "❯ \n──────\nnew task? /clear to save 131.9k tokens"
+        ));
+        // claude's post-turn form "✻ Cooked for 30s" is done, NOT working
+        assert!(!agent_actively_working(
+            "✻ Cooked for 30s\n── recap: ...\n❯"
+        ));
+        // mentioning the words without the live spinner pairing is not "working"
+        assert!(!agent_actively_working(
+            "I was working on the parser earlier. Done now.\n❯"
+        ));
+    }
+
+    #[test]
+    fn claude_idle_ready_detection() {
+        // end-of-turn idle prompt: shows /clear hint, no y-n markers
+        assert!(claude_idle_ready(
+            "❯ \n──────-- INSERT --──────\nnew task? /clear to save 649.6k tokens"
+        ));
+        // also matches the short form
+        assert!(claude_idle_ready(
+            "/clear to save 138k tokens\n-- INSERT --"
+        ));
+        // a mid-task permission prompt: y-n marker present → NOT idle-ready
+        assert!(!claude_idle_ready(
+            "Do you want to proceed? [Yes/No]\n/clear to save 100k tokens"
+        ));
+        // actively working: no /clear hint → NOT idle-ready
+        assert!(!claude_idle_ready(
+            "✽ Baking… (42s · ↓ output 5k tokens)"
+        ));
+        // idle without /clear hint (fresh session) → not detected (safe fail)
+        assert!(!claude_idle_ready(
+            "❯ \n──────\n-- INSERT --"
+        ));
     }
 }

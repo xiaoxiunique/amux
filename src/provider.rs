@@ -147,12 +147,14 @@ pub fn resolve_settings(name: &str, app_type: &str) -> Result<ProviderSettings> 
 
 /// Claude: settings_config is a JSON blob → write to temp file → --settings <path>
 fn resolve_claude_settings(settings_config: &str) -> Result<ProviderSettings> {
+    let blob = neutralize_conflicting_auth_token(settings_config)?;
+
     let mut tmp = tempfile::Builder::new()
         .prefix("amux-provider-")
         .suffix(".json")
         .tempfile()
         .context("creating temp settings file")?;
-    tmp.write_all(settings_config.as_bytes())
+    tmp.write_all(blob.as_bytes())
         .context("writing settings")?;
     let path = tmp.into_temp_path().keep().context("persisting temp file")?;
 
@@ -160,6 +162,39 @@ fn resolve_claude_settings(settings_config: &str) -> Result<ProviderSettings> {
         extra_argv: vec!["--settings".into(), path.to_string_lossy().into_owned()],
         env_vars: vec![],
     })
+}
+
+/// The CC Switch proxy exports BOTH `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY`
+/// into the shell (as `PROXY_MANAGED` stubs). A provider's settings_config sets
+/// only the ONE credential it uses, so when Claude Code loads `--settings` the
+/// other stub survives — and Claude refuses to choose reliably when both are set
+/// ("Both ANTHROPIC_AUTH_TOKEN and ANTHROPIC_API_KEY set · auth may not work").
+///
+/// Rewrite the settings `env` so the unused credential is blanked to an empty
+/// string (which the settings layer applies over the inherited shell env),
+/// leaving exactly one non-empty credential. No-op when the blob isn't JSON or
+/// the provider already sets both / neither.
+fn neutralize_conflicting_auth_token(settings_config: &str) -> Result<String> {
+    // Non-JSON blobs (shouldn't happen with cc-switch, but stay safe) pass through.
+    let Ok(mut v): std::result::Result<serde_json::Value, _> =
+        serde_json::from_str(settings_config)
+    else {
+        return Ok(settings_config.to_string());
+    };
+    let Some(env) = v.get_mut("env").and_then(|e| e.as_object_mut()) else {
+        return Ok(settings_config.to_string());
+    };
+    let has_token = env.contains_key("ANTHROPIC_AUTH_TOKEN");
+    let has_key = env.contains_key("ANTHROPIC_API_KEY");
+    if has_token && !has_key {
+        env.insert("ANTHROPIC_API_KEY".to_string(), serde_json::Value::String(String::new()));
+    } else if has_key && !has_token {
+        env.insert(
+            "ANTHROPIC_AUTH_TOKEN".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+    }
+    Ok(serde_json::to_string(&v)?)
 }
 
 /// Codex: settings_config is JSON with {auth, config} →
@@ -231,5 +266,39 @@ mod tests {
     #[test]
     fn open_db_does_not_panic() {
         let _ = open_db();
+    }
+
+    #[test]
+    fn neutralizer_blanks_unused_credential() {
+        // glm-style: only AUTH_TOKEN set → API_KEY must be blanked
+        let glm = r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"tok","ANTHROPIC_BASE_URL":"u"}}"#;
+        let out = neutralize_conflicting_auth_token(glm).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let env = v["env"].as_object().unwrap();
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "tok"); // preserved
+        assert_eq!(env["ANTHROPIC_API_KEY"], ""); // blanked
+
+        // deepseek-style: only API_KEY set → AUTH_TOKEN must be blanked
+        let ds = r#"{"env":{"ANTHROPIC_API_KEY":"k","ANTHROPIC_MODEL":"m"}}"#;
+        let out = neutralize_conflicting_auth_token(ds).unwrap();
+        let env = serde_json::from_str::<serde_json::Value>(&out).unwrap()["env"]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(env["ANTHROPIC_API_KEY"], "k"); // preserved
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], ""); // blanked
+
+        // both set → untouched (no blanking)
+        let both = r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"t","ANTHROPIC_API_KEY":"k"}}"#;
+        let out = neutralize_conflicting_auth_token(both).unwrap();
+        let env = serde_json::from_str::<serde_json::Value>(&out).unwrap()["env"]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "t");
+        assert_eq!(env["ANTHROPIC_API_KEY"], "k");
+
+        // non-JSON → passed through unchanged
+        assert_eq!(neutralize_conflicting_auth_token("garbage").unwrap(), "garbage");
     }
 }
