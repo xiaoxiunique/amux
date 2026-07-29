@@ -1064,27 +1064,38 @@ fn agent_actively_working(tail: &str) -> bool {
         return true;
     }
     // Claude Code streaming spinner, e.g. "✽ Baking… (3m 13s · ↓ 10.9k tokens)".
-    // After the turn ends the line changes to "✻ Cooked for 30s" — no ellipsis-
-    // paren, no token-stream arrow, so this correctly goes false once done.
-    // The "… (" + "tokens)" pair covers even the brief pre-stream window.
-    recent.contains("· ↓") || (recent.contains("… (") && recent.contains("tokens)"))
+    // Both markers must sit on the SAME line: the ellipsis-paren "… (" plus a
+    // parenthesised "tokens)". A finished subagent result line looks like
+    // "-purpose  Research …            43m 27s · ↓ 2.2k tokens" — it carries the
+    // "· ↓" arrow but has no "… (" and no closing paren, so it must not count as
+    // live work. After a turn ends the spinner becomes "✻ Churned for 1m 23s",
+    // which matches neither marker.
+    recent
+        .lines()
+        .any(|l| l.contains("… (") && l.contains("tokens)"))
 }
 
 /// Claude Code at its end-of-turn idle input prompt — the agent has finished and
 /// is awaiting the next message, distinct from a mid-task permission / y-n prompt.
-/// The `/clear to save … tokens` hint Claude prints ONLY at the idle prompt, never
-/// while it's actively working or asking a y-n question.
+///
+/// The signal is Claude's editable composer at the bottom of the pane: the `❯`
+/// prompt plus the `-- INSERT --` / `bypass permissions` mode line. Claude only
+/// renders that composer when it wants your next message — not while streaming
+/// and not while a y-n choice is on screen. (An earlier version keyed off the
+/// `/clear to save … tokens` hint, but Claude only prints that once context use
+/// is high, so quiet panes were missed.)
 fn claude_idle_ready(tail: &str) -> bool {
     let low = tail.to_lowercase();
-    let idle_hint = low.contains("/clear to save") || low.contains("new task? /clear");
+    let composer = low.contains("-- insert --") || low.contains("bypass permissions on");
+    let prompt = tail.contains('❯') || tail.contains('>');
     let yn = contains_any(
         &low,
         &[
             "yes/no", "(y/n)", " y/n", "proceed?", "do you want", "allow once",
-            "allow always", "yes, continue", "no, skip",
+            "allow always", "yes, continue", "no, skip", "1. yes", "2. no",
         ],
     );
-    idle_hint && !yn
+    composer && prompt && !yn && !agent_actively_working(tail)
 }
 
 fn infer_status(
@@ -4519,9 +4530,14 @@ mod tests {
         assert!(agent_actively_working(
             "scrollback\n✽ Baking… (3m 13s · ↓ 10.9k tokens)\n"
         ));
-        // claude streaming without the down-arrow (ellipsis-paren + tokens))
-        assert!(agent_actively_working(
-            "✽ Pondering… (15s · output 42 tokens)\n"
+        // regression: a FINISHED subagent result line carries "· ↓ … tokens" but
+        // no "… (" and no closing paren — must NOT read as live work.
+        assert!(!agent_actively_working(
+            "✻ Churned for 1m 23s\n❯\n  -- INSERT --\n  ⏺ main\n-purpose  Research FlyingFox + Hummingbird                 43m 27s · ↓ 2.2k tokens"
+        ));
+        // the two markers must be on the SAME line, not merely both present
+        assert!(!agent_actively_working(
+            "done… (earlier)\n❯ \nsubagent used 2.2k tokens)"
         ));
         // a finished / idle pane must NOT read as working
         assert!(!agent_actively_working(
@@ -4539,25 +4555,28 @@ mod tests {
 
     #[test]
     fn claude_idle_ready_detection() {
-        // end-of-turn idle prompt: shows /clear hint, no y-n markers
+        // end-of-turn idle prompt: composer rendered, no y-n markers
         assert!(claude_idle_ready(
-            "❯ \n──────-- INSERT --──────\nnew task? /clear to save 649.6k tokens"
+            "❯ \n──────\n  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
         ));
-        // also matches the short form
+        // regression (iotex): a quiet pane with NO "/clear to save" hint must
+        // still count as idle — the composer is the signal, not the hint.
         assert!(claude_idle_ready(
-            "/clear to save 138k tokens\n-- INSERT --"
+            "✻ Churned for 1m 23s\n※ recap: ...\n──── ai-wallet-mcp-app ──\n❯\u{a0}\n────\n  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n  ⏺ main\n-purpose  Research FlyingFox                 43m 27s · ↓ 2.2k tokens"
         ));
         // a mid-task permission prompt: y-n marker present → NOT idle-ready
         assert!(!claude_idle_ready(
-            "Do you want to proceed? [Yes/No]\n/clear to save 100k tokens"
+            "Do you want to proceed? [Yes/No]\n❯ \n-- INSERT --"
         ));
-        // actively working: no /clear hint → NOT idle-ready
+        // numbered trust/permission choice → NOT idle-ready
         assert!(!claude_idle_ready(
-            "✽ Baking… (42s · ↓ output 5k tokens)"
+            "❯ 1. Yes, I trust this folder\n   2. No, exit\n-- INSERT --"
         ));
-        // idle without /clear hint (fresh session) → not detected (safe fail)
+        // actively streaming → NOT idle-ready even though composer may linger
         assert!(!claude_idle_ready(
-            "❯ \n──────\n-- INSERT --"
+            "✽ Baking… (42s · ↓ 5k tokens)\n❯ \n-- INSERT --"
         ));
+        // no composer at all (e.g. codex pane) → not idle-ready
+        assert!(!claude_idle_ready("› some codex prompt\n  gpt-5.6 high"));
     }
 }
