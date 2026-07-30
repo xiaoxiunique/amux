@@ -1029,8 +1029,48 @@ fn hook_status_for_pane(pane: &BasePane) -> Option<(PaneStatus, String)> {
 /// Seconds since the pane's agent session file (codex rollout / claude jsonl)
 /// was last written. `None` when no matching file is found. A small value means
 /// the agent is actively appending output → working.
+/// Cache of `(agent, cwd)` → resolved session-file path, with the time it was
+/// resolved. Finding that path is expensive — for codex it stats every rollout
+/// in ~/.codex/sessions (hundreds of files) and reads the head of up to 60 to
+/// match the cwd. That ran per pane per 2.5s poll, and every codex pane rescans
+/// the *same* directory, so it dominated the daemon's CPU. The mapping is
+/// stable (a directory's active session file doesn't change second to second),
+/// so cache it briefly; the mtime itself is still stat'd fresh every call, which
+/// is what liveness actually depends on.
+static SESSION_FILE_CACHE: LazyLock<Mutex<HashMap<String, (Option<PathBuf>, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const SESSION_FILE_CACHE_TTL: Duration = Duration::from_secs(30);
+/// A miss is re-checked much sooner: a freshly launched agent creates its
+/// session file lazily, and we don't want a cached `None` to hide it for 30s.
+const SESSION_FILE_CACHE_MISS_TTL: Duration = Duration::from_secs(3);
+
+fn cached_session_file(agent: &str, cwd: &str) -> Option<PathBuf> {
+    let key = format!("{agent}\u{1}{cwd}");
+    if let Some((path, at)) = SESSION_FILE_CACHE
+        .lock()
+        .expect("session file cache mutex poisoned")
+        .get(&key)
+    {
+        let ttl = if path.is_some() {
+            SESSION_FILE_CACHE_TTL
+        } else {
+            SESSION_FILE_CACHE_MISS_TTL
+        };
+        if at.elapsed() < ttl {
+            return path.clone();
+        }
+    }
+    let resolved = crate::commands::session_ids::session_file_for(agent, Path::new(cwd));
+    SESSION_FILE_CACHE
+        .lock()
+        .expect("session file cache mutex poisoned")
+        .insert(key, (resolved.clone(), Instant::now()));
+    resolved
+}
+
 fn session_activity_age(agent: &str, cwd: &str) -> Option<f64> {
-    let path = crate::commands::session_ids::session_file_for(agent, Path::new(cwd))?;
+    let path = cached_session_file(agent, cwd)?;
     let modified = path.metadata().ok()?.modified().ok()?;
     let secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
     let now = SystemTime::now()
@@ -1045,17 +1085,17 @@ fn session_activity_age(agent: &str, cwd: &str) -> Option<f64> {
 /// claude `thinking (… esc to interrupt)`). This is authoritative for Running:
 /// it overrides a stale completion hook (codex-notify / claude-stop), which is
 /// necessarily out of date once the agent has begun a new turn.
+/// Lowercased last `n` lines of a pane tail. Status signals all live at the
+/// bottom of the screen, so callers work on this slice instead of lowercasing
+/// the whole ~19KB scrollback on every poll (14 panes x 2.5s adds up fast).
+fn recent_lower(tail: &str, n: usize) -> String {
+    let mut lines: Vec<&str> = tail.lines().rev().take(n).collect();
+    lines.reverse();
+    lines.join("\n").to_lowercase()
+}
+
 fn agent_actively_working(tail: &str) -> bool {
-    let recent = tail
-        .lines()
-        .rev()
-        .take(18)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
+    let recent = recent_lower(tail, 18);
     // Interruptible spinner: codex "• Working (… esc to interrupt)", Claude
     // "✻ thinking (… esc to interrupt)".
     if contains_any(&recent, &["esc to interrupt", "/stop to close"])
@@ -1085,9 +1125,10 @@ fn agent_actively_working(tail: &str) -> bool {
 /// `/clear to save … tokens` hint, but Claude only prints that once context use
 /// is high, so quiet panes were missed.)
 fn claude_idle_ready(tail: &str) -> bool {
-    let low = tail.to_lowercase();
+    // The composer and any y-n choice both render at the bottom of the screen.
+    let low = recent_lower(tail, 24);
     let composer = low.contains("-- insert --") || low.contains("bypass permissions on");
-    let prompt = tail.contains('❯') || tail.contains('>');
+    let prompt = low.contains('❯') || low.contains('>');
     let yn = contains_any(
         &low,
         &[
@@ -1104,7 +1145,6 @@ fn infer_status(
     changed_recently: bool,
     file_age: Option<f64>,
 ) -> (PaneStatus, String) {
-    let lower = tail.to_lowercase();
     let agent_like = agent_kind_for_pane(pane, tail).is_some();
 
     // `prompt_zone` = the last few non-empty lines, i.e. the bottom of the
@@ -1214,7 +1254,7 @@ fn infer_status(
         return (PaneStatus::Running, "recent output changed".to_string());
     }
 
-    if lower.is_empty() || ["zsh", "bash", "fish", "nu"].contains(&pane.command.as_str()) {
+    if tail.trim().is_empty() || ["zsh", "bash", "fish", "nu"].contains(&pane.command.as_str()) {
         return (PaneStatus::Idle, "shell pane".to_string());
     }
 
@@ -1268,33 +1308,37 @@ fn tail_hash(value: &str) -> u64 {
 }
 
 fn activity_fingerprint(tail: &str) -> String {
-    tail.lines()
-        .map(strip_terminal_noise)
-        .map(|line| {
-            line.replace(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'], "")
-                .trim()
-                .to_string()
-        })
-        .filter(|line| !line.is_empty())
-        .filter(|line| !line.chars().all(|ch| "╭╮╰╯│─ ".contains(ch)))
-        .filter(|line| !line.to_lowercase().starts_with("─ worked for"))
-        .filter(|line| !line.starts_with('›'))
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            !lower.contains("context ") || !lower.contains("% used")
-        })
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            !(contains_any(&lower, &["working (", "thinking (", "running ("])
+    // Only the last handful of lines end up in the fingerprint, so walk the tail
+    // bottom-up and stop once we have enough. Cleaning all ~300 captured lines
+    // first and *then* taking 24 threw away ~90% of the work every poll, per
+    // pane — the dominant cost in the 2.5s snapshot tick.
+    let mut kept: Vec<String> = Vec::with_capacity(24);
+    for raw in tail.lines().rev() {
+        let line = strip_terminal_noise(raw)
+            .replace(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'], "")
+            .trim()
+            .to_string();
+        if line.is_empty()
+            || line.chars().all(|ch| "╭╮╰╯│─ ".contains(ch))
+            || line.starts_with('›')
+        {
+            continue;
+        }
+        let lower = line.to_lowercase();
+        if lower.starts_with("─ worked for")
+            || (lower.contains("context ") && lower.contains("% used"))
+            || (contains_any(&lower, &["working (", "thinking (", "running ("])
                 && contains_any(&lower, &["esc to interrupt", "/stop to close"]))
-        })
-        .rev()
-        .take(24)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
+        {
+            continue;
+        }
+        kept.push(line);
+        if kept.len() == 24 {
+            break;
+        }
+    }
+    kept.reverse();
+    kept.join("\n")
 }
 
 fn clean_task_title(value: &str) -> String {
