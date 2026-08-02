@@ -7,6 +7,7 @@
     unreachable_code,
     unused_assignments
 )]
+pub mod herdr;
 pub mod server;
 
 #[cfg(feature = "full")]
@@ -100,6 +101,7 @@ pub fn serve(
     token: Option<&str>,
     foreground: bool,
     open: bool,
+    with_herdr: bool,
 ) -> Result<()> {
     let host = host.unwrap_or(DEFAULT_HOST);
     let port = if port == 0 { DEFAULT_PORT } else { port };
@@ -107,6 +109,10 @@ pub fn serve(
 
     if foreground {
         // Run directly in this process with a tokio runtime
+        herdr::set_enabled(with_herdr);
+        if with_herdr {
+            println!("herdr bridge enabled");
+        }
         if open {
             open_browser(port);
         }
@@ -136,6 +142,11 @@ pub fn serve(
     }
     if !token.is_empty() {
         cmd.arg("--token").arg(token);
+    }
+    // The daemon is this binary re-executed, so the flag has to be forwarded
+    // or `--herdr` would silently do nothing in the default (daemon) mode.
+    if with_herdr {
+        cmd.arg("--herdr");
     }
 
     let child = cmd

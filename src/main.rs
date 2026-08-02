@@ -4,6 +4,7 @@ mod config;
 mod provider;
 mod serve;
 mod session;
+mod state;
 mod tmux;
 mod tui;
 
@@ -72,6 +73,15 @@ fn main() -> Result<()> {
                 eprintln!("Skipped Ghostty keybindings: config file not found");
             }
 
+            match commands::init::install_agent_hooks() {
+                Ok(messages) => {
+                    for message in messages {
+                        println!("{message}");
+                    }
+                }
+                Err(e) => eprintln!("Skipped agent hooks: {e}"),
+            }
+
             println!(
                 "Reload your shell (e.g. `source {}`) to use aliases.",
                 path.display()
@@ -95,7 +105,21 @@ fn main() -> Result<()> {
             token,
             foreground,
             open,
-        }) => serve::serve(port, host.as_deref(), token.as_deref(), foreground, open),
+            herdr,
+        }) => serve::serve(port, host.as_deref(), token.as_deref(), foreground, open, herdr),
+        Some(Command::Hook {
+            state,
+            pane,
+            session,
+            source,
+            task_id,
+            message,
+        }) => {
+            let state = state::HookState::parse(&state)?;
+            let event = state::record_status(pane, session, state, source, task_id, message)?;
+            println!("{}", serde_json::to_string(&event)?);
+            Ok(())
+        }
         Some(Command::Stop) => serve::stop(),
         Some(Command::InstallCli) => commands::init::install_cli(&agents),
         Some(Command::Save { file }) => {

@@ -2248,6 +2248,9 @@ fn build_snapshot() -> Snapshot {
         })
         .collect();
 
+    let mut panes: Vec<Pane> = panes;
+    append_herdr_panes(&mut panes, &now);
+
     Snapshot {
         ok: true,
         now,
@@ -2255,6 +2258,81 @@ fn build_snapshot() -> Snapshot {
         system,
         device,
         error: None,
+    }
+}
+
+/// Append agents running inside herdr (`amux serve --herdr`).
+///
+/// herdr reports agent state natively, so these panes bypass the terminal
+/// heuristics entirely — no spinner matching, no session-file scanning, no
+/// hook events. A missing or broken herdr contributes nothing and never
+/// disturbs the rmux panes above.
+fn append_herdr_panes(panes: &mut Vec<Pane>, now: &str) {
+    if !crate::serve::herdr::enabled() {
+        return;
+    }
+    let bridged = crate::serve::herdr::collect();
+    if bridged.is_empty() {
+        crate::serve::herdr::note_empty_once();
+        return;
+    }
+    for b in bridged {
+        let status = herdr_status(&b.agent_status);
+        let reason = format!("herdr: {}", b.agent_status);
+        PANE_STATUS_CACHE
+            .lock()
+            .expect("pane status cache mutex poisoned")
+            .insert(b.id.clone(), status.clone());
+
+        // Reuse the same interaction-message builder the rmux panes use, so
+        // the client renders herdr panes identically.
+        let base = BasePane {
+            id: b.id.clone(),
+            target: b.id.clone(),
+            session: b.session.clone(),
+            window_index: String::new(),
+            window_name: b.workspace_id.clone(),
+            pane_index: String::new(),
+            command: b.agent.clone(),
+            path: b.cwd.clone(),
+            active: false,
+            pid: None,
+            title: b.title.clone(),
+        };
+        let messages = interaction_messages_for_pane(&base, &b.tail, &status, &reason, now);
+
+        panes.push(Pane {
+            id: b.id,
+            target: base.target,
+            session: b.session,
+            window_index: base.window_index,
+            window_name: base.window_name,
+            pane_index: base.pane_index,
+            command: b.agent,
+            path: b.cwd,
+            active: false,
+            pid: None,
+            title: b.title,
+            tail: b.tail,
+            status,
+            reason,
+            updated_at: now.to_string(),
+            activity_age_secs: None,
+            messages,
+        });
+    }
+}
+
+/// Map herdr's agent state onto amux's. `blocked` is the one amux spends the
+/// most effort inferring from terminal text — herdr reports it directly.
+fn herdr_status(state: &str) -> PaneStatus {
+    match state {
+        "working" => PaneStatus::Running,
+        "blocked" => PaneStatus::Waiting,
+        "done" => PaneStatus::Done,
+        // `idle`, `unknown`, and anything new default to Idle: safe, because
+        // Idle is what lets the pending queue flush.
+        _ => PaneStatus::Idle,
     }
 }
 
@@ -2648,6 +2726,28 @@ fn flush_pending_messages(state: &AppState, panes: &[Pane]) {
             continue;
         };
 
+        // herdr panes go through its API; the rmux copy-mode / paste dance
+        // below doesn't apply to them.
+        if crate::serve::herdr::owns(&pane.id) {
+            if let Err(error) = crate::serve::herdr::send(&pane.id, &message.text, message.enter) {
+                eprintln!("[pending] herdr send failed for {}: {error}; re-queued", pane.id);
+                PENDING_MESSAGES
+                    .lock()
+                    .expect("pending messages mutex poisoned")
+                    .entry(pane.id.clone())
+                    .or_default()
+                    .insert(0, message);
+                continue;
+            }
+            PENDING_FLUSH_AT
+                .lock()
+                .expect("pending flush mutex poisoned")
+                .insert(pane.id.clone(), Instant::now());
+            request_pane_log_refresh_burst(state, &pane.id);
+            eprintln!("[pending] delivered queued message to {}", pane.id);
+            continue;
+        }
+
         exit_tmux_copy_mode(&pane.id);
         if message.vim_mode {
             let _ = send_key_parts(&pane.id, &["C-[", "i"]);
@@ -2805,6 +2905,22 @@ async fn api_send(
         None if body.enter != Some(false) => Some("Enter"),
         None => None,
     };
+
+    // herdr panes aren't in `list_panes()` (that's rmux), so route them to the
+    // herdr bridge before the rmux lookup below would fail to find them.
+    if crate::serve::herdr::owns(&body.pane_id) {
+        let enter = requested_submit_key == Some("Enter");
+        return match crate::serve::herdr::send(&body.pane_id, &body.text, enter) {
+            Ok(()) => {
+                schedule_snapshot_refresh_soon(&state);
+                json_response(StatusCode::OK, json!({ "ok": true, "backend": "herdr" }))
+            }
+            Err(error) => json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({ "ok": false, "error": error }),
+            ),
+        };
+    }
 
     let target_pane = list_panes()
         .ok()
@@ -3028,6 +3144,27 @@ async fn api_key(
             StatusCode::BAD_REQUEST,
             json!({ "error": "invalid paneId or key" }),
         );
+    }
+
+    // herdr keys go through its API. Its send-keys takes key *names* only, and
+    // the vim composites below are rmux/tmux-specific, so map those to the
+    // plain key herdr understands.
+    if crate::serve::herdr::owns(&pane_id) {
+        let herdr_key = match key.as_str() {
+            "VimClear" | "VimBackspace" => "BSpace",
+            "C-[" => "Escape",
+            other => other,
+        };
+        return match crate::serve::herdr::send_key(&pane_id, herdr_key) {
+            Ok(()) => {
+                schedule_snapshot_refresh_soon(&state);
+                json_response(StatusCode::OK, json!({ "ok": true, "backend": "herdr" }))
+            }
+            Err(error) => json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({ "ok": false, "error": error }),
+            ),
+        };
     }
 
     let previous_tail = capture_pane_lines(&pane_id, PANE_COMMAND_TAIL_LINE_COUNT);

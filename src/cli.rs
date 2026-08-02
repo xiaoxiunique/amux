@@ -51,6 +51,30 @@ pub enum Command {
         /// Open the web UI in your browser after starting.
         #[arg(long)]
         open: bool,
+        /// Also surface agents running inside herdr (https://herdr.dev)
+        /// alongside the rmux sessions.
+        #[arg(long)]
+        herdr: bool,
+    },
+    /// Record an explicit agent lifecycle status for the monitor.
+    Hook {
+        /// State: running/start, waiting, idle, failed, or done/completed.
+        state: String,
+        /// tmux pane id, e.g. %61. Defaults to $TMUX_PANE when omitted.
+        #[arg(long, env = "TMUX_PANE")]
+        pane: Option<String>,
+        /// tmux session name. Useful when no pane id is available.
+        #[arg(long)]
+        session: Option<String>,
+        /// Source label stored with the event.
+        #[arg(long)]
+        source: Option<String>,
+        /// Optional task/turn id from the calling agent.
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Optional short status message.
+        #[arg(long)]
+        message: Option<String>,
     },
     /// Stop the agent monitor daemon.
     Stop,

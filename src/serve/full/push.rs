@@ -7,9 +7,10 @@
 //! - Token-based APNs auth (ES256 JWT signed with a `.p8` key), HTTP/2 to
 //!   `api(.sandbox).push.apple.com`.
 //! - Status-transition notifications: when a phone-initiated Claude turn stops
-//!   for confirmation (Running→Waiting) or finishes (Running→Idle/Done), push
-//!   a Chinese-language alert to every registered device — but only for opted-in
-//!   sessions and only for turns kicked off from a phone.
+//!   for confirmation (Running→Waiting), a Claude turn finishes
+//!   (Running→Idle/Done), or a Codex hook reports Done, push a Chinese-language
+//!   alert to every registered device — but only for opted-in sessions and only
+//!   for turns kicked off from a phone.
 //!
 //! Handlers: `GET/POST /api/pane/notify-config`, `GET /api/push/status`,
 //! `POST /api/push/register`, `POST /api/push/test`.
@@ -30,7 +31,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::serve::server::{
-    is_authed, json_response, now_iso, pane_is_claude, AppState, Pane, PaneStatus,
+    is_authed, json_response, now_iso, pane_is_claude, pane_is_codex, AppState, Pane, PaneStatus,
 };
 
 // ===========================================================================
@@ -527,34 +528,56 @@ pub(crate) fn mark_send_source(headers: &HeaderMap, path: &str) {
     let mut map = lock_recover(&MOBILE_TRIGGERED);
     if matches!(source, "ios" | "android") {
         map.insert(path.to_string(), Instant::now());
+        lock_recover(&NOTIFY_PREV_STATUS).insert(path.to_string(), PaneStatus::Running);
     } else {
         map.remove(path);
     }
 }
 
+fn notification_event(
+    prev: Option<PaneStatus>,
+    cur: PaneStatus,
+    is_claude: bool,
+    is_codex: bool,
+) -> Option<&'static str> {
+    match (prev, cur) {
+        (Some(PaneStatus::Running), PaneStatus::Waiting) if is_claude => Some("waiting"),
+        (Some(PaneStatus::Running), PaneStatus::Idle | PaneStatus::Done)
+            if is_claude =>
+        {
+            Some("done")
+        }
+        (Some(PaneStatus::Running), PaneStatus::Done) if is_codex => Some("done"),
+        _ => None,
+    }
+}
+
 /// Push a notification when a Claude session stops for a confirmation
-/// (Running→Waiting) or finishes its turn (Running→Idle/Done) — but only for
-/// turns kicked off from a phone (MOBILE_TRIGGERED) and sessions that opted in.
+/// (Running→Waiting), a Claude turn finishes (Running→Idle/Done), or a Codex
+/// hook reports Done — but only for turns kicked off from a phone
+/// (MOBILE_TRIGGERED) and sessions that opted in.
 pub(crate) fn notify_status_changes(panes: &[Pane]) {
     for pane in panes {
         let path = pane.path.trim();
         if path.is_empty() {
             continue;
         }
-        if !pane_is_claude(&pane.session, &pane.command, &pane.title) {
+        let is_claude = pane_is_claude(&pane.session, &pane.command, &pane.title);
+        let is_codex = pane_is_codex(&pane.session, &pane.command, &pane.title);
+        if !is_claude && !is_codex {
             continue;
         }
         let cur = pane.status.clone();
         let prev = {
             let mut map = lock_recover(&NOTIFY_PREV_STATUS);
             let prev = map.get(path).cloned();
-            map.insert(path.to_string(), cur.clone());
+            if !(is_codex && prev == Some(PaneStatus::Running) && cur == PaneStatus::Idle) {
+                map.insert(path.to_string(), cur.clone());
+            }
             prev
         };
-        let event = match (prev, cur) {
-            (Some(PaneStatus::Running), PaneStatus::Waiting) => "waiting",
-            (Some(PaneStatus::Running), PaneStatus::Idle | PaneStatus::Done) => "done",
-            _ => continue,
+        let Some(event) = notification_event(prev, cur, is_claude, is_codex) else {
+            continue;
         };
         let cfg = notify_config_for(path);
         if !cfg.enabled || !cfg.events.iter().any(|e| e == event) {
@@ -572,5 +595,42 @@ pub(crate) fn notify_status_changes(panes: &[Pane]) {
             "任务完成 ✅"
         };
         push_to_all(project.to_string(), body.to_string(), Some(pane.id.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_done_transition_notifies() {
+        assert_eq!(
+            notification_event(Some(PaneStatus::Running), PaneStatus::Done, false, true),
+            Some("done")
+        );
+        assert_eq!(
+            notification_event(Some(PaneStatus::Running), PaneStatus::Idle, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_waiting_transition_is_ignored() {
+        assert_eq!(
+            notification_event(Some(PaneStatus::Running), PaneStatus::Waiting, false, true),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_waiting_and_done_transitions_notify() {
+        assert_eq!(
+            notification_event(Some(PaneStatus::Running), PaneStatus::Waiting, true, false),
+            Some("waiting")
+        );
+        assert_eq!(
+            notification_event(Some(PaneStatus::Running), PaneStatus::Done, true, false),
+            Some("done")
+        );
     }
 }
