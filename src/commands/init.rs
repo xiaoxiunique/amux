@@ -22,9 +22,13 @@ pub fn render_block(agents: &[Agent]) -> String {
 /// Render the rmux setup block: mouse text-selection → clipboard, plus the fzf
 /// session switcher on M-o (Ghostty Shift+Cmd+O).
 pub fn render_mux_block() -> String {
+    // The clipboard pipe command is platform-specific: pbcopy on macOS,
+    // clip on Windows. The body is a format string, so we resolve the
+    // platform-dependent value before it is substituted.
+    let clipper = if cfg!(windows) { "clip" } else { "pbcopy" };
     format!(
         "{BEGIN}\n\
-         # mouse text selection copies to the macOS clipboard\n\
+         # mouse text selection copies to the system clipboard\n\
          set -g mouse on\n\
          # Default pipe for every copy-mode binding that calls copy-pipe*\n\
          # without an explicit command — which is most of them, including the\n\
@@ -32,11 +36,11 @@ pub fn render_mux_block() -> String {
          # y and MouseDragEnd covers copy-mode-vi, but mode-keys defaults to\n\
          # emacs, so a mouse drag lands on the emacs table and the selection\n\
          # never reaches the system clipboard.\n\
-         set -g copy-command \"pbcopy\"\n\
-         bind -T copy-mode-vi y send -X copy-pipe-and-cancel \"pbcopy\"\n\
-         bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n\
-         bind -T copy-mode M-w send -X copy-pipe-and-cancel \"pbcopy\"\n\
-         bind -T copy-mode MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n\
+         set -g copy-command \"{clipper}\"\n\
+         bind -T copy-mode-vi y send -X copy-pipe-and-cancel \"{clipper}\"\n\
+         bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"{clipper}\"\n\
+         bind -T copy-mode M-w send -X copy-pipe-and-cancel \"{clipper}\"\n\
+         bind -T copy-mode MouseDragEnd1Pane send -X copy-pipe-and-cancel \"{clipper}\"\n\
          # Size a session to its smallest attached client, so switching into a\n\
          # session that a taller window owns doesn't clip its bottom rows.\n\
          set -g window-size smallest\n\
@@ -561,13 +565,16 @@ mod tests {
         // emacs, so a mouse drag hit the emacs table's bare
         // copy-pipe-and-cancel and the text stopped at rmux's own buffer
         // instead of reaching the system clipboard.
+        let clipper = if cfg!(windows) { "clip" } else { "pbcopy" };
         let b = render_mux_block();
-        assert!(b.contains("set -g copy-command \"pbcopy\""),
-            "copy-command is what covers the bindings we don't restate");
+        assert!(
+            b.contains(&format!("set -g copy-command \"{clipper}\"")),
+            "copy-command is what covers the bindings we don't restate"
+        );
         for table in ["copy-mode-vi", "copy-mode"] {
             assert!(
                 b.contains(&format!(
-                    "bind -T {table} MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\""
+                    "bind -T {table} MouseDragEnd1Pane send -X copy-pipe-and-cancel \"{clipper}\""
                 )),
                 "missing mouse copy binding for {table}"
             );
