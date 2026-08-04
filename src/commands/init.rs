@@ -26,8 +26,17 @@ pub fn render_mux_block() -> String {
         "{BEGIN}\n\
          # mouse text selection copies to the macOS clipboard\n\
          set -g mouse on\n\
+         # Default pipe for every copy-mode binding that calls copy-pipe*\n\
+         # without an explicit command — which is most of them, including the\n\
+         # built-in double/triple-click word and line selections. Binding only\n\
+         # y and MouseDragEnd covers copy-mode-vi, but mode-keys defaults to\n\
+         # emacs, so a mouse drag lands on the emacs table and the selection\n\
+         # never reaches the system clipboard.\n\
+         set -g copy-command \"pbcopy\"\n\
          bind -T copy-mode-vi y send -X copy-pipe-and-cancel \"pbcopy\"\n\
          bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n\
+         bind -T copy-mode M-w send -X copy-pipe-and-cancel \"pbcopy\"\n\
+         bind -T copy-mode MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\"\n\
          # Size a session to its smallest attached client, so switching into a\n\
          # session that a taller window owns doesn't clip its bottom rows.\n\
          set -g window-size smallest\n\
@@ -544,6 +553,25 @@ mod tests {
         assert!(b.trim_end().ends_with(END));
         assert!(b.contains("bind -n M-o choose-tree -Zs"));
         assert!(b.contains("set -g window-size smallest"));
+    }
+
+    #[test]
+    fn mux_block_copies_to_the_clipboard_in_both_mode_tables() {
+        // Regression: only copy-mode-vi was bound, but mode-keys defaults to
+        // emacs, so a mouse drag hit the emacs table's bare
+        // copy-pipe-and-cancel and the text stopped at rmux's own buffer
+        // instead of reaching the system clipboard.
+        let b = render_mux_block();
+        assert!(b.contains("set -g copy-command \"pbcopy\""),
+            "copy-command is what covers the bindings we don't restate");
+        for table in ["copy-mode-vi", "copy-mode"] {
+            assert!(
+                b.contains(&format!(
+                    "bind -T {table} MouseDragEnd1Pane send -X copy-pipe-and-cancel \"pbcopy\""
+                )),
+                "missing mouse copy binding for {table}"
+            );
+        }
     }
 
     #[test]
