@@ -470,6 +470,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         )
         .route("/api/cc-switch", get(api_cc_switch_status))
         .route("/api/capabilities", get(api_capabilities))
+        .route("/api/usb/devices", get(api_usb_devices))
         .route("/api/files/roots", get(api_files_roots))
         .route("/api/files/list", get(api_files_list))
         .route("/api/files/read", get(api_files_read))
@@ -2659,6 +2660,24 @@ async fn api_capabilities(
         );
     }
     json_response(StatusCode::OK, json!({ "ok": true, "capabilities": body }))
+}
+
+// ------------------------------------------------------------- USB devices
+
+async fn api_usb_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let devices = crate::serve::usb::enumerate();
+    let available = crate::serve::usb::available();
+    json_response(
+        StatusCode::OK,
+        json!({ "ok": true, "available": available, "devices": devices }),
+    )
 }
 
 // ------------------------------------------------------------- files

@@ -10,6 +10,7 @@
 pub mod cron;
 pub mod files;
 pub mod herdr;
+pub mod usb;
 pub mod server;
 
 #[cfg(feature = "full")]
