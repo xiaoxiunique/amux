@@ -447,6 +447,86 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// On Windows, download the latest rmux release binary from GitHub when it
+/// isn't already on the machine, so `amux install-cli` is genuinely
+/// self-contained. Fails gracefully on network or extraction errors — the
+/// caller prints a manual-install fallback.
+#[cfg(windows)]
+fn download_rmux_windows(dest: &Path) -> Result<()> {
+    let version = std::env::var("AMUX_RMUX_VERSION")
+        .unwrap_or_else(|_| "0.8.0".to_string());
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        a => bail!("unsupported architecture: {a} (no rmux binary for it)"),
+    };
+    let name = format!("rmux-{version}-windows-{arch}");
+    let url = format!(
+        "https://github.com/helvesec/rmux/releases/download/v{version}/{name}.zip"
+    );
+    let tmp = tempfile::tempdir().context("creating temp dir for rmux download")?;
+    let zip = tmp.path().join(format!("{name}.zip"));
+    let extract = tmp.path().join("rmux-extracted");
+
+    println!("  -> {url}");
+    let resp = reqwest::blocking::get(&url)
+        .with_context(|| format!("downloading {url}"))?
+        .error_for_status()
+        .with_context(|| format!("HTTP error from {url}"))?;
+    let bytes = resp
+        .bytes()
+        .with_context(|| format!("reading {url}"))?;
+    std::fs::write(&zip, &bytes).context("writing rmux zip to temp")?;
+
+    // PowerShell's Expand-Archive is present on every supported Windows
+    // release; no extra tooling needed.
+    std::fs::create_dir(&extract).context("creating extract dir")?;
+    let status = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Expand-Archive -Path '{}' -DestinationPath '{}'",
+                zip.display(),
+                extract.display()
+            ),
+        ])
+        .status()
+        .context("running Expand-Archive (is PowerShell available?)")?;
+    if !status.success() {
+        bail!("Expand-Archive failed (corrupt download or disk full?)");
+    }
+
+    // The zip typically contains `rmux-{version}-windows-{arch}/rmux.exe`.
+    let exe = find_in(&extract, "rmux.exe").with_context(|| {
+        format!(
+            "rmux.exe not found after extraction — the release layout may have changed;\n\
+             extracted to {}",
+            extract.display()
+        )
+    })?;
+    std::fs::copy(&exe, dest)
+        .with_context(|| format!("copying rmux.exe to {}", dest.display()))?;
+    Ok(())
+}
+
+/// Recursively search a directory tree for a file with the given name.
+#[cfg(windows)]
+fn find_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    use std::fs;
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if let Some(found) = find_in(&p, name) {
+                return Some(found);
+            }
+        } else if p.file_name().and_then(|n| n.to_str()) == Some(name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
 /// Make amux + rmux and the `cc`/`cx` shortcuts available to a terminal, from a
 /// bundled or installed binary. Idempotent.
 pub fn install_cli(agents: &[Agent]) -> Result<()> {
@@ -475,9 +555,28 @@ pub fn install_cli(agents: &[Agent]) -> Result<()> {
             link_or_copy(r, &bindir.join(rmux_name))?;
             println!("Installed rmux → {}", bindir.join(rmux_name).display());
         }
-        None => eprintln!(
-            "note: rmux not found next to amux or on PATH — install it from https://rmux.io"
-        ),
+        None => {
+            #[cfg(windows)]
+            {
+                println!("rmux not found — downloading from GitHub releases…");
+                match download_rmux_windows(&bindir.join(rmux_name)) {
+                    Ok(()) => println!(
+                        "Installed rmux → {}",
+                        bindir.join(rmux_name).display()
+                    ),
+                    Err(e) => eprintln!(
+                        "Failed to download rmux: {e}\n\
+                         Install it manually from https://rmux.io"
+                    ),
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                eprintln!(
+                    "note: rmux not found next to amux or on PATH — install it from https://rmux.io"
+                )
+            }
+        },
     }
 
     #[cfg(not(windows))]
