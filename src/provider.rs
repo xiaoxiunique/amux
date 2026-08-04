@@ -25,6 +25,13 @@ fn open_db() -> Option<Connection> {
     Connection::open_with_flags(&p, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
 }
 
+/// True when the CC Switch database exists on this machine, i.e. `--provider`
+/// and the cc-switch endpoints have something to work with. Lets the server
+/// advertise the feature instead of the client discovering it by failing.
+pub fn is_installed() -> bool {
+    db_path().is_some_and(|p| p.exists())
+}
+
 /// Resolve a provider name/id to a DB provider ID for the given app_type.
 fn resolve_provider_id(name: &str, app_type: &str, conn: &Connection) -> Result<String> {
     // Try exact ID match

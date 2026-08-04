@@ -37,6 +37,19 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// True when the herdr binary is present on this machine, regardless of
+/// whether `--herdr` was passed. Distinct from [`enabled`]: the client needs
+/// to tell "not installed" (hide the feature) from "installed but the bridge
+/// is off" (tell the user to restart serve with --herdr).
+pub fn installed() -> bool {
+    Command::new(herdr_bin())
+        .arg("--help")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
 /// Pane ids we hand out are prefixed so they can't collide with rmux's `%59`
 /// and so `/api/send` can route back to the right backend.
 pub const PANE_PREFIX: &str = "herdr:";

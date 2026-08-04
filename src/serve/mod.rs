@@ -7,6 +7,7 @@
     unreachable_code,
     unused_assignments
 )]
+pub mod cron;
 pub mod herdr;
 pub mod server;
 

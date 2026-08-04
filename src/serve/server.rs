@@ -469,6 +469,12 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
             post(api_project_history_launch),
         )
         .route("/api/cc-switch", get(api_cc_switch_status))
+        .route("/api/capabilities", get(api_capabilities))
+        .route("/api/cron/schedules", get(api_cron_schedules))
+        .route("/api/cron/jobs", get(api_cron_jobs))
+        .route("/api/cron/jobs/running", get(api_cron_running))
+        .route("/api/cron/log", get(api_cron_log))
+        .route("/api/cron/action", post(api_cron_action))
         .route("/api/cc-switch/switch", post(api_cc_switch_switch))
         .route("/ws", get(snapshot_ws))
         .route("/pane-log/ws", get(pane_log_ws))
@@ -2603,6 +2609,175 @@ async fn api_snapshot(
     }
 
     json_response(StatusCode::OK, broadcast_snapshot(&state))
+}
+
+// -------------------------------------------------------- capabilities
+
+/// Cached result of the capability probe. `herdr` detection spawns a process,
+/// so this is computed once rather than on every client poll.
+static CAPABILITIES: LazyLock<serde_json::Value> = LazyLock::new(|| {
+    json!({
+        // Optional integrations, each gated on the tool actually being present.
+        "cronbox": crate::serve::cron::available(),
+        "ccSwitch": crate::provider::is_installed(),
+        "herdr": {
+            "installed": crate::serve::herdr::installed(),
+            // Installed but not enabled means serve needs restarting with
+            // --herdr; the client can say so instead of silently showing
+            // nothing.
+            "enabled": crate::serve::herdr::enabled(),
+        },
+        // Compiled-in feature set: the control-center / screenshot / push
+        // endpoints only exist in `--features full` builds.
+        "full": cfg!(feature = "full"),
+        "platform": std::env::consts::OS,
+    })
+});
+
+/// Report which optional tools this machine has, so the client can hide
+/// features instead of discovering they are missing by calling them and
+/// handling the failure.
+async fn api_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let mut body = CAPABILITIES.clone();
+    // `enabled` is the one field that can differ from the cached probe if the
+    // flag were toggled, so refresh it rather than serving a stale value.
+    if let Some(h) = body.get_mut("herdr").and_then(|h| h.as_object_mut()) {
+        h.insert(
+            "enabled".to_string(),
+            json!(crate::serve::herdr::enabled()),
+        );
+    }
+    json_response(StatusCode::OK, json!({ "ok": true, "capabilities": body }))
+}
+
+// ------------------------------------------------------------- cronbox
+/// Uniform failure shape for the cron endpoints. A missing CronBox is a 404
+/// (nothing to manage) rather than a 500, so the client can hide the feature
+/// instead of showing an error.
+fn cron_error(error: String) -> Response<Body> {
+    let missing = error.contains("not found");
+    let code = if missing {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    json_response(code, json!({ "ok": false, "error": error }))
+}
+
+async fn api_cron_schedules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    match crate::serve::cron::schedules() {
+        Ok(schedules) => json_response(
+            StatusCode::OK,
+            json!({ "ok": true, "schedules": schedules }),
+        ),
+        Err(error) => cron_error(error),
+    }
+}
+
+async fn api_cron_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok());
+    let status = query.get("status").map(String::as_str);
+    let schedule_id = query.get("scheduleId").map(String::as_str);
+    match crate::serve::cron::jobs(limit, status, schedule_id) {
+        Ok(jobs) => json_response(StatusCode::OK, json!({ "ok": true, "jobs": jobs })),
+        Err(error) => cron_error(error),
+    }
+}
+
+async fn api_cron_running(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    match crate::serve::cron::running() {
+        Ok(jobs) => json_response(StatusCode::OK, json!({ "ok": true, "jobs": jobs })),
+        Err(error) => cron_error(error),
+    }
+}
+
+async fn api_cron_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let Some(id) = query.get("id").filter(|v| !v.is_empty()) else {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "id is required" }));
+    };
+    match crate::serve::cron::job_log(id) {
+        Ok((id, logs)) => json_response(
+            StatusCode::OK,
+            json!({ "ok": true, "id": id, "logs": logs }),
+        ),
+        Err(error) => cron_error(error),
+    }
+}
+
+#[derive(Deserialize)]
+struct CronActionRequest {
+    action: String,
+    id: String,
+}
+
+/// Mutations: enable / disable a schedule, cancel a job, or trigger a run.
+/// All are delegated to the cronbox CLI so the running daemon picks them up.
+async fn api_cron_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<CronActionRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    if body.id.is_empty() {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "id is required" }));
+    }
+    let result = match body.action.as_str() {
+        "enable" => crate::serve::cron::enable(&body.id),
+        "disable" => crate::serve::cron::disable(&body.id),
+        "cancel" => crate::serve::cron::cancel(&body.id),
+        "trigger" => crate::serve::cron::trigger(&body.id),
+        other => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": format!("unknown action: {other}") }),
+            )
+        }
+    };
+    match result {
+        Ok(message) => json_response(
+            StatusCode::OK,
+            json!({ "ok": true, "action": body.action, "message": message }),
+        ),
+        Err(error) => cron_error(error),
+    }
 }
 
 async fn api_pane_context(
