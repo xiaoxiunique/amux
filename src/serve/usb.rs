@@ -143,6 +143,68 @@ fn parse(text: &str) -> Vec<UsbDevice> {
     out
 }
 
+/// Take a screenshot of a USB-connected phone, keyed by its serial number.
+///
+/// Returns the image bytes and a content type. Android is captured directly
+/// from `adb exec-out screencap -p` (stdout PNG, no temp file). iOS uses
+/// `idevicescreenshot`, which writes a PNG to a temp file and requires the
+/// device have a developer disk image mounted.
+///
+/// The serial must match a device in the cached USB enumeration; if it
+/// doesn't, the function returns an error rather than guessing a tool.
+pub fn screenshot(serial: &str) -> Result<(Vec<u8>, &'static str), String> {
+    let devices = enumerate();
+    let device = devices
+        .iter()
+        .find(|d| d.serial.as_deref() == Some(serial))
+        .ok_or_else(|| format!("no USB device with serial {serial}"))?;
+
+    let vendor = device.vendor.to_lowercase();
+
+    // Android: adb pipes PNG directly to stdout.
+    if vendor.contains("xiao")
+        || vendor.contains("samsung")
+        || vendor.contains("huawei")
+        || vendor.contains("oppo")
+        || vendor.contains("vivo")
+        || vendor.contains("oneplus")
+        || vendor.contains("google")
+        || vendor.contains("motorola")
+    {
+        let output = Command::new("adb")
+            .args(["-s", serial, "exec-out", "screencap", "-p"])
+            .output()
+            .map_err(|e| format!("adb: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("adb screenshot failed: {}", stderr.trim()));
+        }
+        return Ok((output.stdout, "image/png"));
+    }
+
+    // iOS: idevicescreenshot writes to a file.
+    if vendor.contains("apple inc") || vendor.contains("apple") {
+        let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let path = dir.path().join("shot.png");
+
+        let status = Command::new("idevicescreenshot")
+            .args(["-u", serial])
+            .arg(&path)
+            .status()
+            .map_err(|e| format!("idevicescreenshot: {e}"))?;
+        if !status.success() {
+            return Err("idevicescreenshot failed (device connected and unlocked?)".to_string());
+        }
+        let bytes = std::fs::read(&path).map_err(|e| format!("reading screenshot: {e}"))?;
+        return Ok((bytes, "image/png"));
+    }
+
+    Err(format!(
+        "screenshot not supported for vendor '{}' (serial {serial})",
+        device.vendor
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

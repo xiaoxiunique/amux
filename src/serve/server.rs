@@ -471,6 +471,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         .route("/api/cc-switch", get(api_cc_switch_status))
         .route("/api/capabilities", get(api_capabilities))
         .route("/api/usb/devices", get(api_usb_devices))
+        .route("/api/usb/screenshot", get(api_usb_screenshot))
         .route("/api/files/roots", get(api_files_roots))
         .route("/api/files/list", get(api_files_list))
         .route("/api/files/read", get(api_files_read))
@@ -2678,6 +2679,37 @@ async fn api_usb_devices(
         StatusCode::OK,
         json!({ "ok": true, "available": available, "devices": devices }),
     )
+}
+
+async fn api_usb_screenshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let Some(serial) = query.get("serial").filter(|s| !s.is_empty()) else {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "serial is required" }));
+    };
+    match crate::serve::usb::screenshot(serial) {
+        Ok((bytes, content_type)) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(bytes))
+            .expect("response builder"),
+        Err(error) => {
+            let code = if error.contains("no USB device") {
+                StatusCode::NOT_FOUND
+            } else if error.contains("not supported") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            json_response(code, json!({ "error": error }))
+        }
+    }
 }
 
 // ------------------------------------------------------------- files
