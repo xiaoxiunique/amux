@@ -470,6 +470,10 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         )
         .route("/api/cc-switch", get(api_cc_switch_status))
         .route("/api/capabilities", get(api_capabilities))
+        .route("/api/files/roots", get(api_files_roots))
+        .route("/api/files/list", get(api_files_list))
+        .route("/api/files/read", get(api_files_read))
+        .route("/api/files/download", get(api_files_download))
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
         .route("/api/cron/jobs/running", get(api_cron_running))
@@ -2655,6 +2659,154 @@ async fn api_capabilities(
         );
     }
     json_response(StatusCode::OK, json!({ "ok": true, "capabilities": body }))
+}
+
+// ------------------------------------------------------------- files
+
+/// The directories the client may browse: every live pane's cwd plus the
+/// project history. Computed per request so a newly opened project shows up
+/// without restarting the server.
+fn browsable_roots() -> Vec<crate::serve::files::Root> {
+    let pane_paths: Vec<String> = list_panes()
+        .map(|panes| panes.into_iter().map(|p| p.path).collect())
+        .unwrap_or_default();
+    let history_paths: Vec<String> = load_project_history()
+        .map(|entries| entries.into_iter().map(|e| e.path).collect())
+        .unwrap_or_default();
+    crate::serve::files::roots(&pane_paths, &history_paths)
+}
+
+/// Map a resolve failure to a status: outside-the-roots is a refusal (403),
+/// a missing path is a 404.
+fn files_error(error: String) -> Response<Body> {
+    let code = if error.contains("outside") {
+        StatusCode::FORBIDDEN
+    } else if error.contains("no such path") {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    json_response(code, json!({ "ok": false, "error": error }))
+}
+
+async fn api_files_roots(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    json_response(StatusCode::OK, json!({ "ok": true, "roots": browsable_roots() }))
+}
+
+async fn api_files_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let path = query.get("path").cloned().unwrap_or_default();
+    let show_all = query.get("all").map(|v| v == "true").unwrap_or(false);
+    let roots = browsable_roots();
+    match crate::serve::files::resolve_within(&path, &roots) {
+        Ok((dir, root)) => match crate::serve::files::list(&dir, &root, show_all) {
+            Ok(listing) => json_response(
+                StatusCode::OK,
+                json!({ "ok": true, "listing": listing }),
+            ),
+            Err(error) => files_error(error),
+        },
+        Err(error) => files_error(error),
+    }
+}
+
+async fn api_files_read(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let path = query.get("path").cloned().unwrap_or_default();
+    let roots = browsable_roots();
+    let (file, _) = match crate::serve::files::resolve_within(&path, &roots) {
+        Ok(v) => v,
+        Err(error) => return files_error(error),
+    };
+    match crate::serve::files::preview(&file) {
+        Ok(crate::serve::files::Preview::Text { content, size }) => json_response(
+            StatusCode::OK,
+            json!({ "ok": true, "text": true, "content": content, "size": size }),
+        ),
+        Ok(crate::serve::files::Preview::Binary { size, reason }) => json_response(
+            StatusCode::OK,
+            json!({ "ok": true, "text": false, "size": size, "reason": reason }),
+        ),
+        Err(error) => files_error(error),
+    }
+}
+
+/// Stream a file back. Streaming rather than buffering because project trees
+/// hold large artefacts (a release binary here is 48MB) that shouldn't be held
+/// in memory to serve.
+async fn api_files_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let path = query.get("path").cloned().unwrap_or_default();
+    let roots = browsable_roots();
+    let (file, _) = match crate::serve::files::resolve_within(&path, &roots) {
+        Ok(v) => v,
+        Err(error) => return files_error(error),
+    };
+    let meta = match std::fs::metadata(&file) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return files_error("path is a directory".to_string()),
+        Err(e) => return files_error(format!("cannot stat file: {e}")),
+    };
+    let handle = match tokio::fs::File::open(&file).await {
+        Ok(f) => f,
+        Err(e) => return files_error(format!("cannot open file: {e}")),
+    };
+
+    let name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "download".to_string());
+    // Quote-escape so a filename containing `"` can't break out of the header.
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        name.replace('\\', "").replace('"', "")
+    );
+    // Stream in chunks rather than reading the whole file into memory: project
+    // trees hold large artefacts (a release binary here is 48MB).
+    let stream = futures_util::stream::try_unfold(handle, |mut f| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            Ok::<_, std::io::Error>(None)
+        } else {
+            buf.truncate(n);
+            Ok(Some((axum::body::Bytes::from(buf), f)))
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, crate::serve::files::content_type_for(&file))
+        .header(header::CONTENT_LENGTH, meta.len())
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(Body::from_stream(stream))
+        .expect("response builder")
 }
 
 // ------------------------------------------------------------- cronbox
