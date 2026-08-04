@@ -239,8 +239,30 @@ pub fn list(dir: &Path, root: &Path, show_all: bool) -> Result<Listing, String> 
 /// Outcome of asking for a text preview.
 pub enum Preview {
     Text { content: String, size: u64 },
-    /// Not previewable inline; the client should offer a download instead.
+    /// Not text, but the client can render it from `/api/files/download`
+    /// (which already serves the right content type). `kind` is `image` or
+    /// `video`.
+    Media { size: u64, kind: &'static str },
+    /// Not previewable at all; the client should offer a download.
     Binary { size: u64, reason: &'static str },
+}
+
+/// Media that a phone can display directly, keyed off the extension.
+///
+/// Decided before the size check: a 3MB photo is perfectly viewable, it just
+/// can't be sent as a JSON string, so the size cap that applies to text
+/// shouldn't push images into "too large to preview".
+fn media_kind(file: &Path) -> Option<&'static str> {
+    match file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "heic") => Some("image"),
+        Some("mp4" | "mov" | "m4v") => Some("video"),
+        _ => None,
+    }
 }
 
 /// Read a file for inline preview.
@@ -254,6 +276,10 @@ pub fn preview(file: &Path) -> Result<Preview, String> {
         return Err("path is a directory".to_string());
     }
     let size = meta.len();
+
+    if let Some(kind) = media_kind(file) {
+        return Ok(Preview::Media { size, kind });
+    }
     if size > MAX_PREVIEW_BYTES {
         return Ok(Preview::Binary { size, reason: "too large to preview" });
     }
@@ -395,6 +421,39 @@ mod tests {
         let bin = tmp.path().join("a.bin");
         fs::write(&bin, [0xff, 0xfe, 0x00, 0x01]).unwrap();
         assert!(matches!(preview(&bin).unwrap(), Preview::Binary { .. }));
+    }
+
+    #[test]
+    fn media_is_offered_for_display_at_any_size() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Images and videos report as media, not as opaque binary — the client
+        // renders them from the download endpoint.
+        let png = tmp.path().join("shot.png");
+        fs::write(&png, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).unwrap();
+        assert!(matches!(
+            preview(&png).unwrap(),
+            Preview::Media { kind: "image", .. }
+        ));
+
+        let mov = tmp.path().join("clip.mp4");
+        fs::write(&mov, [0x00, 0x00, 0x00, 0x18]).unwrap();
+        assert!(matches!(
+            preview(&mov).unwrap(),
+            Preview::Media { kind: "video", .. }
+        ));
+
+        // Crucially, the text size cap must not demote a large photo to
+        // "too large to preview" — 128 files in these projects are over 1MB.
+        let big = tmp.path().join("big.jpg");
+        fs::write(&big, vec![0u8; (MAX_PREVIEW_BYTES + 1024) as usize]).unwrap();
+        match preview(&big).unwrap() {
+            Preview::Media { kind, size } => {
+                assert_eq!(kind, "image");
+                assert!(size > MAX_PREVIEW_BYTES);
+            }
+            _ => panic!("a large image must still be previewable"),
+        }
     }
 
     #[test]

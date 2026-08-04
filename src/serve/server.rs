@@ -2742,6 +2742,12 @@ async fn api_files_read(
             StatusCode::OK,
             json!({ "ok": true, "text": true, "content": content, "size": size }),
         ),
+        // The client renders these straight from /api/files/download, which
+        // already serves the correct content type.
+        Ok(crate::serve::files::Preview::Media { size, kind }) => json_response(
+            StatusCode::OK,
+            json!({ "ok": true, "text": false, "media": kind, "size": size }),
+        ),
         Ok(crate::serve::files::Preview::Binary { size, reason }) => json_response(
             StatusCode::OK,
             json!({ "ok": true, "text": false, "size": size, "reason": reason }),
