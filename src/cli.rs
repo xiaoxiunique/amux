@@ -27,6 +27,9 @@ pub enum Command {
     /// Install amux + rmux and the cc/cx shortcuts onto your PATH (self-contained
     /// setup from a bundled or installed binary).
     InstallCli,
+    /// Ensure Claude Code and Codex CLI are on the machine, installing any
+    /// that are missing via npm / bun / brew.
+    Install,
     /// List amux-managed sessions.
     #[command(alias = "list")]
     Ls,

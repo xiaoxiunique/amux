@@ -76,5 +76,8 @@ fi
 echo "==> running amux install-cli…"
 "$BIN_DIR/amux" install-cli
 
+echo "==> ensuring Claude Code and Codex are installed…"
+"$BIN_DIR/amux" install
+
 echo
 echo "Done. Run 'amux' to open the TUI, or 'cc' / 'cx' to start an agent."

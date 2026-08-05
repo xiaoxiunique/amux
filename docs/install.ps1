@@ -52,5 +52,8 @@ Write-Host "==> running amux install-cli…"
 & "$BinDir\amux.exe" install-cli
 if (-not $?) { throw "install-cli failed" }
 
+Write-Host "==> ensuring Claude Code and Codex are installed…"
+& "$BinDir\amux.exe" install
+
 Write-Host ""
 Write-Host "Done. Open a new terminal and run 'cc' or 'cx' to start an agent."
