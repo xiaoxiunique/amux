@@ -434,6 +434,13 @@ fn which(name: &str) -> Option<PathBuf> {
 
 /// Symlink (unix) or copy (windows) `src` → `dst`, replacing any existing file.
 fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
+    // `src` may already be the file we're about to overwrite — rmux is found
+    // via PATH, which can resolve to the install directory itself. Removing
+    // `dst` first would delete the source, leaving a symlink pointing at
+    // nothing (or, for a same-named link, at itself: ELOOP).
+    if same_file(src, dst) {
+        return Ok(());
+    }
     let _ = std::fs::remove_file(dst);
     #[cfg(unix)]
     {
@@ -445,6 +452,17 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
         std::fs::copy(src, dst).with_context(|| format!("copying to {}", dst.display()))?;
     }
     Ok(())
+}
+
+/// True when both paths name the same file on disk. Compares canonicalized
+/// paths so a symlink and its target count as one — that's exactly the case
+/// that would otherwise destroy the binary.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        // `b` not existing yet is the normal first-install path.
+        _ => false,
+    }
 }
 
 /// On Windows, download the latest rmux release binary from GitHub when it
@@ -637,6 +655,54 @@ pub fn install_cli(agents: &[Agent]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn installing_a_binary_over_itself_leaves_it_intact() {
+        // rmux is located via PATH, which can resolve to the very directory we
+        // install into. Removing dst first would then delete the source and
+        // leave a symlink pointing at itself (ELOOP) — the binary is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rmux");
+        std::fs::write(&bin, b"#!/bin/sh\ntrue\n").unwrap();
+
+        link_or_copy(&bin, &bin).unwrap();
+
+        assert!(bin.exists(), "the binary must survive");
+        assert!(!bin.is_symlink(), "must not become a link to itself");
+        assert_eq!(std::fs::read(&bin).unwrap(), b"#!/bin/sh\ntrue\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installing_through_a_symlink_to_itself_is_also_a_no_op() {
+        // The same hazard one level of indirection away: PATH found a symlink
+        // that already points at the destination.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("rmux-0.8.0");
+        let link = dir.path().join("rmux");
+        std::fs::write(&real, b"binary").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        link_or_copy(&link, &real).unwrap();
+
+        assert!(real.exists(), "the real binary must survive");
+        assert_eq!(std::fs::read(&real).unwrap(), b"binary");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_install_still_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src-bin");
+        let dst = dir.path().join("bin");
+        std::fs::write(&src, b"binary").unwrap();
+
+        link_or_copy(&src, &dst).unwrap();
+
+        assert!(dst.is_symlink());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"binary");
+    }
 
     fn agents() -> Vec<Agent> {
         vec![
