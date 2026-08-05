@@ -6,7 +6,7 @@ use std::process::Command;
 /// Detects each one; installs whatever is missing via the canonical package
 /// manager for this platform, preferring `bun` over `npm` when both exist.
 pub fn install_agents(agents: &[crate::config::Agent]) -> Result<()> {
-    let pkg_mgr = detect_package_manager();
+    let pkg_mgr = ensure_package_manager()?;
 
     let mut missing = Vec::new();
     // The configured agents are the ones amux knows how to launch — we ensure
@@ -87,15 +87,51 @@ enum PkgMgr {
     Brew,
 }
 
-/// Pick the package manager: bun > brew > npm, preferring the faster tool
-/// when available and the system one otherwise.
-fn detect_package_manager() -> PkgMgr {
+/// Pick the package manager: bun > brew > npm. If nothing is available at
+/// all, try to bootstrap bun via its zero-dependency install script
+/// (`curl -fsSL https://bun.sh/install | bash`) and retry.
+fn ensure_package_manager() -> Result<PkgMgr> {
     if which("bun").is_some() {
-        PkgMgr::Bun
-    } else if cfg!(target_os = "macos") && which("brew").is_some() {
-        PkgMgr::Brew
+        return Ok(PkgMgr::Bun);
+    }
+    if cfg!(target_os = "macos") && which("brew").is_some() {
+        return Ok(PkgMgr::Brew);
+    }
+    if which("npm").is_some() {
+        return Ok(PkgMgr::Npm);
+    }
+
+    println!("No package manager found — installing bun (one binary, zero deps)…");
+
+    // Bun's installer writes to ~/.bun and adds it to the current shell's rc
+    // file. We can't re-source the rc from here, but we know where the binary
+    // lands and can run it directly.
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg("curl -fsSL https://bun.sh/install | bash")
+        .status()
+        .context("running bun installer")?;
+
+    if !status.success() {
+        bail!("bun install failed. Install a package manager manually (brew, bun, npm) and try again.");
+    }
+
+    // The installer puts bun at ~/.bun/bin/bun.
+    let bun_path = dirs::home_dir()
+        .map(|h| h.join(".bun/bin/bun"))
+        .filter(|p| p.is_file());
+
+    // On Windows the path differs, but bun on Windows is experimental; the
+    // user would have npm via Node.js installer anyway. Keep trying.
+    if bun_path.is_some() {
+        return Ok(PkgMgr::Bun);
+    }
+
+    // Give it one more try — the shell may have refreshed.
+    if which("bun").is_some() {
+        Ok(PkgMgr::Bun)
     } else {
-        PkgMgr::Npm
+        bail!("bun binary not found after install — add ~/.bun/bin to your PATH and re-run")
     }
 }
 
