@@ -8,7 +8,7 @@ REPO="xiaoxiunique/amux"
 BIN_DIR="$HOME/.local/bin"
 
 # China network: set AMUX_GITHUB_PROXY to a mirror, e.g.
-#   export AMUX_GITHUB_PROXY=https://gh.api.99988866.xyz
+#   export AMUX_GITHUB_PROXY=https://ghproxy.com
 # install.sh will prefix every GitHub URL it hits with it.
 GITHUB="${AMUX_GITHUB_PROXY:+$AMUX_GITHUB_PROXY/}"
 

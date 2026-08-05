@@ -2,7 +2,7 @@
 # irm https://amux.cc/install.ps1 | iex
 #
 # China network: set $env:AMUX_GITHUB_PROXY before running, e.g.
-#   $env:AMUX_GITHUB_PROXY = "https://gh.api.99988866.xyz"
+#   $env:AMUX_GITHUB_PROXY = "https://ghproxy.com"
 # And all GitHub URLs in this script will be prefixed with it.
 
 param(

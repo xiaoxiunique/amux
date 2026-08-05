@@ -7,9 +7,9 @@ use std::process::Command;
 /// the very install step that would be needed to fetch it.
 const CN_REGISTRY: &str = "https://registry.npmmirror.com";
 
-/// Mirror prefix for GitHub downloads, e.g. `https://gh.api.99988866.xyz/`.
-/// Used by `--china` as a best-effort default.
-const CN_GITHUB_PROXY: &str = "https://gh.api.99988866.xyz";
+/// Default GitHub mirror for `--china`. ghproxy.com is the most widely used
+/// and has been stable for years.
+const CN_GITHUB_PROXY: &str = "https://ghproxy.com";
 
 /// Ensure the machine has Claude Code, Codex CLI, and rmux available.
 ///
