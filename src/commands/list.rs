@@ -27,12 +27,18 @@ pub fn list_sessions(limit: Option<usize>) -> Result<()> {
         }
         println!("{label} (最近 {}):", sessions.len());
         for s in &sessions {
+            // id + when + size on one line, the prompt indented under it —
+            // descriptions are long and variable, so a column layout would
+            // either truncate them harshly or push the metadata off-screen.
             println!(
                 "  {}  {:>8}  {}",
                 short_id(&s.id),
                 human_size(s.size),
                 relative_time(s.modified),
             );
+            if let Some(summary) = &s.summary {
+                println!("    {}", truncate(summary, 72));
+            }
         }
     }
     Ok(())
@@ -42,6 +48,16 @@ pub fn list_sessions(limit: Option<usize>) -> Result<()> {
 /// resume UIs display.
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
+}
+
+/// Cut to `max` characters, counting by char so multi-byte text (these
+/// prompts are often Chinese) isn't split mid-character.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 fn human_size(bytes: u64) -> String {
@@ -103,6 +119,16 @@ mod tests {
     fn shortens_ids() {
         assert_eq!(short_id("7ec5d280-1234-5678"), "7ec5d280");
         assert_eq!(short_id("abc"), "abc");
+    }
+
+    #[test]
+    fn truncates_on_char_boundaries() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("hello world", 8), "hello w…");
+        // Multi-byte input must not panic or split a character.
+        let cn = "改一下小红书板块的导出功能";
+        assert_eq!(truncate(cn, 5), "改一下小…");
+        assert_eq!(truncate(cn, 100), cn);
     }
 
     #[allow(dead_code)]

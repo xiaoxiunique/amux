@@ -209,6 +209,82 @@ pub struct PastSession {
     pub modified: f64,
     /// Bytes on disk — a rough proxy for how much work is in it.
     pub size: u64,
+    /// The opening user prompt, which is what the agents' own resume pickers
+    /// show. `None` when the transcript has no readable user turn.
+    pub summary: Option<String>,
+}
+
+/// First real user prompt in a session file — what it was actually about.
+///
+/// Both agents' resume UIs key off this rather than any stored title, because
+/// neither format records one. Only the head of the file is read: the opening
+/// turn is near the top, and these transcripts run to tens of megabytes.
+fn first_user_prompt(path: &Path, agent: &str) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+
+    /// Enough lines to clear the session header and any injected preamble
+    /// without reading a 90MB transcript.
+    const MAX_LINES: usize = 400;
+
+    let file = std::fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(MAX_LINES).map_while(Result::ok) {
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let text = match agent {
+            // {"type":"event_msg","payload":{"type":"user_message","message":"…"}}
+            "codex" => v
+                .get("payload")
+                .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("user_message"))
+                .and_then(|p| p.get("message"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string),
+            // {"type":"user","message":{"content": "…" | [{"type":"text","text":"…"}]}}
+            "claude" => v
+                .get("type")
+                .filter(|t| t.as_str() == Some("user"))
+                .and(v.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| match c {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Array(items) => {
+                        let joined: String = items
+                            .iter()
+                            .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        (!joined.is_empty()).then_some(joined)
+                    }
+                    _ => None,
+                }),
+            _ => None,
+        };
+
+        let Some(text) = text else { continue };
+        let cleaned = clean_prompt(&text);
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
+    None
+}
+
+/// Collapse whitespace and drop turns that aren't the user talking: tool
+/// results, and the harness-injected blocks (`<local-command-caveat>`,
+/// `<system-reminder>`, …) that would otherwise be mistaken for the prompt.
+fn clean_prompt(raw: &str) -> String {
+    let text = raw.trim();
+    if text.starts_with('<') || text.contains("tool_result") {
+        return String::new();
+    }
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // A handful of characters is a stray fragment, not a description.
+    if collapsed.chars().count() < 4 {
+        return String::new();
+    }
+    collapsed
 }
 
 /// The most recent `limit` sessions an agent recorded for `cwd`, newest first.
@@ -231,6 +307,7 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
         let size = path.metadata().map(|m| m.len()).unwrap_or(0);
         PastSession {
             modified: mtime_epoch(&path),
+            summary: first_user_prompt(&path, agent_name),
             id,
             path,
             size,
@@ -284,6 +361,19 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn cleans_prompts_and_rejects_injected_blocks() {
+        assert_eq!(clean_prompt("  hello   world \n"), "hello world");
+        // Harness-injected turns are not the user's prompt.
+        assert_eq!(clean_prompt("<local-command-caveat>Caveat: …"), "");
+        assert_eq!(clean_prompt("<system-reminder>x</system-reminder>"), "");
+        assert_eq!(clean_prompt("[{\"tool_result\": 1}]"), "");
+        // Stray fragments aren't descriptions.
+        assert_eq!(clean_prompt("ok"), "");
+        // Multi-byte text survives intact.
+        assert_eq!(clean_prompt(" 改一下导出功能 "), "改一下导出功能");
+    }
     use super::*;
     use std::io::Write;
 
