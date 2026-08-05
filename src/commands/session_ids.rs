@@ -45,7 +45,18 @@ pub fn store_id(session_name: &str, id: &str) {
 /// Args that make the agent resume a specific session id.
 pub fn resume_args(agent_name: &str, id: &str) -> Vec<String> {
     match agent_name {
-        "codex" => vec!["resume".into(), id.to_string()],
+        "codex" => {
+            // The provider a session was recorded under may no longer exist in
+            // config.toml — cc-switch replaces `model_providers` wholesale on
+            // every switch. Codex then refuses to open the session at all, so
+            // re-supply the name on the command line when it's missing.
+            let mut args = codex_session_provider(id)
+                .map(|p| codex_provider_patch(&p))
+                .unwrap_or_default();
+            args.push("resume".into());
+            args.push(id.to_string());
+            args
+        }
         "claude" => vec!["--resume".into(), id.to_string()],
         _ => Vec::new(),
     }
@@ -134,6 +145,79 @@ fn codex_meta(path: &Path) -> Option<(String, String)> {
     Some((cwd, id))
 }
 
+/// The `model_provider` a codex rollout was recorded under, if any.
+///
+/// Codex refuses to resume a session whose provider is missing from
+/// config.toml, and cc-switch rewrites `model_providers` wholesale on every
+/// switch — so a session recorded under a since-replaced provider becomes
+/// unopenable. Reading the name back lets us re-supply it at launch.
+pub fn codex_session_provider(id: &str) -> Option<String> {
+    let root = agent_session_root("codex")?;
+    let path = codex_rollout_with_id(&root, id)?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(text.lines().next()?).ok()?;
+    let name = v.get("payload")?.get("model_provider")?.as_str()?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Providers codex ships itself. Overriding one is rejected outright ("reserved
+/// built-in provider IDs"), so these must never be re-supplied.
+fn is_builtin_provider(name: &str) -> bool {
+    matches!(name, "openai" | "oss" | "azure")
+}
+
+/// `-c model_providers.<name>={...}` arguments that define `provider` as an
+/// alias of the local proxy, or nothing when the provider needs no help.
+///
+/// Returns empty when the provider is already configured, is a codex built-in,
+/// or the config can't be read — in each case codex resolves it on its own and
+/// an override would be at best redundant, at worst rejected.
+pub fn codex_provider_patch(provider: &str) -> Vec<String> {
+    if provider.is_empty() || is_builtin_provider(provider) {
+        return Vec::new();
+    }
+    if codex_config_has_provider(provider) {
+        return Vec::new();
+    }
+    let Some(base_url) = codex_proxy_base_url() else {
+        return Vec::new();
+    };
+    vec![
+        "-c".to_string(),
+        format!(
+            "model_providers.{provider}={{name=\"{provider}\",\
+             base_url=\"{base_url}\",wire_api=\"responses\",\
+             requires_openai_auth=true,experimental_bearer_token=\"PROXY_MANAGED\"}}"
+        ),
+    ]
+}
+
+/// True when config.toml already declares `[model_providers.<name>]`.
+fn codex_config_has_provider(name: &str) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(home.join(".codex").join("config.toml")) else {
+        return false;
+    };
+    let header = format!("[model_providers.{name}]");
+    text.lines().any(|l| l.trim() == header)
+}
+
+/// Base URL of whatever provider config.toml currently points at — the local
+/// cc-switch proxy in practice. Reused for the alias so a resumed session
+/// talks to the same endpoint a fresh one would.
+fn codex_proxy_base_url() -> Option<String> {
+    let home = dirs::home_dir()?;
+    let text = std::fs::read_to_string(home.join(".codex").join("config.toml")).ok()?;
+    text.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("base_url"))
+        .and_then(|l| l.split('=').nth(1))
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Newest codex rollout file whose recorded cwd matches. Scans recent files only.
 fn newest_codex_rollout_path(root: &Path, cwd: &Path) -> Option<PathBuf> {
     let target = cwd.to_string_lossy();
@@ -149,8 +233,7 @@ fn newest_codex_rollout_for(root: &Path, cwd: &Path) -> Option<String> {
     codex_meta(&p).map(|(_, id)| id)
 }
 
-fn codex_rollout_with_id(root: &Path, id: &str) -> Option<PathBuf> {
-    let needle = format!("-{id}.jsonl");
+fn codex_rollout_with_id(root: &Path, id: &str) -> Option<PathBuf> {    let needle = format!("-{id}.jsonl");
     jsonl_files_by_mtime(root)
         .into_iter()
         .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(&needle)))
@@ -518,6 +601,41 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn builtin_providers_are_never_overridden() {
+        // Codex rejects these outright: "reserved built-in provider IDs".
+        assert!(super::codex_provider_patch("openai").is_empty());
+        assert!(super::codex_provider_patch("oss").is_empty());
+        assert!(super::codex_provider_patch("").is_empty());
+    }
+
+    #[test]
+    fn provider_patch_precedes_the_resume_subcommand() {
+        // `-c` is a global flag; codex rejects it after the subcommand. Any
+        // patch resume_args produces must come first, and `resume <id>` must
+        // remain the final pair.
+        let args = super::resume_args("codex", "019f9207-b3ec-7b82-8494-e123bdb77987");
+        let resume_at = args
+            .iter()
+            .position(|a| a == "resume")
+            .expect("resume subcommand must be present");
+        assert_eq!(args.len(), resume_at + 2, "id must follow resume");
+        // Everything before it is a well-formed -c pair.
+        assert_eq!(resume_at % 2, 0, "leading args must pair up");
+        for i in (0..resume_at).step_by(2) {
+            assert_eq!(args[i], "-c", "only -c pairs may precede resume");
+        }
+    }
+
+    #[test]
+    fn claude_resume_is_unaffected() {
+        assert_eq!(
+            super::resume_args("claude", "abc"),
+            vec!["--resume".to_string(), "abc".to_string()]
+        );
+        assert!(super::resume_args("vim", "abc").is_empty());
+    }
 
     #[test]
     fn distinguishes_session_ids_from_project_names() {
