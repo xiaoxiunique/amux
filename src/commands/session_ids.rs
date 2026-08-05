@@ -209,16 +209,56 @@ pub struct PastSession {
     pub modified: f64,
     /// Bytes on disk — a rough proxy for how much work is in it.
     pub size: u64,
-    /// The opening user prompt, which is what the agents' own resume pickers
-    /// show. `None` when the transcript has no readable user turn.
+    /// Short description: Claude's own generated title, or the opening user
+    /// prompt for Codex, which records none. `None` when neither is readable.
     pub summary: Option<String>,
+}
+
+/// A short description of what a session was about.
+///
+/// Claude Code maintains its own generated title (`ai-title` records, rewritten
+/// as the conversation evolves) and that is what its resume picker shows, so we
+/// use the last one. Codex records no title at all, so its opening user prompt
+/// stands in — the same thing its own picker falls back to.
+fn session_summary(path: &Path, agent: &str) -> Option<String> {
+    match agent {
+        "claude" => last_ai_title(path).or_else(|| first_user_prompt(path, agent)),
+        _ => first_user_prompt(path, agent),
+    }
+}
+
+/// The most recent `ai-title` in a Claude transcript.
+///
+/// Titles are appended throughout the session and refined as it goes, so the
+/// last one is the one Claude Code itself displays. This has to scan the whole
+/// file, which is why only the title line is parsed — a substring test first
+/// keeps the 90MB transcripts cheap.
+fn last_ai_title(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut title = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("\"ai-title\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(t) = v.get("aiTitle").and_then(|t| t.as_str()) {
+                let cleaned = clean_prompt(t);
+                if !cleaned.is_empty() {
+                    title = Some(cleaned);
+                }
+            }
+        }
+    }
+    title
 }
 
 /// First real user prompt in a session file — what it was actually about.
 ///
-/// Both agents' resume UIs key off this rather than any stored title, because
-/// neither format records one. Only the head of the file is read: the opening
-/// turn is near the top, and these transcripts run to tens of megabytes.
+/// Used for Codex, which stores no title of its own. Only the head of the file
+/// is read: the opening turn is near the top, and these transcripts run to tens
+/// of megabytes.
 fn first_user_prompt(path: &Path, agent: &str) -> Option<String> {
     use std::io::{BufRead, BufReader};
 
@@ -307,7 +347,7 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
         let size = path.metadata().map(|m| m.len()).unwrap_or(0);
         PastSession {
             modified: mtime_epoch(&path),
-            summary: first_user_prompt(&path, agent_name),
+            summary: session_summary(&path, agent_name),
             id,
             path,
             size,
@@ -361,6 +401,35 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn prefers_the_last_ai_title_for_claude() {
+        // Claude appends ai-title records and refines them as the session
+        // goes; its resume picker shows the final one, so we must too.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        std::fs::write(
+            &f,
+            concat!(
+                r#"{"type":"user","message":{"content":"first prompt here"}}"#, "\n",
+                r#"{"type":"ai-title","aiTitle":"early guess"}"#, "\n",
+                r#"{"type":"ai-title","aiTitle":"hono-to-python-backend-migration"}"#, "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            session_summary(&f, "claude").as_deref(),
+            Some("hono-to-python-backend-migration")
+        );
+        // Codex has no titles, so it falls back to the opening prompt.
+        let g = dir.path().join("c.jsonl");
+        std::fs::write(
+            &g,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"改一下导出功能"}}"#,
+        )
+        .unwrap();
+        assert_eq!(session_summary(&g, "codex").as_deref(), Some("改一下导出功能"));
+    }
 
     #[test]
     fn cleans_prompts_and_rejects_injected_blocks() {
