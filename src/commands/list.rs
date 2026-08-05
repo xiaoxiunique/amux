@@ -1,4 +1,4 @@
-use crate::commands::session_ids::{self, recent_sessions, PastSession};
+use crate::commands::session_ids::{self, recent_sessions};
 use anyhow::{Context, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -182,10 +182,5 @@ mod tests {
         let cn = "改一下小红书板块的导出功能";
         assert_eq!(truncate(cn, 5), "改一下小…");
         assert_eq!(truncate(cn, 100), cn);
-    }
-
-    #[allow(dead_code)]
-    fn _assert_past_session_shape(s: &PastSession) {
-        let _ = (&s.id, &s.path, s.modified, s.size);
     }
 }

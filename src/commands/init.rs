@@ -458,7 +458,7 @@ fn download_rmux_windows(dest: &Path) -> Result<()> {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
-        a => bail!("unsupported architecture: {a} (no rmux binary for it)"),
+        a => anyhow::bail!("unsupported architecture: {a} (no rmux binary for it)"),
     };
     let name = format!("rmux-{version}-windows-{arch}");
     let url = format!(
@@ -499,7 +499,7 @@ fn download_rmux_windows(dest: &Path) -> Result<()> {
         .status()
         .context("running Expand-Archive (is PowerShell available?)")?;
     if !status.success() {
-        bail!("Expand-Archive failed (corrupt download or disk full?)");
+        anyhow::bail!("Expand-Archive failed (corrupt download or disk full?)");
     }
 
     // The zip typically contains `rmux-{version}-windows-{arch}/rmux.exe`.
