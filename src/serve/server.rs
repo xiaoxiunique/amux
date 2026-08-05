@@ -476,6 +476,8 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         .route("/api/files/list", get(api_files_list))
         .route("/api/files/read", get(api_files_read))
         .route("/api/files/download", get(api_files_download))
+        .route("/api/sessions", get(api_sessions))
+        .route("/api/sessions/resume", post(api_sessions_resume))
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
         .route("/api/cron/jobs/running", get(api_cron_running))
@@ -620,6 +622,20 @@ fn sanitized_command(program: &str) -> Command {
         .env_remove("TMUX_CONF")
         .env_remove("TMUX_CONF_LOCAL")
         .env_remove("TMUX_SOCKET");
+    // When serve is started from inside a Claude Code session it inherits that
+    // session's markers. An agent launched further down this chain then sees
+    // itself as a *child* session and turns transcript saving off — so the
+    // conversation is never recorded, and resuming it later finds nothing.
+    // These identify one specific running session and must not be handed down.
+    for key in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_PID",
+    ] {
+        command.env_remove(key);
+    }
     command
 }
 
@@ -1005,6 +1021,41 @@ fn agent_launch_command(agent: &str) -> Result<String, String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_command.to_string()))
+}
+
+/// Same as [`agent_launch_command`], for sibling modules in `serve`.
+pub(crate) fn agent_launch_command_for(agent: &str) -> Result<String, String> {
+    agent_launch_command(agent)
+}
+
+/// True when the multiplexer already has a session by this name.
+pub(crate) fn mux_has_session(name: &str) -> bool {
+    tmux_command()
+        .args(["has-session", "-t", name])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Create a detached session running `command` in `cwd`.
+///
+/// Goes through `tmux_command()` so the child doesn't inherit this server's own
+/// `TMUX`/`TMUX_PANE` and end up nested.
+pub(crate) fn mux_new_session(name: &str, cwd: &str, command: &str) -> Result<(), String> {
+    let output = tmux_command()
+        .args(["new-session", "-d", "-s", name, "-c", cwd, command])
+        .output()
+        .map_err(|error| format!("failed to launch {command}: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(if stderr.is_empty() {
+        format!("multiplexer exited with {}", output.status)
+    } else {
+        stderr
+    })
 }
 
 fn is_codex_pane(pane: &BasePane, tail: &str) -> bool {
@@ -2738,6 +2789,83 @@ fn files_error(error: String) -> Response<Body> {
         StatusCode::BAD_REQUEST
     };
     json_response(code, json!({ "ok": false, "error": error }))
+}
+
+/// `GET /api/sessions?path=<dir>&limit=<n>` — past conversations for a project,
+/// per agent, newest first.
+async fn api_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let Some(path) = query.get("path").filter(|v| !v.is_empty()).cloned() else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "ok": false, "error": "path is required" }),
+        );
+    };
+    let limit = query.get("limit").and_then(|v| v.parse::<usize>().ok());
+
+    // Reads and parses transcript files (Claude's can reach tens of MB), so
+    // this must not run on the async runtime's thread.
+    match tokio::task::spawn_blocking(move || crate::serve::sessions::list(&path, limit)).await {
+        Ok(Ok(agents)) => json_response(StatusCode::OK, json!({ "ok": true, "agents": agents })),
+        Ok(Err(error)) => json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "ok": false, "agents": [], "error": error }),
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "ok": false, "agents": [], "error": error.to_string() }),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResumeSessionRequest {
+    path: String,
+    agent: String,
+    session_id: String,
+    suffix: String,
+}
+
+/// `POST /api/sessions/resume` — reopen a past conversation in its own
+/// multiplexer session, leaving the project's primary session running.
+async fn api_sessions_resume(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<ResumeSessionRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::serve::sessions::resume(&body.path, &body.agent, &body.session_id, &body.suffix)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(session)) => {
+            // Let websocket clients pick up the new pane without waiting for
+            // the next poll.
+            schedule_snapshot_refresh_soon(&state);
+            json_response(StatusCode::OK, json!({ "ok": true, "session": session }))
+        }
+        Ok(Err(error)) => json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "ok": false, "error": error }),
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({ "ok": false, "error": error.to_string() }),
+        ),
+    }
 }
 
 async fn api_files_roots(

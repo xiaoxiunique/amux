@@ -202,8 +202,13 @@ pub fn current_id(agent_name: &str, cwd: &Path) -> Option<String> {
 }
 
 /// One past conversation for a directory, newest first.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PastSession {
     pub id: String,
+    /// Local path to the transcript. Skipped when serialized — remote clients
+    /// have no use for a host-side path, and it leaks the home directory.
+    #[serde(skip)]
     pub path: PathBuf,
     /// Seconds since the epoch of the file's last write.
     pub modified: f64,
