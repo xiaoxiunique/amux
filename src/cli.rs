@@ -37,6 +37,12 @@ pub enum Command {
     /// List amux-managed sessions.
     #[command(alias = "list")]
     Ls,
+    /// List recent Claude Code and Codex conversations for this directory.
+    Sessions {
+        /// How many per agent (default 5).
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
+    },
     /// Kill a session by name.
     Kill { name: String },
     /// Show resolved config and its path.

@@ -123,6 +123,7 @@ fn main() -> Result<()> {
         Some(Command::Stop) => serve::stop(),
         Some(Command::InstallCli) => commands::init::install_cli(&agents),
         Some(Command::Install { china }) => commands::install::install_agents(&agents, china),
+        Some(Command::Sessions { limit }) => commands::list::list_sessions(limit),
         Some(Command::Save { file }) => {
             commands::sessions::save(file.as_deref(), &agents)
         }

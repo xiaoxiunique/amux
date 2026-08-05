@@ -201,6 +201,87 @@ pub fn current_id(agent_name: &str, cwd: &Path) -> Option<String> {
     }
 }
 
+/// One past conversation for a directory, newest first.
+pub struct PastSession {
+    pub id: String,
+    pub path: PathBuf,
+    /// Seconds since the epoch of the file's last write.
+    pub modified: f64,
+    /// Bytes on disk — a rough proxy for how much work is in it.
+    pub size: u64,
+}
+
+/// The most recent `limit` sessions an agent recorded for `cwd`, newest first.
+///
+/// Codex stores every rollout in one flat tree and records the cwd inside the
+/// file, so its scan is bounded (`SCAN_LIMIT`) to avoid parsing thousands of
+/// unrelated rollouts. Claude keys sessions by an escaped project directory,
+/// so its lookup is a plain directory read.
+pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSession> {
+    /// How many of the newest codex rollouts to inspect. Each one costs a
+    /// file read (only the first line is parsed), and rollouts for other
+    /// projects are interleaved, so this trades completeness for speed.
+    const SCAN_LIMIT: usize = 400;
+
+    let Some(root) = agent_session_root(agent_name) else {
+        return Vec::new();
+    };
+
+    let describe = |path: PathBuf, id: String| {
+        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        PastSession {
+            modified: mtime_epoch(&path),
+            id,
+            path,
+            size,
+        }
+    };
+
+    match agent_name {
+        "codex" => {
+            let target = cwd.to_string_lossy();
+            jsonl_files_by_mtime(&root)
+                .into_iter()
+                .take(SCAN_LIMIT)
+                .filter_map(|f| {
+                    codex_meta(&f)
+                        .filter(|(rcwd, _)| *rcwd == target)
+                        .map(|(_, id)| describe(f, id))
+                })
+                .take(limit)
+                .collect()
+        }
+        "claude" => {
+            let dir = claude_project_dir(&root, cwd);
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+                .collect();
+            files.sort_by(|a, b| {
+                mtime_epoch(b)
+                    .partial_cmp(&mtime_epoch(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            files
+                .into_iter()
+                .take(limit)
+                .map(|p| {
+                    // Claude names the file after the session id.
+                    let id = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    describe(p, id)
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
