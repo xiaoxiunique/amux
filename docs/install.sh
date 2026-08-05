@@ -7,6 +7,11 @@ set -eu
 REPO="xiaoxiunique/amux"
 BIN_DIR="$HOME/.local/bin"
 
+# China network: set AMUX_GITHUB_PROXY to a mirror, e.g.
+#   export AMUX_GITHUB_PROXY=https://gh.api.99988866.xyz
+# install.sh will prefix every GitHub URL it hits with it.
+GITHUB="${AMUX_GITHUB_PROXY:+$AMUX_GITHUB_PROXY/}"
+
 # --- detect platform ---
 OS=$(uname -s)
 ARCH=$(uname -m)
@@ -36,11 +41,11 @@ esac
 
 # --- latest release ---
 echo "==> fetching latest release…"
-LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+LATEST=$(curl -fsSL "${GITHUB}https://api.github.com/repos/$REPO/releases/latest" \
   | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 VERSION="${LATEST#v}"
 ASSET="amux-v${VERSION}-${TARGET}.${EXT}"
-URL="https://github.com/$REPO/releases/download/$LATEST/$ASSET"
+URL="${GITHUB}https://github.com/$REPO/releases/download/$LATEST/$ASSET"
 
 echo "==> downloading amux ${VERSION} (${TARGET})…"
 TMP=$(mktemp -d)

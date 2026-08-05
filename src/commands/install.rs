@@ -1,12 +1,38 @@
 use anyhow::{bail, Context, Result};
 use std::process::Command;
 
+/// Common Chinese npm registry, used by `--china`. Hardcoded rather than
+/// fetched from a dynamic config because this mirror has been stable for
+/// years and the alternative (a dead `amux.cc/mirrors.json` lookup) gates
+/// the very install step that would be needed to fetch it.
+const CN_REGISTRY: &str = "https://registry.npmmirror.com";
+
+/// Mirror prefix for GitHub downloads, e.g. `https://gh.api.99988866.xyz/`.
+/// Used by `--china` as a best-effort default.
+const CN_GITHUB_PROXY: &str = "https://gh.api.99988866.xyz";
+
 /// Ensure the machine has Claude Code, Codex CLI, and rmux available.
 ///
 /// Detects each one; installs whatever is missing via the canonical package
 /// manager for this platform, preferring `bun` over `npm` when both exist.
-pub fn install_agents(agents: &[crate::config::Agent]) -> Result<()> {
-    let pkg_mgr = ensure_package_manager()?;
+pub fn install_agents(agents: &[crate::config::Agent], china: bool) -> Result<()> {
+    // Registry override, either from --china or an explicit env var.
+    // The env var takes precedence so a user can use a private mirror
+    // without typing it every time.
+    let registry: Option<String> = std::env::var("AMUX_REGISTRY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| china.then(|| CN_REGISTRY.to_string()));
+    let _github_proxy: Option<String> = std::env::var("AMUX_GITHUB_PROXY")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| china.then(|| CN_GITHUB_PROXY.to_string()));
+
+    if let Some(ref r) = registry {
+        println!("using registry: {r}");
+    }
+
+    let pkg_mgr = ensure_package_manager(china)?;
 
     let mut missing = Vec::new();
     // The configured agents are the ones amux knows how to launch — we ensure
@@ -41,12 +67,22 @@ pub fn install_agents(agents: &[crate::config::Agent]) -> Result<()> {
         };
 
         let result = match pkg_mgr {
-            PkgMgr::Bun => Command::new("bun")
-                .args(["install", "-g", npm_pkg])
-                .status(),
-            PkgMgr::Npm => Command::new("npm")
-                .args(["install", "-g", npm_pkg])
-                .status(),
+            PkgMgr::Bun => {
+                let mut cmd = Command::new("bun");
+                cmd.arg("install").arg("-g");
+                if let Some(ref r) = registry {
+                    cmd.arg("--registry").arg(r);
+                }
+                cmd.arg(npm_pkg).status()
+            }
+            PkgMgr::Npm => {
+                let mut cmd = Command::new("npm");
+                cmd.arg("install").arg("-g");
+                if let Some(ref r) = registry {
+                    cmd.arg("--registry").arg(r);
+                }
+                cmd.arg(npm_pkg).status()
+            }
             PkgMgr::Brew => {
                 let f = brew_formula.unwrap_or(npm_pkg);
                 Command::new("brew").args(["install", f]).status()
@@ -90,7 +126,7 @@ enum PkgMgr {
 /// Pick the package manager: bun > brew > npm. If nothing is available at
 /// all, try to bootstrap bun via its zero-dependency install script
 /// (`curl -fsSL https://bun.sh/install | bash`) and retry.
-fn ensure_package_manager() -> Result<PkgMgr> {
+fn ensure_package_manager(china: bool) -> Result<PkgMgr> {
     if which("bun").is_some() {
         return Ok(PkgMgr::Bun);
     }
@@ -106,11 +142,18 @@ fn ensure_package_manager() -> Result<PkgMgr> {
     // Bun's installer writes to ~/.bun and adds it to the current shell's rc
     // file. We can't re-source the rc from here, but we know where the binary
     // lands and can run it directly.
-    let status = Command::new("bash")
-        .arg("-c")
-        .arg("curl -fsSL https://bun.sh/install | bash")
-        .status()
-        .context("running bun installer")?;
+    // With --china, set BUN_INSTALL so the install script uses the npm mirror
+    // for the binary download rather than hitting GitHub Releases directly.
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c");
+    if china {
+        cmd.env(
+            "BUN_INSTALL",
+            format!("https://bun.sh/install?registry={CN_REGISTRY}"),
+        );
+    }
+    cmd.arg("curl -fsSL https://bun.sh/install | bash");
+    let status = cmd.status().context("running bun installer")?;
 
     if !status.success() {
         bail!("bun install failed. Install a package manager manually (brew, bun, npm) and try again.");

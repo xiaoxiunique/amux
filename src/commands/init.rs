@@ -462,7 +462,12 @@ fn download_rmux_windows(dest: &Path) -> Result<()> {
     };
     let name = format!("rmux-{version}-windows-{arch}");
     let url = format!(
-        "https://github.com/helvesec/rmux/releases/download/v{version}/{name}.zip"
+        "{github}https://github.com/helvesec/rmux/releases/download/v{version}/{name}.zip",
+        github = std::env::var("AMUX_GITHUB_PROXY")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .map(|p| format!("{p}/"))
+            .unwrap_or_default(),
     );
     let tmp = tempfile::tempdir().context("creating temp dir for rmux download")?;
     let zip = tmp.path().join(format!("{name}.zip"));

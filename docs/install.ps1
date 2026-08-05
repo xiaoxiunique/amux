@@ -1,5 +1,9 @@
 # amux one-command installer (Windows)
 # irm https://amux.cc/install.ps1 | iex
+#
+# China network: set $env:AMUX_GITHUB_PROXY before running, e.g.
+#   $env:AMUX_GITHUB_PROXY = "https://gh.api.99988866.xyz"
+# And all GitHub URLs in this script will be prefixed with it.
 
 param(
   [switch]$NoInit
@@ -11,6 +15,9 @@ $ProgressPreference = "SilentlyContinue"
 $Repo = "xiaoxiunique/amux"
 $BinDir = "$env:LOCALAPPDATA\amux\bin"
 
+# China network: prefix every GitHub URL with this proxy.
+$Gh = if ($env:AMUX_GITHUB_PROXY) { "$env:AMUX_GITHUB_PROXY/" } else { "" }
+
 # --- detect architecture ---
 $Arch = switch ($env:PROCESSOR_ARCHITECTURE) {
   "AMD64" { "x86_64" }
@@ -21,10 +28,10 @@ $Target = "x86_64-pc-windows-msvc"
 # TODO: add aarch64 windows binary when GitHub CI builds it
 
 Write-Host "==> fetching latest release…"
-$Release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
+$Release = Invoke-RestMethod "${Gh}https://api.github.com/repos/$Repo/releases/latest"
 $Version = $Release.tag_name -replace '^v',''
 $Asset = "amux-v${Version}-${Target}.zip"
-$Url = "https://github.com/$Repo/releases/download/$($Release.tag_name)/$Asset"
+$Url = "${Gh}https://github.com/$Repo/releases/download/$($Release.tag_name)/$Asset"
 
 Write-Host "==> downloading amux $Version ($Target)…"
 $Tmp = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "amux-install-$(Get-Random)") -Force

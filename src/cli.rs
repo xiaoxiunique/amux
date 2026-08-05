@@ -29,7 +29,11 @@ pub enum Command {
     InstallCli,
     /// Ensure Claude Code and Codex CLI are on the machine, installing any
     /// that are missing via npm / bun / brew.
-    Install,
+    Install {
+        /// Use Chinese mirrors for package registries and GitHub downloads.
+        #[arg(long)]
+        china: bool,
+    },
     /// List amux-managed sessions.
     #[command(alias = "list")]
     Ls,
