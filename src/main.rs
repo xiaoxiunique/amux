@@ -132,7 +132,14 @@ fn main() -> Result<()> {
         }
         Some(Command::Goto(args)) => {
             let query = args.first().and_then(|s| s.to_str()).unwrap_or("");
-            commands::sessions::goto(query, &agents)
+            // `amux <session-id>` resumes that conversation wherever it lives;
+            // `amux <name>` stays the directory fuzzy-match. Ids are hex+dash,
+            // project names aren't, so the two can't collide.
+            if commands::session_ids::looks_like_session_id(query) {
+                commands::list::resume_by_id(query, &agents)
+            } else {
+                commands::sessions::goto(query, &agents)
+            }
         }
         None => tui::run_tui(&agents),
     }

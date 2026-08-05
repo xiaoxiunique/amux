@@ -1,4 +1,4 @@
-use crate::commands::session_ids::{recent_sessions, PastSession};
+use crate::commands::session_ids::{self, recent_sessions, PastSession};
 use anyhow::{Context, Result};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,6 +42,59 @@ pub fn list_sessions(limit: Option<usize>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Attach to a past conversation by id prefix, in whichever agent recorded it.
+///
+/// The session's own directory is used, not the caller's — `amux <id>` is meant
+/// to work from anywhere. Reuses the normal launch path so the rmux session is
+/// created and named exactly as `cc`/`cx` would.
+pub fn resume_by_id(prefix: &str, agents: &[crate::config::Agent]) -> Result<()> {
+    let found = session_ids::find_by_id_prefix(prefix);
+
+    let target = match found.as_slice() {
+        [] => anyhow::bail!("no session id starts with '{prefix}'"),
+        [only] => only,
+        many => {
+            // An ambiguous prefix is the user's to resolve — picking for them
+            // could drop them into the wrong project.
+            println!("'{prefix}' matches {} sessions:", many.len());
+            for s in many {
+                println!(
+                    "  {}  {:<7} {}",
+                    short_id(&s.id),
+                    s.agent,
+                    s.cwd.display()
+                );
+                if let Some(summary) = &s.summary {
+                    println!("    {}", truncate(summary, 68));
+                }
+            }
+            anyhow::bail!("prefix is ambiguous — use more characters");
+        }
+    };
+
+    let agent = crate::config::find(agents, target.agent)
+        .with_context(|| format!("agent '{}' is not configured", target.agent))?
+        .clone();
+
+    if !target.cwd.is_dir() {
+        anyhow::bail!(
+            "session's directory no longer exists: {}",
+            target.cwd.display()
+        );
+    }
+
+    println!(
+        "resuming {} in {}",
+        target.agent,
+        target.cwd.display()
+    );
+    if let Some(summary) = &target.summary {
+        println!("  {summary}");
+    }
+
+    crate::commands::run::run_in(&agent, &target.cwd, &target.id, agents)
 }
 
 /// First 8 chars — enough to identify a session, and what the agents' own

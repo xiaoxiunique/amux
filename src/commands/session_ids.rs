@@ -214,6 +214,118 @@ pub struct PastSession {
     pub summary: Option<String>,
 }
 
+/// A session located by id prefix, along with everything needed to resume it.
+pub struct FoundSession {
+    pub agent: &'static str,
+    pub id: String,
+    pub cwd: PathBuf,
+    pub summary: Option<String>,
+}
+
+/// True when `s` looks like a session id prefix rather than a directory name.
+///
+/// Both agents use hex-and-dash ids (UUID for Claude, ULID-ish for Codex),
+/// while project names contain letters outside `a-f` or are shorter, so this
+/// cleanly separates `amux 019fc770` from `amux mbox`.
+pub fn looks_like_session_id(s: &str) -> bool {
+    s.len() >= 6
+        && s.chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
+        && s.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Find a session by id prefix across every project, newest first.
+///
+/// Searches both agents so the caller doesn't have to know which one recorded
+/// it — that is the whole point of `amux <id>`.
+pub fn find_by_id_prefix(prefix: &str) -> Vec<FoundSession> {
+    /// Same bound as `recent_sessions`: parsing every rollout ever written to
+    /// answer one lookup would be slow, and ids resolve to recent work.
+    const SCAN_LIMIT: usize = 800;
+
+    let needle = prefix.to_lowercase();
+    let mut out = Vec::new();
+
+    // Claude: id is the filename, and the project dir encodes the cwd.
+    if let Some(root) = agent_session_root("claude") {
+        if let Ok(projects) = std::fs::read_dir(&root) {
+            for project in projects.flatten() {
+                let Ok(files) = std::fs::read_dir(project.path()) else {
+                    continue;
+                };
+                for f in files.flatten() {
+                    let p = f.path();
+                    if p.extension().is_none_or(|x| x != "jsonl") {
+                        continue;
+                    }
+                    let id = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if !id.to_lowercase().starts_with(&needle) {
+                        continue;
+                    }
+                    // The transcript records its own cwd; the escaped
+                    // directory name can't be reversed (both `/` and `_`
+                    // become `-`).
+                    if let Some(cwd) = claude_cwd(&p) {
+                        out.push(FoundSession {
+                            agent: "claude",
+                            summary: session_summary(&p, "claude"),
+                            id,
+                            cwd,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Codex: id is inside the file, and so is the cwd.
+    if let Some(root) = agent_session_root("codex") {
+        for p in jsonl_files_by_mtime(&root).into_iter().take(SCAN_LIMIT) {
+            // Cheap pre-filter: the id is also in the filename.
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+            if !name
+                .map(|n| n.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Some((cwd, id)) = codex_meta(&p) {
+                if id.to_lowercase().starts_with(&needle) {
+                    out.push(FoundSession {
+                        agent: "codex",
+                        summary: session_summary(&p, "codex"),
+                        id,
+                        cwd: PathBuf::from(cwd),
+                    });
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// The cwd a Claude transcript recorded for itself.
+fn claude_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(60).map_while(Result::ok) {
+        if !line.contains("\"cwd\"") {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                return Some(PathBuf::from(cwd));
+            }
+        }
+    }
+    None
+}
+
 /// A short description of what a session was about.
 ///
 /// Claude Code maintains its own generated title (`ai-title` records, rewritten
@@ -401,6 +513,23 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn distinguishes_session_ids_from_project_names() {
+        // Real ids from both agents.
+        assert!(looks_like_session_id("019fc770"));
+        assert!(looks_like_session_id("7ec5d280-a655-4577-83d5-7d0b93392cd1"));
+        assert!(looks_like_session_id("dab626ac"));
+        // Project names `amux <name>` must keep matching directories.
+        assert!(!looks_like_session_id("mbox"));
+        assert!(!looks_like_session_id("sitin"));
+        assert!(!looks_like_session_id("amux"));
+        assert!(!looks_like_session_id("agent-port"));
+        // `deadbeef` is all-hex but has no digit, so it reads as a name.
+        assert!(!looks_like_session_id("deadbeef"));
+        // Too short to be an id prefix worth resolving.
+        assert!(!looks_like_session_id("019f"));
+    }
 
     #[test]
     fn prefers_the_last_ai_title_for_claude() {
