@@ -41,9 +41,13 @@ pub fn render_mux_block() -> String {
          bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel \"{clipper}\"\n\
          bind -T copy-mode M-w send -X copy-pipe-and-cancel \"{clipper}\"\n\
          bind -T copy-mode MouseDragEnd1Pane send -X copy-pipe-and-cancel \"{clipper}\"\n\
-         # Size a session to its smallest attached client, so switching into a\n\
-         # session that a taller window owns doesn't clip its bottom rows.\n\
-         set -g window-size smallest\n\
+         # Size a session to whichever client last used it. `smallest` — the\n\
+         # obvious choice for not clipping rows — pins a session to the\n\
+         # narrowest client that ever attached: leave a split-pane window open\n\
+         # at home and a laptop elsewhere can never grow past it, because the\n\
+         # idle client still counts. `latest` follows the machine you're\n\
+         # actually typing on.\n\
+         set -g window-size latest\n\
          # amux session switcher (Ghostty Shift+Cmd+O → ESC o). Native choose-tree:\n\
          # j/k or ↑/↓ move, Enter switches, q/Esc cancels. We can't use an fzf\n\
          # popup here — rmux's display-popup has no client context (client_name\n\
@@ -726,7 +730,7 @@ mod tests {
         assert!(b.starts_with(BEGIN));
         assert!(b.trim_end().ends_with(END));
         assert!(b.contains("bind -n M-o choose-tree -Zs"));
-        assert!(b.contains("set -g window-size smallest"));
+        assert!(b.contains("set -g window-size latest"));
     }
 
     #[test]
