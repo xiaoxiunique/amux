@@ -123,6 +123,28 @@ fn main() -> Result<()> {
         Some(Command::Stop) => serve::stop(),
         Some(Command::InstallCli) => commands::init::install_cli(&agents),
         Some(Command::Install { china }) => commands::install::install_agents(&agents, china),
+        Some(Command::New { first, second }) => {
+            // `amux new <name>` uses the default agent; `amux new <agent> <name>`
+            // picks one. A lone argument is always the name — except when it
+            // names an agent, which is almost certainly a forgotten name rather
+            // than a session someone meant to call "cx".
+            let (agent_name, suffix) = match &second {
+                Some(name) => (first.as_str(), name.as_str()),
+                None => {
+                    if config::find(&agents, &first).is_some() {
+                        anyhow::bail!(
+                            "'{first}' is an agent — give the session a name too, \
+                             e.g. `amux new {first} debug`"
+                        );
+                    }
+                    ("claude", first.as_str())
+                }
+            };
+            let a = config::find(&agents, agent_name)
+                .ok_or_else(|| anyhow::anyhow!("unknown agent '{agent_name}'"))?
+                .clone();
+            commands::new::new_session(&a, suffix, &agents)
+        }
         Some(Command::Sessions { limit }) => commands::list::list_sessions(limit),
         Some(Command::Save { file }) => {
             commands::sessions::save(file.as_deref(), &agents)

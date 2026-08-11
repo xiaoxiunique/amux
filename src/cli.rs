@@ -37,6 +37,14 @@ pub enum Command {
     /// List amux-managed sessions.
     #[command(alias = "list")]
     Ls,
+    /// Open an additional session for this directory, alongside any that are
+    /// already running. `amux new debug`, or `amux new cx debug` for Codex.
+    New {
+        /// Name for the new session, or the agent when a name follows.
+        first: String,
+        /// Name for the new session, when the first argument is an agent.
+        second: Option<String>,
+    },
     /// List recent Claude Code and Codex conversations for this directory.
     Sessions {
         /// How many per agent (default 5).

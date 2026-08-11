@@ -117,7 +117,7 @@ fn canonical_project_dir(dir: &str) -> Result<PathBuf, String> {
 /// Session names are shell- and multiplexer-visible identifiers, and tmux/rmux
 /// treat `.` and `:` as target syntax. Restrict the user's suffix to characters
 /// that can't change how a name is parsed.
-fn sanitize_suffix(raw: &str) -> Result<String, String> {
+pub(crate) fn sanitize_suffix(raw: &str) -> Result<String, String> {
     let s = raw.trim();
     if s.is_empty() {
         return Err("suffix is required".to_string());

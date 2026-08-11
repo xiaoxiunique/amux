@@ -33,10 +33,12 @@ pub fn managed_sessions(all: &[String], agents: &[Agent]) -> Vec<ManagedSession>
             } else {
                 continue;
             };
-            // slug_hash must be `<slug>_<8hex>` with non-empty slug
+            // slug_hash must be `<slug>_<8hex>`, optionally followed by the
+            // `-<suffix>` an `amux new` session carries.
             if let Some(idx) = slug_hash.rfind('_') {
                 let tail = &slug_hash[idx + 1..];
-                if tail.len() == 8 && tail.chars().all(|c| c.is_ascii_hexdigit()) && idx > 0 {
+                let hash = tail.split('-').next().unwrap_or(tail);
+                if hash.len() == 8 && hash.chars().all(|c| c.is_ascii_hexdigit()) && idx > 0 {
                     out.push(ManagedSession { name: name.clone(), alias: a.alias.clone() });
                     break;
                 }
@@ -328,6 +330,29 @@ mod tests {
         assert!(names.contains(&"cx_api_deadbeef"));
         assert!(!names.contains(&"random_session"));
         assert!(!names.contains(&"cc_nohash"));
+    }
+
+    #[test]
+    fn detects_amux_new_suffixed_sessions() {
+        // `amux new` appends `-<suffix>` to the normal name; those sessions
+        // must still show up in `amux ls`.
+        let all = vec![
+            "cc_myproject_1a2b3c4d".to_string(),
+            "cc_myproject_1a2b3c4d-debug".to_string(),
+            "cc_myproject_1a2b3c4d-2".to_string(),
+            "cx-glm_api_deadbeef-试验".to_string(),
+            // A suffix must not rescue a name whose hash is malformed.
+            "cc_myproject_notahash-debug".to_string(),
+        ];
+        let names: Vec<_> = managed_sessions(&all, &agents())
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"cc_myproject_1a2b3c4d".to_string()));
+        assert!(names.contains(&"cc_myproject_1a2b3c4d-debug".to_string()));
+        assert!(names.contains(&"cc_myproject_1a2b3c4d-2".to_string()));
+        assert!(names.contains(&"cx-glm_api_deadbeef-试验".to_string()));
+        assert!(!names.contains(&"cc_myproject_notahash-debug".to_string()));
     }
 
     #[test]
