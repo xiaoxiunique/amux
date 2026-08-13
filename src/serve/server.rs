@@ -1028,14 +1028,10 @@ pub(crate) fn agent_launch_command_for(agent: &str) -> Result<String, String> {
     agent_launch_command(agent)
 }
 
-/// True when the multiplexer already has a session by this name.
+/// True when the multiplexer already has a session by this exact name.
 pub(crate) fn mux_has_session(name: &str) -> bool {
-    tmux_command()
-        .args(["has-session", "-t", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    // Exact match — a suffixed session must not shadow the primary name.
+    crate::tmux::has_session(name)
 }
 
 /// Pin a session to follow whichever client last used it.

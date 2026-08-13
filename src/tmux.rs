@@ -41,10 +41,20 @@ pub fn in_tmux() -> bool {
 }
 
 pub fn has_session(name: &str) -> bool {
+    // `has-session -t name` matches by prefix, so a suffixed session
+    // (`cx_myapp_1a2b3c4d-debug`) would make the bare name
+    // (`cx_myapp_1a2b3c4d`) appear to exist. `amux <id>` / `amux run` would
+    // then skip creating the real session and fail on attach. Compare against
+    // the full session list instead, which is exact.
     Command::new(mux_bin())
-        .args(["has-session", "-t", name])
+        .args(["list-sessions", "-F", "#{session_name}"])
         .output()
-        .map(|o| o.status.success())
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == name)
+        })
         .unwrap_or(false)
 }
 
@@ -243,6 +253,31 @@ mod tests {
         assert!(list_session_names().unwrap().contains(&name));
         kill_session(&name).unwrap();
         assert!(!has_session(&name));
+    }
+
+    #[test]
+    fn has_session_does_not_match_by_prefix() {
+        if !is_available() {
+            eprintln!("skipping: no multiplexer installed");
+            return;
+        }
+        let name = format!("amuxpre_{}", std::process::id());
+        let _ = kill_session(&name);
+        let _ = kill_session(&format!("{name}-debug"));
+        new_session_detached(&name, "/tmp").unwrap();
+        new_session_detached(&format!("{name}-debug"), "/tmp").unwrap();
+
+        assert!(has_session(&name));
+        assert!(has_session(&format!("{name}-debug")));
+
+        // Delete the primary; the suffixed session alone must not make the
+        // bare name look present — that was the bug that made `amux <id>`
+        // skip creating the real session and fail on attach.
+        kill_session(&name).unwrap();
+        assert!(!has_session(&name), "bare name must be absent when only the suffixed one exists");
+        assert!(has_session(&format!("{name}-debug")));
+
+        kill_session(&format!("{name}-debug")).unwrap();
     }
 
     #[test]
