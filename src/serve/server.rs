@@ -1038,6 +1038,20 @@ pub(crate) fn mux_has_session(name: &str) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Pin a session to follow whichever client last used it.
+///
+/// window-size is per-session and snapshotted from the global at creation time,
+/// so a session created before the config was installed stays stuck at the
+/// narrowest client that ever attached. Best-effort — an older multiplexer
+/// without the option must not fail the launch.
+pub(crate) fn pin_window_size(name: &str) {
+    let _ = tmux_command()
+        .args(["set-option", "-t", name, "window-size", "latest"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Create a detached session running `command` in `cwd`.
 ///
 /// Goes through `tmux_command()` so the child doesn't inherit this server's own
@@ -1048,6 +1062,7 @@ pub(crate) fn mux_new_session(name: &str, cwd: &str, command: &str) -> Result<()
         .output()
         .map_err(|error| format!("failed to launch {command}: {error}"))?;
     if output.status.success() {
+        pin_window_size(name);
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -4090,7 +4105,9 @@ fn launch_project_session(
         ])
         .output()
         .map_err(|error| format!("failed to launch {command}: {error}"))?;
-    if !output.status.success() {
+    if output.status.success() {
+        pin_window_size(&session_name);
+    } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
             format!("tmux exited with {}", output.status)

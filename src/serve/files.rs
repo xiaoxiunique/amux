@@ -220,13 +220,10 @@ pub fn list(dir: &Path, root: &Path, show_all: bool) -> Result<Listing, String> 
         }
     }
 
-    // Directories first, then case-insensitive by name — the ordering a file
-    // browser is expected to have.
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    // Newest-modified first, directories included. A browser that drops you
+    // into a project folder wants the thing you just touched at the top, not
+    // buried under alphabetically-earlier names.
+    entries.sort_by(newest_first_modified);
 
     Ok(Listing {
         path: dir.to_string_lossy().into_owned(),
@@ -261,6 +258,7 @@ fn media_kind(file: &Path) -> Option<&'static str> {
     {
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "heic") => Some("image"),
         Some("mp4" | "mov" | "m4v") => Some("video"),
+        Some("mp3" | "wav" | "m4a" | "aac" | "ogg" | "flac") => Some("audio"),
         _ => None,
     }
 }
@@ -309,10 +307,26 @@ pub fn content_type_for(file: &Path) -> &'static str {
         Some("gz" | "tgz") => "application/gzip",
         Some("mp4") => "video/mp4",
         Some("mov") => "video/quicktime",
+        Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
+        Some("m4a") => "audio/mp4",
+        Some("aac") => "audio/aac",
+        Some("ogg") => "audio/ogg",
+        Some("flac") => "audio/flac",
         Some("csv") => "text/csv",
         Some("html" | "htm") => "text/html",
         Some("txt" | "md" | "log" | "toml" | "yaml" | "yml") => "text/plain",
         _ => "application/octet-stream",
+    }
+}
+
+/// Newest `modified` first; entries without a timestamp sort to the end.
+fn newest_first_modified(a: &Entry, b: &Entry) -> std::cmp::Ordering {
+    match (a.modified, b.modified) {
+        (Some(a), Some(b)) => b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     }
 }
 
@@ -394,7 +408,10 @@ mod tests {
 
         let l = list(&root, &root, false).unwrap();
         let names: Vec<&str> = l.entries.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, vec!["src", "README.md"]);
+        // README.md was written after src was created, so with newest-first it
+        // leads — the directory is only preferred within the same-ish time.
+        assert_eq!(names[0], "README.md");
+        assert_eq!(names[1], "src");
         assert!(l.filtered);
 
         // show_all reveals both the noise dir and the dotfile.
@@ -421,6 +438,33 @@ mod tests {
         let bin = tmp.path().join("a.bin");
         fs::write(&bin, [0xff, 0xfe, 0x00, 0x01]).unwrap();
         assert!(matches!(preview(&bin).unwrap(), Preview::Binary { .. }));
+    }
+
+    #[test]
+    fn audio_files_preview_as_media() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, kind) in [
+            ("a.mp3", "audio"),
+            ("b.wav", "audio"),
+            ("c.m4a", "audio"),
+            ("d.flac", "audio"),
+        ] {
+            let f = tmp.path().join(name);
+            fs::write(&f, b"\xff\xfb").unwrap();
+            match preview(&f).unwrap() {
+                Preview::Media { kind: k, size } => {
+                    assert_eq!(k, kind, "{name} should be media");
+                    assert!(size >= 2);
+                }
+                _ => panic!("{name} should be a media preview"),
+            }
+            // The download must carry a MIME the phone's player accepts.
+            assert!(content_type_for(&f).starts_with("audio/"), "{name}");
+        }
+        // Uppercase extensions are still recognized.
+        let up = tmp.path().join("E.MP3");
+        fs::write(&up, b"\xff\xfb").unwrap();
+        assert!(matches!(preview(&up).unwrap(), Preview::Media { .. }));
     }
 
     #[test]

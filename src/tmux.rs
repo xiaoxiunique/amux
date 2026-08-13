@@ -55,6 +55,7 @@ pub fn new_session_detached(name: &str, cwd: &str) -> Result<()> {
     if !status.success() {
         bail!("failed to create session '{name}'");
     }
+    pin_window_size(name);
     Ok(())
 }
 
@@ -112,16 +113,88 @@ pub fn kill_session(name: &str) -> Result<()> {
 }
 
 /// Attach (outside a mux, replacing this process) or switch-client (inside one).
+/// Pin a session to follow whichever client last used it.
+///
+/// `window-size` is a per-session option, snapshotted from the global value
+/// when the session is created. A session created before `amux init` wrote the
+/// config — or on a server whose global is still the default `smallest` — is
+/// stuck at the narrowest client that ever attached, and no later change to the
+/// global rescues it: connect from a second machine and the window can't grow
+/// past the first one's, even after that client is gone.
+///
+/// Best-effort: a multiplexer without the option must not fail the launch.
+pub fn pin_window_size(name: &str) {
+    let _ = Command::new(mux_bin())
+        .args(["set-option", "-t", name, "window-size", "latest"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // Setting the option does not re-evaluate it: `latest` is recomputed on
+    // client attach/detach/resize, so a session whose terminal was resized
+    // *before* the option was set keeps the stale size indefinitely. `-A`
+    // forces that recompute now.
+    let _ = Command::new(mux_bin())
+        .args(["resize-window", "-t", name, "-A"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Recompute a session's size against its clients, shortly from now.
+///
+/// `resize-window -A` only sees the clients attached *at the moment it runs*,
+/// and `attach-session` replaces this process — so a foreground call would
+/// always run before the client we care about exists. Spawning a detached
+/// helper that sleeps first lets the resize land just after the attach.
+fn resize_after_attach(name: &str) {
+    let bin = mux_bin();
+    #[cfg(unix)]
+    let spawned = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "sleep 0.4; {} resize-window -t {} -A >/dev/null 2>&1",
+            shell_quote(&bin),
+            shell_quote(name)
+        ))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    #[cfg(not(unix))]
+    let spawned = Command::new("cmd")
+        .args([
+            "/C",
+            &format!(
+                "timeout /t 1 /nobreak >nul & \"{bin}\" resize-window -t \"{name}\" -A"
+            ),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let _ = spawned;
+}
+
 pub fn attach_or_switch(name: &str) -> Result<()> {
+    // Covers sessions created before the option was set — attaching is exactly
+    // when a stale size becomes visible.
+    pin_window_size(name);
     if in_tmux() {
         Command::new(mux_bin())
             .args(["switch-client", "-t", name])
             .status()?;
+        // The client moved after the pin above ran, so recompute against it.
+        let _ = Command::new(mux_bin())
+            .args(["resize-window", "-t", name, "-A"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         Ok(())
     } else {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
+            // Attaching does not itself re-evaluate `window-size latest`, so a
+            // session sized to an older, narrower client would stay that way.
+            resize_after_attach(name);
             let err = Command::new(mux_bin())
                 .args(["attach-session", "-t", name])
                 .exec();
@@ -131,6 +204,7 @@ pub fn attach_or_switch(name: &str) -> Result<()> {
         {
             // Windows has no exec(): run attach to completion, then exit with
             // its status so the shell behaves as if we'd been replaced.
+            resize_after_attach(name);
             let status = Command::new(mux_bin())
                 .args(["attach-session", "-t", name])
                 .status()?;
@@ -169,5 +243,31 @@ mod tests {
         assert!(list_session_names().unwrap().contains(&name));
         kill_session(&name).unwrap();
         assert!(!has_session(&name));
+    }
+
+    #[test]
+    fn a_new_session_follows_its_latest_client() {
+        if !is_available() {
+            eprintln!("skipping: no multiplexer installed");
+            return;
+        }
+        let name = format!("amuxsize_{}", std::process::id());
+        let _ = kill_session(&name);
+        new_session_detached(&name, "/tmp").unwrap();
+
+        let opt = Command::new(mux_bin())
+            .args(["show-options", "-t", &name, "window-size"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        let _ = kill_session(&name);
+
+        // A session that inherits the default `smallest` is the bug: it pins
+        // itself to the narrowest client that ever attached, so a second
+        // machine can never widen it.
+        assert!(
+            opt.contains("latest"),
+            "new sessions must be pinned to the latest client, got {opt:?}"
+        );
     }
 }

@@ -48,6 +48,10 @@ pub fn render_mux_block() -> String {
          # idle client still counts. `latest` follows the machine you're\n\
          # actually typing on.\n\
          set -g window-size latest\n\
+         # Scrollback depth. The default 2000 is thin for agent work: a single\n\
+         # build log or test run can bury everything before it, and the phone\n\
+         # app's log view can only show what the buffer still holds.\n\
+         set -g history-limit 50000\n\
          # amux session switcher (Ghostty Shift+Cmd+O → ESC o). Native choose-tree:\n\
          # j/k or ↑/↓ move, Enter switches, q/Esc cancels. We can't use an fzf\n\
          # popup here — rmux's display-popup has no client context (client_name\n\
