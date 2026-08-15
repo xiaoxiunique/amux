@@ -547,33 +547,20 @@ pub async fn spawn_forwarder(host: &str, listen_port: u16) {
 async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-    let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
-        return;
-    };
     let (client_read, client_write) = inbound.into_split();
-    let (mut server_read, mut server_write) = outbound.into_split();
 
-    // Downstream needs no changes, but the relay also writes its own replies,
-    // so both share the socket under a lock.
+    // Both the proxied responses and the relay's own replies go to the same
+    // socket, so they share it under a lock.
     let client_out = std::sync::Arc::new(tokio::sync::Mutex::new(client_write));
-    {
-        let sink = client_out.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match server_read.read(&mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => {
-                        let mut w = sink.lock().await;
-                        if w.write_all(&buf[..n]).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-    }
-    let mut client_out = client_out;
+
+    // The upstream is opened on demand, not up front. dsh advertises
+    // `Keep-Alive: timeout=5`, and the relay answers `/` itself — so an eager
+    // connection would sit idle through the whole page load and be closed
+    // before the first API call reached it. That call then vanished into a
+    // dead socket, which is what left the session list empty on a slower
+    // network while a fast one happened to finish inside the five seconds.
+    let mut upstream: Option<tokio::net::tcp::OwnedWriteHalf> = None;
+    let upstream_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut reader = BufReader::new(client_read);
     loop {
@@ -629,7 +616,7 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
             }
             if method == "POST" {
                 save_ui_state(&String::from_utf8_lossy(&body));
-                if write_simple(&mut client_out, "application/json", b"{\"ok\":true}")
+                if write_simple(&client_out, "application/json", b"{\"ok\":true}")
                     .await
                     .is_err()
                 {
@@ -637,7 +624,7 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
                 }
             } else {
                 let state = load_ui_state();
-                if write_simple(&mut client_out, "application/json", state.as_bytes())
+                if write_simple(&client_out, "application/json", state.as_bytes())
                     .await
                     .is_err()
                 {
@@ -648,7 +635,7 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
         }
         if method == "GET" && (path == "/" || path == "/index.html") {
             if let Some(html) = injected_index().await {
-                if write_simple(&mut client_out, "text/html; charset=utf-8", &html)
+                if write_simple(&client_out, "text/html; charset=utf-8", &html)
                     .await
                     .is_err()
                 {
@@ -659,6 +646,40 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
             // Injection failed (dsh restarting?) — fall through and proxy it.
         }
 
+        // Connect (or reconnect) only now that something must actually go
+        // upstream. A connection dsh dropped while idle is replaced instead of
+        // being written into.
+        if upstream.is_some() && !upstream_alive.load(std::sync::atomic::Ordering::Relaxed) {
+            upstream = None;
+        }
+        if upstream.is_none() {
+            let Ok(sock) = tokio::net::TcpStream::connect(&target).await else {
+                return;
+            };
+            let (mut server_read, server_write) = sock.into_split();
+            upstream = Some(server_write);
+            upstream_alive.store(true, std::sync::atomic::Ordering::Relaxed);
+
+            let sink = client_out.clone();
+            let alive = upstream_alive.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    match server_read.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let mut w = sink.lock().await;
+                            if w.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                alive.store(false, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        let server_write = upstream.as_mut().expect("upstream just ensured");
+
         if server_write.write_all(&head).await.is_err() {
             return;
         }
@@ -667,7 +688,7 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
         if chunked {
             // Rare from this client, and framing it wrongly would corrupt the
             // stream; hand the rest over verbatim instead.
-            let _ = tokio::io::copy(&mut reader, &mut server_write).await;
+            let _ = tokio::io::copy(&mut reader, server_write).await;
             return;
         }
         if content_length > 0 {
@@ -682,7 +703,7 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
 
         if upgrading {
             // Past the handshake this is no longer HTTP.
-            let _ = tokio::io::copy(&mut reader, &mut server_write).await;
+            let _ = tokio::io::copy(&mut reader, server_write).await;
             return;
         }
     }
@@ -804,7 +825,7 @@ fn split_request_line(line: &str) -> (&str, &str) {
 
 /// Write a complete, self-contained HTTP response to the client.
 async fn write_simple(
-    sink: &mut std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    sink: &std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
