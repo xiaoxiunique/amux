@@ -898,6 +898,47 @@ pub fn tls_enabled() -> bool {
     tls_paths().is_some()
 }
 
+/// The hostname the certificate is issued for.
+///
+/// TLS only validates against the name in the certificate, so a client that
+/// built the URL from an IP would fail the handshake. Reporting the name lets
+/// it use one that matches.
+pub fn tls_host() -> Option<String> {
+    let (cert_path, _) = tls_paths()?;
+    let pem = std::fs::read(&cert_path).ok()?;
+    let cert = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()?
+        .ok()?;
+    // Read the first DNS name out of the subjectAltName extension. Parsing the
+    // whole certificate would need another dependency; the name is a plain
+    // IA5String, and Tailscale's certs carry exactly one.
+    let der = cert.as_ref();
+    let host = find_first_dns_name(der)?;
+    Some(host)
+}
+
+/// Scan DER for the SAN extension's first dNSName (context tag 0x82).
+fn find_first_dns_name(der: &[u8]) -> Option<String> {
+    let mut i = 0;
+    while i + 2 < der.len() {
+        if der[i] == 0x82 {
+            let len = der[i + 1] as usize;
+            if len > 3 && i + 2 + len <= der.len() {
+                if let Ok(s) = std::str::from_utf8(&der[i + 2..i + 2 + len]) {
+                    // A hostname, not arbitrary bytes that happened to match.
+                    if s.contains('.')
+                        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+                    {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Load the certificate into a rustls config.
 fn tls_config() -> Option<std::sync::Arc<tokio_rustls::rustls::ServerConfig>> {
     let (cert_path, key_path) = tls_paths()?;

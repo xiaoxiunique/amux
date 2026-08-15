@@ -2766,6 +2766,9 @@ static CAPABILITIES: LazyLock<serde_json::Value> = LazyLock::new(|| {
             // Browsers only allow a WebSocket from a plain-HTTP page on
             // loopback, so the client has to know which scheme to use.
             "relayTls": crate::serve::dsh::tls_enabled(),
+            // The certificate is issued for a name, not an address; a client
+            // that used an IP would fail the handshake.
+            "relayHost": crate::serve::dsh::tls_host(),
         },
         // Compiled-in feature set: the control-center / screenshot / push
         // endpoints only exist in `--features full` builds.
@@ -2798,6 +2801,7 @@ async fn api_capabilities(
     if let Some(d) = body.get_mut("dsh").and_then(|d| d.as_object_mut()) {
         d.insert("relayPort".to_string(), json!(crate::serve::dsh::relay_port()));
         d.insert("relayTls".to_string(), json!(crate::serve::dsh::tls_enabled()));
+        d.insert("relayHost".to_string(), json!(crate::serve::dsh::tls_host()));
     }
     json_response(StatusCode::OK, json!({ "ok": true, "capabilities": body }))
 }
