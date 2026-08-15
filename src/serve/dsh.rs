@@ -476,131 +476,61 @@ mod tests {
 }
 
 
-/// Path prefixes the dsh frontend requests with absolute URLs.
-///
-/// Its HTML and plugin manifest reference `/assets/…`, `/plugins/…` and
-/// `/api/…` from the origin root, so mounting the UI under `/dsh/` only works
-/// if these are also served from the root. Proxying them by prefix avoids
-/// rewriting HTML — and, more importantly, avoids missing the plugin URLs the
-/// client loads dynamically at runtime.
-pub const PROXY_PREFIXES: &[&str] = &["/assets/", "/plugins/", "/api/", "/client"];
-
-/// True when a request path belongs to the dsh frontend rather than amux.
-///
-/// `/api/` is deliberately excluded here: amux has its own `/api/` routes,
-/// which are matched first by the router. Only paths that fall through to the
-/// fallback reach this.
-pub fn owns_path(path: &str) -> bool {
-    PROXY_PREFIXES.iter().any(|p| path.starts_with(p))
-        || path == "/favicon.svg"
-        || path == "/manifest.webmanifest"
-}
-
-/// Forward one request to `dsh web` and return its response for streaming.
-///
-/// The body is deliberately *not* buffered: `/api/events.*` are Server-Sent
-/// Event streams that never end, so reading them to completion would hang the
-/// request forever and leave the UI stuck retrying.
-///
-/// The Origin header is rewritten to dsh's own address: it guards `/api` with
-/// a browser-trust fence that rejects any other origin, and a WebView loading
-/// the UI from amux would otherwise be refused.
-pub async fn proxy(
-    method: reqwest::Method,
-    path_and_query: &str,
-    headers: &[(String, String)],
-    body: Vec<u8>,
-) -> Result<(u16, Vec<(String, String)>, reqwest::Response), String> {
-    let base = base_url();
-    let url = format!("{base}{path_and_query}");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let mut req = client.request(method, &url);
-    for (k, v) in headers {
-        let lower = k.to_ascii_lowercase();
-        // Hop-by-hop and identity headers must not be forwarded as-is.
-        if matches!(
-            lower.as_str(),
-            "host"
-                | "origin"
-                | "referer"
-                | "connection"
-                | "content-length"
-                | "accept-encoding"
-                | "sec-fetch-site"
-        ) {
-            continue;
-        }
-        req = req.header(k, v);
-    }
-    // All three must agree or the trust check rejects the request: Host must
-    // be loopback, Origin's host must equal it, and Sec-Fetch-Site must not
-    // say cross-site (the browser sets that when it sees amux's origin).
-    req = req
-        .header("Host", authority())
-        .header("Origin", &base)
-        .header("Referer", format!("{base}/"))
-        .header("Sec-Fetch-Site", "same-origin");
-    if !body.is_empty() {
-        req = req.body(body);
-    }
-
-    let res = req.send().await.map_err(|e| format!("dsh proxy: {e}"))?;
-    let status = res.status().as_u16();
-    let out_headers: Vec<(String, String)> = res
-        .headers()
-        .iter()
-        .filter(|(k, _)| {
-            !matches!(
-                k.as_str(),
-                "connection" | "transfer-encoding" | "content-length"
-            )
-        })
-        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
-        .collect();
-    Ok((status, out_headers, res))
-}
-
-#[cfg(test)]
-mod proxy_tests {
-    use super::*;
-
-    #[test]
-    fn recognises_frontend_paths() {
-        assert!(owns_path("/assets/index-Dqw48FrP.js"));
-        assert!(owns_path("/plugins/@deepseek-ai/dsh-client-runtime/client.js?rev=1"));
-        assert!(owns_path("/favicon.svg"));
-        assert!(owns_path("/manifest.webmanifest"));
-        // amux's own UI must keep serving these.
-        assert!(!owns_path("/main.dart.js"));
-        assert!(!owns_path("/index.html"));
-        assert!(!owns_path("/"));
-    }
-}
-
-
-
-/// `ws://…` form of the dsh base address.
-pub fn ws_base() -> String {
-    base_url()
-        .replacen("http://", "ws://", 1)
-        .replacen("https://", "wss://", 1)
-}
-
-/// Authority (`host:port`) dsh expects to see.
-///
-/// Its trust check requires all three of: a loopback `Host`, a non-`cross-site`
-/// `Sec-Fetch-Site`, and — when present — an `Origin` whose host *equals* that
-/// `Host`. Rewriting only one of them fails the equality test, which is what
-/// silently closed the first attempt at the event sockets.
-pub fn authority() -> String {
+/// Authority (`host:port`) of the dsh server, for the forwarder to dial.
+fn authority() -> String {
     base_url()
         .trim_start_matches("http://")
         .trim_start_matches("https://")
         .trim_end_matches('/')
         .to_string()
+}
+
+/// Relay `0.0.0.0:<listen_port>` to the dsh server, byte for byte.
+///
+/// dsh binds loopback only and rejects `--host 0.0.0.0` outright, so a phone
+/// cannot reach its UI. This carries the bytes across without interpreting
+/// them: no HTTP parsing, no header rewriting, no WebSocket framing. Whatever
+/// dsh's client and server say to each other keeps working when they change it.
+///
+/// The one thing dsh must be told is which outside authority to trust:
+///
+/// ```text
+/// dsh web --trusted-host 192.168.1.234
+/// ```
+///
+/// Without that its browser-trust fence rejects `/api` calls whose Host isn't
+/// loopback. Rewriting the headers to fake that check is possible but couples
+/// amux to dsh's internals; the flag is the supported way in.
+///
+/// # Exposure
+///
+/// This does what dsh declines to do for you — its UI can run arbitrary code,
+/// and the relay has no authentication of its own (amux's `--token` does not
+/// apply to a raw byte stream). It is opt-in for that reason. Only enable it on
+/// a network you trust, or behind a VPN such as Tailscale.
+pub async fn spawn_forwarder(listen_port: u16) {
+    let target = authority();
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", listen_port)).await {
+        Ok(l) => l,
+        Err(error) => {
+            eprintln!("[dsh] cannot listen on :{listen_port}: {error}");
+            return;
+        }
+    };
+    println!("dsh UI forwarded: http://0.0.0.0:{listen_port} -> {target}");
+    println!("  remember: dsh web --trusted-host <this machine's address>");
+
+    loop {
+        let Ok((mut inbound, _)) = listener.accept().await else {
+            continue;
+        };
+        let target = target.clone();
+        tokio::spawn(async move {
+            let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+                return;
+            };
+            // Ignore the result: a peer hanging up is the normal way this ends.
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+        });
+    }
 }

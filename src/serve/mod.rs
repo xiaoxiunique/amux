@@ -107,6 +107,7 @@ pub fn serve(
     foreground: bool,
     open: bool,
     with_herdr: bool,
+    dsh_port: Option<u16>,
 ) -> Result<()> {
     let host = host.unwrap_or(DEFAULT_HOST);
     let port = if port == 0 { DEFAULT_PORT } else { port };
@@ -122,7 +123,12 @@ pub fn serve(
             open_browser(port);
         }
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-        rt.block_on(server::run_server(host, port, token));
+        rt.block_on(async {
+            if let Some(p) = dsh_port {
+                tokio::spawn(dsh::spawn_forwarder(p));
+            }
+            server::run_server(host, port, token).await
+        });
         return Ok(());
     }
 
@@ -152,6 +158,10 @@ pub fn serve(
     // or `--herdr` would silently do nothing in the default (daemon) mode.
     if with_herdr {
         cmd.arg("--herdr");
+    }
+    // Same reason as --herdr: the daemon is a re-exec, so the flag must travel.
+    if let Some(p) = dsh_port {
+        cmd.arg("--dsh-port").arg(p.to_string());
     }
 
     let child = cmd

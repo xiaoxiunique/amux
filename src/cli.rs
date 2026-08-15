@@ -76,6 +76,12 @@ pub enum Command {
         /// alongside the rmux sessions.
         #[arg(long)]
         herdr: bool,
+        /// Relay the DeepSeek Harness UI on this port so a phone can open it.
+        /// dsh binds loopback only; pair this with
+        /// `dsh web --trusted-host <address>`. The relay is unauthenticated
+        /// and dsh can run arbitrary code — use it only on a trusted network.
+        #[arg(long, value_name = "PORT")]
+        dsh_port: Option<u16>,
     },
     /// Record an explicit agent lifecycle status for the monitor.
     Hook {

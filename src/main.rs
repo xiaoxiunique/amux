@@ -106,7 +106,16 @@ fn main() -> Result<()> {
             foreground,
             open,
             herdr,
-        }) => serve::serve(port, host.as_deref(), token.as_deref(), foreground, open, herdr),
+            dsh_port,
+        }) => serve::serve(
+            port,
+            host.as_deref(),
+            token.as_deref(),
+            foreground,
+            open,
+            herdr,
+            dsh_port,
+        ),
         Some(Command::Hook {
             state,
             pane,
