@@ -475,3 +475,104 @@ mod tests {
     }
 }
 
+
+/// Path prefixes the dsh frontend requests with absolute URLs.
+///
+/// Its HTML and plugin manifest reference `/assets/…`, `/plugins/…` and
+/// `/api/…` from the origin root, so mounting the UI under `/dsh/` only works
+/// if these are also served from the root. Proxying them by prefix avoids
+/// rewriting HTML — and, more importantly, avoids missing the plugin URLs the
+/// client loads dynamically at runtime.
+pub const PROXY_PREFIXES: &[&str] = &["/assets/", "/plugins/", "/api/", "/client"];
+
+/// True when a request path belongs to the dsh frontend rather than amux.
+///
+/// `/api/` is deliberately excluded here: amux has its own `/api/` routes,
+/// which are matched first by the router. Only paths that fall through to the
+/// fallback reach this.
+pub fn owns_path(path: &str) -> bool {
+    PROXY_PREFIXES.iter().any(|p| path.starts_with(p))
+        || path == "/favicon.svg"
+        || path == "/manifest.webmanifest"
+}
+
+/// Forward one request to `dsh web` and return its response verbatim.
+///
+/// The Origin header is rewritten to dsh's own address: it guards `/api` with
+/// a browser-trust fence that rejects any other origin, and a WebView loading
+/// the UI from amux would otherwise be refused.
+pub async fn proxy(
+    method: reqwest::Method,
+    path_and_query: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let base = base_url();
+    let url = format!("{base}{path_and_query}");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client.request(method, &url);
+    for (k, v) in headers {
+        let lower = k.to_ascii_lowercase();
+        // Hop-by-hop and identity headers must not be forwarded as-is.
+        if matches!(
+            lower.as_str(),
+            "host" | "origin" | "referer" | "connection" | "content-length" | "accept-encoding"
+        ) {
+            continue;
+        }
+        req = req.header(k, v);
+    }
+    req = req.header("Origin", &base).header("Referer", format!("{base}/"));
+    if !body.is_empty() {
+        req = req.body(body);
+    }
+
+    let res = req.send().await.map_err(|e| format!("dsh proxy: {e}"))?;
+    let status = res.status().as_u16();
+    let out_headers: Vec<(String, String)> = res
+        .headers()
+        .iter()
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "connection" | "transfer-encoding" | "content-length"
+            )
+        })
+        .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+        .collect();
+    let bytes = res.bytes().await.map_err(|e| e.to_string())?.to_vec();
+    Ok((status, out_headers, bytes))
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn recognises_frontend_paths() {
+        assert!(owns_path("/assets/index-Dqw48FrP.js"));
+        assert!(owns_path("/plugins/@deepseek-ai/dsh-client-runtime/client.js?rev=1"));
+        assert!(owns_path("/favicon.svg"));
+        assert!(owns_path("/manifest.webmanifest"));
+        // amux's own UI must keep serving these.
+        assert!(!owns_path("/main.dart.js"));
+        assert!(!owns_path("/index.html"));
+        assert!(!owns_path("/"));
+    }
+}
+
+/// `ws://…` form of the dsh base address, for proxying its event streams.
+pub fn ws_base() -> String {
+    base_url().replacen("http://", "ws://", 1).replacen("https://", "wss://", 1)
+}
+
+/// Origin header value dsh's trust fence accepts.
+pub fn origin_header() -> reqwest::header::HeaderValue {
+    reqwest::header::HeaderValue::from_str(&base_url())
+        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(DEFAULT_BASE))
+}

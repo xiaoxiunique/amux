@@ -409,7 +409,173 @@ fn web_content_type(path: &str) -> &'static str {
 /// Serve the embedded web client, falling back to index.html for SPA routes.
 /// This is the router fallback, so it only runs for paths no `/api` or `/ws`
 /// route matched.
-async fn serve_webui(uri: Uri) -> Response<Body> {
+/// Forward a request to `dsh web` and turn its reply into an axum response.
+async fn proxy_to_dsh(
+    method: reqwest::Method,
+    uri: &Uri,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Response<Body> {
+    let target = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+
+    match crate::serve::dsh::proxy(method, &target, &headers, body).await {
+        Ok((status, out_headers, bytes)) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
+            for (k, v) in out_headers {
+                builder = builder.header(k, v);
+            }
+            builder
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| bad_gateway("malformed dsh response"))
+        }
+        Err(error) => bad_gateway(&error),
+    }
+}
+
+/// Upgrade handler for dsh's `/api/events.*` streams.
+async fn dsh_events_ws(ws: WebSocketUpgrade, uri: Uri) -> Response<Body> {
+    if !crate::serve::dsh::available() {
+        return bad_gateway("dsh is not running");
+    }
+    let target = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    ws.on_upgrade(move |socket| proxy_ws_to_dsh(socket, target))
+        .into_response()
+}
+
+/// Bridge a browser WebSocket to the matching one on `dsh web`.
+///
+/// dsh streams live session state over `/api/events.*`; without this the UI
+/// loads but never fills in — it retries the connection forever and shows an
+/// empty workspace.
+async fn proxy_ws_to_dsh(socket: WebSocket, path_and_query: String) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as TMessage;
+
+    let base = crate::serve::dsh::ws_base();
+    let url = format!("{base}{path_and_query}");
+
+    // dsh applies the same origin fence to the upgrade request.
+    let request = match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str()) {
+        Ok(mut r) => {
+            r.headers_mut().insert(
+                "Origin",
+                crate::serve::dsh::origin_header(),
+            );
+            r
+        }
+        Err(error) => {
+            eprintln!("[dsh] bad ws url {url}: {error}");
+            return;
+        }
+    };
+
+    let (upstream, _) = match tokio_tungstenite::connect_async(request).await {
+        Ok(pair) => pair,
+        Err(error) => {
+            eprintln!("[dsh] ws connect failed for {path_and_query}: {error}");
+            return;
+        }
+    };
+
+    let (mut up_tx, mut up_rx) = upstream.split();
+    let (mut cli_tx, mut cli_rx) = socket.split();
+
+    // Either direction closing ends the pair.
+    let to_upstream = async {
+        while let Some(Ok(msg)) = cli_rx.next().await {
+            let out = match msg {
+                Message::Text(t) => TMessage::Text(t.to_string()),
+                Message::Binary(b) => TMessage::Binary(b.to_vec()),
+                Message::Ping(p) => TMessage::Ping(p.to_vec()),
+                Message::Pong(p) => TMessage::Pong(p.to_vec()),
+                Message::Close(_) => break,
+            };
+            if up_tx.send(out).await.is_err() {
+                break;
+            }
+        }
+    };
+    let to_client = async {
+        while let Some(Ok(msg)) = up_rx.next().await {
+            let out = match msg {
+                TMessage::Text(t) => Message::Text(t.to_string().into()),
+                TMessage::Binary(b) => Message::Binary(b.into()),
+                TMessage::Ping(p) => Message::Ping(p.into()),
+                TMessage::Pong(p) => Message::Pong(p.into()),
+                TMessage::Close(_) => break,
+                TMessage::Frame(_) => continue,
+            };
+            if cli_tx.send(out).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        _ = to_upstream => {}
+        _ = to_client => {}
+    }
+}
+
+fn bad_gateway(message: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(message.to_string()))
+        .expect("response builder")
+}
+
+/// `GET /dsh` and `/dsh/…` — the DeepSeek Harness UI, served through amux so a
+/// phone can reach it. dsh itself refuses to bind anything but localhost
+/// (it would expose remote code execution), so this is the only way in.
+async fn serve_dsh_ui(uri: Uri) -> Response<Body> {
+    if !crate::serve::dsh::available() {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(
+                "<!doctype html><meta charset=utf-8>\
+                 <body style=\"font:16px system-ui;padding:2rem;line-height:1.6\">\
+                 <h3>DeepSeek Harness 没有运行</h3>\
+                 <p>在电脑上执行 <code>dsh web</code> 后刷新本页。</p>",
+            ))
+            .expect("response builder");
+    }
+    // Everything under /dsh/ maps to the same page: the UI is a SPA and does
+    // its own routing. Its assets are absolute and handled by the fallback.
+    let root: Uri = "/".parse().expect("static uri");
+    let _ = uri;
+    proxy_to_dsh(reqwest::Method::GET, &root, Vec::new(), Vec::new()).await
+}
+
+async fn serve_webui(
+    method: axum::http::Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    // The dsh UI is mounted under /dsh/, but its HTML, plugin manifest and RPC
+    // calls all use absolute paths from the origin root. Those land here — the
+    // dotted `/api/session.list` shape never matches one of amux's own slashed
+    // routes — and are forwarded to `dsh web` rather than 404ing against the
+    // bundled client.
+    if crate::serve::dsh::available() && crate::serve::dsh::owns_path(uri.path()) {
+        let fwd: Vec<(String, String)> = headers
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
+            .collect();
+        let m = reqwest::Method::from_bytes(method.as_str().as_bytes())
+            .unwrap_or(reqwest::Method::GET);
+        return proxy_to_dsh(m, &uri, fwd, body.to_vec()).await;
+    }
+
     let raw = uri.path().trim_start_matches('/');
     let path = if raw.is_empty() { "index.html" } else { raw };
     let (contents, ctype) = match WEBUI.get_file(path) {
@@ -478,6 +644,19 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         .route("/api/files/download", get(api_files_download))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/resume", post(api_sessions_resume))
+        // The DeepSeek Harness UI, proxied so a phone can reach it: dsh binds
+        // localhost only and refuses otherwise, since it would expose remote
+        // code execution. Its own API calls are dotted (`/api/session.list`)
+        // where amux's are slashed (`/api/session/kill`), so they never
+        // collide — the dotted ones fall through to the proxying fallback.
+        .route("/dsh", get(serve_dsh_ui))
+        .route("/dsh/", get(serve_dsh_ui))
+        .route("/dsh/{*rest}", get(serve_dsh_ui))
+        // dsh's live-event sockets. Named routes rather than a fallback
+        // branch: an upgrade request needs the WebSocketUpgrade extractor,
+        // which the byte-body fallback can't provide.
+        .route("/api/events.mux", get(dsh_events_ws))
+        .route("/api/events.host", get(dsh_events_ws))
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
         .route("/api/cron/jobs/running", get(api_cron_running))

@@ -30,6 +30,9 @@ futures-util = "0.3"
 portable-pty = "0.9"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 include_dir = "0.7"
+# WebSocket *client*, for proxying dsh's live-event streams (axum's `ws`
+# feature is server-side only).
+tokio-tungstenite = "0.24"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # Optional — only pulled in by the `full` feature (agent-port host build).
