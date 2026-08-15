@@ -2324,6 +2324,7 @@ fn build_snapshot() -> Snapshot {
 
     let mut panes: Vec<Pane> = panes;
     append_herdr_panes(&mut panes, &now);
+    append_dsh_panes(&mut panes, &now);
 
     Snapshot {
         ok: true,
@@ -2388,6 +2389,67 @@ fn append_herdr_panes(panes: &mut Vec<Pane>, now: &str) {
             pid: None,
             title: b.title,
             tail: b.tail,
+            status,
+            reason,
+            updated_at: now.to_string(),
+            activity_age_secs: None,
+            messages,
+        });
+    }
+}
+
+/// Surface DeepSeek Harness sessions alongside the rmux panes.
+///
+/// Like herdr, dsh reports state structurally, so these panes skip the
+/// terminal heuristics entirely. Enabled automatically when a `dsh web` server
+/// answers on its port; a missing one contributes nothing.
+fn append_dsh_panes(panes: &mut Vec<Pane>, now: &str) {
+    if !crate::serve::dsh::available() {
+        return;
+    }
+    for b in crate::serve::dsh::collect() {
+        // dsh gives a boolean, not a state machine: a turn is either being
+        // produced or it isn't. Waiting/Failed have no counterpart here.
+        let status = if b.running {
+            PaneStatus::Running
+        } else {
+            PaneStatus::Idle
+        };
+        let reason = format!("dsh: {} · {} 轮", b.preset, b.turns);
+        PANE_STATUS_CACHE
+            .lock()
+            .expect("pane status cache mutex poisoned")
+            .insert(b.id.clone(), status.clone());
+
+        let tail = crate::serve::dsh::tail(&b.id);
+        let base = BasePane {
+            id: b.id.clone(),
+            target: b.id.clone(),
+            session: b.session.clone(),
+            window_index: String::new(),
+            window_name: String::new(),
+            pane_index: String::new(),
+            command: "dsh".to_string(),
+            path: b.cwd.clone(),
+            active: false,
+            pid: None,
+            title: b.title.clone(),
+        };
+        let messages = interaction_messages_for_pane(&base, &tail, &status, &reason, now);
+
+        panes.push(Pane {
+            id: b.id,
+            target: base.target,
+            session: b.session,
+            window_index: base.window_index,
+            window_name: base.window_name,
+            pane_index: base.pane_index,
+            command: base.command,
+            path: b.cwd,
+            active: false,
+            pid: None,
+            title: b.title,
+            tail,
             status,
             reason,
             updated_at: now.to_string(),
@@ -2695,6 +2757,8 @@ static CAPABILITIES: LazyLock<serde_json::Value> = LazyLock::new(|| {
             // nothing.
             "enabled": crate::serve::herdr::enabled(),
         },
+        // dsh needs no flag: it is included whenever its web server answers.
+        "dsh": crate::serve::dsh::available(),
         // Compiled-in feature set: the control-center / screenshot / push
         // endpoints only exist in `--features full` builds.
         "full": cfg!(feature = "full"),
@@ -3271,6 +3335,28 @@ fn flush_pending_messages(state: &AppState, panes: &[Pane]) {
             continue;
         }
 
+        // dsh sessions likewise: its API takes the whole prompt at once, so
+        // there is no separate submit keystroke to replay.
+        if crate::serve::dsh::owns(&pane.id) {
+            if let Err(error) = crate::serve::dsh::send(&pane.id, &message.text) {
+                eprintln!("[pending] dsh send failed for {}: {error}; re-queued", pane.id);
+                PENDING_MESSAGES
+                    .lock()
+                    .expect("pending messages mutex poisoned")
+                    .entry(pane.id.clone())
+                    .or_default()
+                    .insert(0, message);
+                continue;
+            }
+            PENDING_FLUSH_AT
+                .lock()
+                .expect("pending flush mutex poisoned")
+                .insert(pane.id.clone(), Instant::now());
+            request_pane_log_refresh_burst(state, &pane.id);
+            eprintln!("[pending] delivered queued message to {}", pane.id);
+            continue;
+        }
+
         exit_tmux_copy_mode(&pane.id);
         if message.vim_mode {
             let _ = send_key_parts(&pane.id, &["C-[", "i"]);
@@ -3437,6 +3523,21 @@ async fn api_send(
             Ok(()) => {
                 schedule_snapshot_refresh_soon(&state);
                 json_response(StatusCode::OK, json!({ "ok": true, "backend": "herdr" }))
+            }
+            Err(error) => json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({ "ok": false, "error": error }),
+            ),
+        };
+    }
+
+    // Same for dsh: its sessions live in its own server, not in rmux. There is
+    // no separate submit key — a prompt is complete when it is sent.
+    if crate::serve::dsh::owns(&body.pane_id) {
+        return match crate::serve::dsh::send(&body.pane_id, &body.text) {
+            Ok(()) => {
+                schedule_snapshot_refresh_soon(&state);
+                json_response(StatusCode::OK, json!({ "ok": true, "backend": "dsh" }))
             }
             Err(error) => json_response(
                 StatusCode::BAD_GATEWAY,

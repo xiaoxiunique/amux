@@ -8,6 +8,7 @@
     unused_assignments
 )]
 pub mod cron;
+pub mod dsh;
 pub mod files;
 pub mod herdr;
 pub mod sessions;
