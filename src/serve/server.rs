@@ -3226,7 +3226,15 @@ async fn api_pane_context(
     };
 
     let lines = context_line_count(query.get("lines"));
-    let tail = capture_pane_lines(pane_id, lines);
+    // dsh panes have no terminal behind them, so `capture-pane` on their id
+    // returns nothing and the detail view renders blank even though the
+    // snapshot carries a full transcript. Read it from the same place the
+    // snapshot does.
+    let tail = if crate::serve::dsh::owns(pane_id) {
+        crate::serve::dsh::tail(pane_id)
+    } else {
+        capture_pane_lines(pane_id, lines)
+    };
     json_response(
         StatusCode::OK,
         json!({
