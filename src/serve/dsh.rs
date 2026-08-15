@@ -496,7 +496,11 @@ pub fn owns_path(path: &str) -> bool {
         || path == "/manifest.webmanifest"
 }
 
-/// Forward one request to `dsh web` and return its response verbatim.
+/// Forward one request to `dsh web` and return its response for streaming.
+///
+/// The body is deliberately *not* buffered: `/api/events.*` are Server-Sent
+/// Event streams that never end, so reading them to completion would hang the
+/// request forever and leave the UI stuck retrying.
 ///
 /// The Origin header is rewritten to dsh's own address: it guards `/api` with
 /// a browser-trust fence that rejects any other origin, and a WebView loading
@@ -506,7 +510,7 @@ pub async fn proxy(
     path_and_query: &str,
     headers: &[(String, String)],
     body: Vec<u8>,
-) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+) -> Result<(u16, Vec<(String, String)>, reqwest::Response), String> {
     let base = base_url();
     let url = format!("{base}{path_and_query}");
 
@@ -521,13 +525,26 @@ pub async fn proxy(
         // Hop-by-hop and identity headers must not be forwarded as-is.
         if matches!(
             lower.as_str(),
-            "host" | "origin" | "referer" | "connection" | "content-length" | "accept-encoding"
+            "host"
+                | "origin"
+                | "referer"
+                | "connection"
+                | "content-length"
+                | "accept-encoding"
+                | "sec-fetch-site"
         ) {
             continue;
         }
         req = req.header(k, v);
     }
-    req = req.header("Origin", &base).header("Referer", format!("{base}/"));
+    // All three must agree or the trust check rejects the request: Host must
+    // be loopback, Origin's host must equal it, and Sec-Fetch-Site must not
+    // say cross-site (the browser sets that when it sees amux's origin).
+    req = req
+        .header("Host", authority())
+        .header("Origin", &base)
+        .header("Referer", format!("{base}/"))
+        .header("Sec-Fetch-Site", "same-origin");
     if !body.is_empty() {
         req = req.body(body);
     }
@@ -545,8 +562,7 @@ pub async fn proxy(
         })
         .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.to_string(), v.to_string())))
         .collect();
-    let bytes = res.bytes().await.map_err(|e| e.to_string())?.to_vec();
-    Ok((status, out_headers, bytes))
+    Ok((status, out_headers, res))
 }
 
 #[cfg(test)]
@@ -566,13 +582,25 @@ mod proxy_tests {
     }
 }
 
-/// `ws://…` form of the dsh base address, for proxying its event streams.
+
+
+/// `ws://…` form of the dsh base address.
 pub fn ws_base() -> String {
-    base_url().replacen("http://", "ws://", 1).replacen("https://", "wss://", 1)
+    base_url()
+        .replacen("http://", "ws://", 1)
+        .replacen("https://", "wss://", 1)
 }
 
-/// Origin header value dsh's trust fence accepts.
-pub fn origin_header() -> reqwest::header::HeaderValue {
-    reqwest::header::HeaderValue::from_str(&base_url())
-        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(DEFAULT_BASE))
+/// Authority (`host:port`) dsh expects to see.
+///
+/// Its trust check requires all three of: a loopback `Host`, a non-`cross-site`
+/// `Sec-Fetch-Site`, and — when present — an `Origin` whose host *equals* that
+/// `Host`. Rewriting only one of them fails the equality test, which is what
+/// silently closed the first attempt at the event sockets.
+pub fn authority() -> String {
+    base_url()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_string()
 }

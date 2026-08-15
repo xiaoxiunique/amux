@@ -422,21 +422,24 @@ async fn proxy_to_dsh(
         .unwrap_or_else(|| uri.path().to_string());
 
     match crate::serve::dsh::proxy(method, &target, &headers, body).await {
-        Ok((status, out_headers, bytes)) => {
+        Ok((status, out_headers, upstream)) => {
             let mut builder = Response::builder()
                 .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY));
             for (k, v) in out_headers {
                 builder = builder.header(k, v);
             }
+            // Stream rather than buffer: /api/events.* are endless SSE feeds
+            // carrying dsh's live session state, and collecting them would
+            // never return.
             builder
-                .body(Body::from(bytes))
+                .body(Body::from_stream(upstream.bytes_stream()))
                 .unwrap_or_else(|_| bad_gateway("malformed dsh response"))
         }
         Err(error) => bad_gateway(&error),
     }
 }
 
-/// Upgrade handler for dsh's `/api/events.*` streams.
+/// Upgrade handler for dsh's `/api/events.*` live-state streams.
 async fn dsh_events_ws(ws: WebSocketUpgrade, uri: Uri) -> Response<Body> {
     if !crate::serve::dsh::available() {
         return bad_gateway("dsh is not running");
@@ -449,32 +452,40 @@ async fn dsh_events_ws(ws: WebSocketUpgrade, uri: Uri) -> Response<Body> {
         .into_response()
 }
 
-/// Bridge a browser WebSocket to the matching one on `dsh web`.
+/// Pipe one of dsh's event sockets through to the browser.
 ///
-/// dsh streams live session state over `/api/events.*`; without this the UI
-/// loads but never fills in — it retries the connection forever and shows an
-/// empty workspace.
+/// Strictly one-way. dsh closes the socket with 1008 "downlink only" the
+/// moment a client sends anything, so nothing from the browser — not even a
+/// ping — may be forwarded upstream.
 async fn proxy_ws_to_dsh(socket: WebSocket, path_and_query: String) {
     use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message as TMessage;
 
-    let base = crate::serve::dsh::ws_base();
-    let url = format!("{base}{path_and_query}");
+    let url = format!("{}{}", crate::serve::dsh::ws_base(), path_and_query);
+    let authority = crate::serve::dsh::authority();
 
-    // dsh applies the same origin fence to the upgrade request.
-    let request = match tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str()) {
-        Ok(mut r) => {
-            r.headers_mut().insert(
-                "Origin",
-                crate::serve::dsh::origin_header(),
-            );
-            r
-        }
+    let mut request = match url.as_str().into_client_request() {
+        Ok(r) => r,
         Err(error) => {
             eprintln!("[dsh] bad ws url {url}: {error}");
             return;
         }
     };
+    {
+        // Same trust triple as the HTTP proxy: loopback Host, matching Origin,
+        // and a Sec-Fetch-Site that isn't cross-site.
+        let h = request.headers_mut();
+        for (name, value) in [
+            ("Host", authority.clone()),
+            ("Origin", format!("http://{authority}")),
+            ("Sec-Fetch-Site", "same-origin".to_string()),
+        ] {
+            if let Ok(v) = value.parse() {
+                h.insert(name, v);
+            }
+        }
+    }
 
     let (upstream, _) = match tokio_tungstenite::connect_async(request).await {
         Ok(pair) => pair,
@@ -484,25 +495,14 @@ async fn proxy_ws_to_dsh(socket: WebSocket, path_and_query: String) {
         }
     };
 
-    let (mut up_tx, mut up_rx) = upstream.split();
+    let (_up_tx, mut up_rx) = upstream.split();
     let (mut cli_tx, mut cli_rx) = socket.split();
 
-    // Either direction closing ends the pair.
-    let to_upstream = async {
-        while let Some(Ok(msg)) = cli_rx.next().await {
-            let out = match msg {
-                Message::Text(t) => TMessage::Text(t.to_string()),
-                Message::Binary(b) => TMessage::Binary(b.to_vec()),
-                Message::Ping(p) => TMessage::Ping(p.to_vec()),
-                Message::Pong(p) => TMessage::Pong(p.to_vec()),
-                Message::Close(_) => break,
-            };
-            if up_tx.send(out).await.is_err() {
-                break;
-            }
-        }
-    };
-    let to_client = async {
+    // Drain the browser side without forwarding, so a client close still ends
+    // the pair but a stray frame never reaches dsh.
+    let watch_client = async { while let Some(Ok(_)) = cli_rx.next().await {} };
+
+    let downlink = async {
         while let Some(Ok(msg)) = up_rx.next().await {
             let out = match msg {
                 TMessage::Text(t) => Message::Text(t.to_string().into()),
@@ -519,8 +519,8 @@ async fn proxy_ws_to_dsh(socket: WebSocket, path_and_query: String) {
     };
 
     tokio::select! {
-        _ = to_upstream => {}
-        _ = to_client => {}
+        _ = watch_client => {}
+        _ = downlink => {}
     }
 }
 
@@ -649,14 +649,12 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         // code execution. Its own API calls are dotted (`/api/session.list`)
         // where amux's are slashed (`/api/session/kill`), so they never
         // collide — the dotted ones fall through to the proxying fallback.
+        // dsh's live-state sockets, which its UI needs to fill in at all.
+        .route("/api/events.mux", get(dsh_events_ws))
+        .route("/api/events.host", get(dsh_events_ws))
         .route("/dsh", get(serve_dsh_ui))
         .route("/dsh/", get(serve_dsh_ui))
         .route("/dsh/{*rest}", get(serve_dsh_ui))
-        // dsh's live-event sockets. Named routes rather than a fallback
-        // branch: an upgrade request needs the WebSocketUpgrade extractor,
-        // which the byte-body fallback can't provide.
-        .route("/api/events.mux", get(dsh_events_ws))
-        .route("/api/events.host", get(dsh_events_ws))
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
         .route("/api/cron/jobs/running", get(api_cron_running))
