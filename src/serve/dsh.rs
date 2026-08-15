@@ -521,7 +521,16 @@ pub async fn spawn_forwarder(host: &str, listen_port: u16) {
         }
     };
     RELAY_PORT.store(listen_port, Ordering::Relaxed);
-    println!("dsh UI relayed on port {listen_port} -> {target}");
+    let tls = tls_config();
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    println!("dsh UI relayed on port {listen_port} ({scheme}) -> {target}");
+    if tls.is_none() && host != "127.0.0.1" && host != "localhost" {
+        // Worth saying plainly: without TLS the UI simply will not work from
+        // another device, because the browser blocks its WebSocket.
+        println!("  no TLS cert in ~/.amux/dsh-{{cert,key}}.pem — the UI will only");
+        println!("  work over loopback; browsers block WebSockets from a plain-HTTP");
+        println!("  page on any other address");
+    }
     if host != "127.0.0.1" && host != "localhost" {
         println!("  note: unauthenticated, and dsh can run code — trusted networks only");
     }
@@ -531,7 +540,22 @@ pub async fn spawn_forwarder(host: &str, listen_port: u16) {
             continue;
         };
         let target = target.clone();
-        tokio::spawn(relay_connection(inbound, target));
+        match tls.clone() {
+            Some(cfg) => {
+                tokio::spawn(async move {
+                    let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
+                    match acceptor.accept(inbound).await {
+                        Ok(stream) => relay_stream(stream, target).await,
+                        // A failed handshake is usually a probe or a client
+                        // that gave up; nothing to report.
+                        Err(_) => {}
+                    }
+                });
+            }
+            None => {
+                tokio::spawn(relay_connection(inbound, target));
+            }
+        }
     }
 }
 
@@ -545,9 +569,17 @@ pub async fn spawn_forwarder(host: &str, listen_port: u16) {
 /// Everything else is copied untouched, and the moment a connection upgrades
 /// (WebSocket) it becomes a plain byte pipe again.
 async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
+    relay_stream(inbound, target).await
+}
+
+/// Same relay over any stream, so a TLS-wrapped connection reuses it verbatim.
+async fn relay_stream<S>(inbound: S, target: String)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-    let (client_read, client_write) = inbound.into_split();
+    let (client_read, client_write) = tokio::io::split(inbound);
 
     // Both the proxied responses and the relay's own replies go to the same
     // socket, so they share it under a lock.
@@ -825,7 +857,7 @@ fn split_request_line(line: &str) -> (&str, &str) {
 
 /// Write a complete, self-contained HTTP response to the client.
 async fn write_simple(
-    sink: &std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    sink: &std::sync::Arc<tokio::sync::Mutex<impl tokio::io::AsyncWrite + Unpin>>,
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
@@ -838,4 +870,58 @@ async fn write_simple(
     let mut w = sink.lock().await;
     w.write_all(head.as_bytes()).await?;
     w.write_all(body).await
+}
+
+/// Where the relay looks for a TLS certificate.
+///
+/// Browsers refuse to open a WebSocket from a page served over plain HTTP on
+/// anything but a loopback address — which is exactly how the phone reaches
+/// this. Serving the relay over TLS is the only way the dsh UI works off this
+/// machine at all.
+///
+/// A Tailscale-issued certificate is used when one is present: it is publicly
+/// trusted, so nothing has to be installed on the phone. Obtain one with:
+///
+/// ```text
+/// tailscale cert --cert-file ~/.amux/dsh-cert.pem \
+///                --key-file  ~/.amux/dsh-key.pem  <machine>.<tailnet>.ts.net
+/// ```
+fn tls_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let dir = dirs::home_dir()?.join(".amux");
+    let cert = dir.join("dsh-cert.pem");
+    let key = dir.join("dsh-key.pem");
+    (cert.is_file() && key.is_file()).then_some((cert, key))
+}
+
+/// True when the relay will serve HTTPS.
+pub fn tls_enabled() -> bool {
+    tls_paths().is_some()
+}
+
+/// Load the certificate into a rustls config.
+fn tls_config() -> Option<std::sync::Arc<tokio_rustls::rustls::ServerConfig>> {
+    let (cert_path, key_path) = tls_paths()?;
+
+    // rustls refuses to pick a backend on its own when more than one could
+    // apply. reqwest already pulls in ring, so name it explicitly.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    });
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(
+        std::fs::File::open(&cert_path).ok()?,
+    ))
+    .collect::<Result<_, _>>()
+    .ok()?;
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        std::fs::File::open(&key_path).ok()?,
+    ))
+    .ok()??;
+
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .ok()?;
+    Some(std::sync::Arc::new(config))
 }

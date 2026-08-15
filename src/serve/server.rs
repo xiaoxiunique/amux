@@ -2763,6 +2763,9 @@ static CAPABILITIES: LazyLock<serde_json::Value> = LazyLock::new(|| {
         "dsh": {
             "available": crate::serve::dsh::available(),
             "relayPort": crate::serve::dsh::relay_port(),
+            // Browsers only allow a WebSocket from a plain-HTTP page on
+            // loopback, so the client has to know which scheme to use.
+            "relayTls": crate::serve::dsh::tls_enabled(),
         },
         // Compiled-in feature set: the control-center / screenshot / push
         // endpoints only exist in `--features full` builds.
@@ -2794,6 +2797,7 @@ async fn api_capabilities(
     // The relay binds after the cached probe, so this would otherwise be null.
     if let Some(d) = body.get_mut("dsh").and_then(|d| d.as_object_mut()) {
         d.insert("relayPort".to_string(), json!(crate::serve::dsh::relay_port()));
+        d.insert("relayTls".to_string(), json!(crate::serve::dsh::tls_enabled()));
     }
     json_response(StatusCode::OK, json!({ "ok": true, "capabilities": body }))
 }

@@ -30,6 +30,11 @@ futures-util = "0.3"
 portable-pty = "0.9"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 include_dir = "0.7"
+# TLS for the dsh relay. Browsers refuse to open a WebSocket from a page
+# served over plain HTTP on a non-loopback address, so the relay has to
+# terminate TLS itself.
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # Optional — only pulled in by the `full` feature (agent-port host build).
