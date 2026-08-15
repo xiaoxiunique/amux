@@ -79,7 +79,7 @@ pub enum Command {
         /// Port for the DeepSeek Harness UI relay (default: this port + 1).
         /// Starts automatically when a `dsh web` is running, since dsh binds
         /// loopback only and a phone cannot reach it otherwise. Pass 0 to
-        /// disable. Pair with `dsh web --trusted-host <address>`.
+        /// disable.
         #[arg(long, value_name = "PORT")]
         dsh_port: Option<u16>,
     },

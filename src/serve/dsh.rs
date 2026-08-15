@@ -496,27 +496,19 @@ pub fn relay_port() -> Option<u16> {
     }
 }
 
-/// Relay `<host>:<listen_port>` to the dsh server, byte for byte.
+/// Relay `<host>:<listen_port>` to the dsh server.
 ///
 /// dsh binds loopback only and rejects `--host 0.0.0.0` outright, so a phone
-/// cannot reach its UI. This carries the bytes across without interpreting
-/// them: no HTTP parsing, no header rewriting, no WebSocket framing. Whatever
-/// dsh's client and server say to each other keeps working when they change it.
-///
-/// The one thing dsh must be told is which outside authority to trust:
-///
-/// ```text
-/// dsh web --trusted-host 192.168.1.234
-/// ```
-///
-/// Without that its browser-trust fence rejects `/api` calls whose Host isn't
-/// loopback. Rewriting the headers to fake that check is possible but couples
-/// amux to dsh's internals; the flag is the supported way in.
+/// cannot reach its UI. Everything is copied through untouched except `Host`
+/// and `Origin`, which are pointed at dsh's own address — see
+/// [`relay_connection`]. That keeps `--trusted-host` off the user's plate: the
+/// relay works from a LAN address, a Tailscale address or anything else,
+/// without a flag to update every time the network changes.
 ///
 /// # Exposure
 ///
 /// This does what dsh declines to do for you — its UI can run arbitrary code,
-/// and a byte relay has no authentication of its own, so amux's `--token` does
+/// and the relay has no authentication of its own, so amux's `--token` does
 /// not cover it. It binds the same host `amux serve` does, so
 /// `amux serve --host 127.0.0.1` keeps it local too.
 pub async fn spawn_forwarder(host: &str, listen_port: u16) {
@@ -533,19 +525,105 @@ pub async fn spawn_forwarder(host: &str, listen_port: u16) {
     if host != "127.0.0.1" && host != "localhost" {
         println!("  note: unauthenticated, and dsh can run code — trusted networks only");
     }
-    println!("  dsh must allow it: dsh web --trusted-host <this machine's address>");
 
     loop {
-        let Ok((mut inbound, _)) = listener.accept().await else {
+        let Ok((inbound, _)) = listener.accept().await else {
             continue;
         };
         let target = target.clone();
-        tokio::spawn(async move {
-            let Ok(mut outbound) = tokio::net::TcpStream::connect(&target).await else {
+        tokio::spawn(relay_connection(inbound, target));
+    }
+}
+
+/// Carry one connection, rewriting only `Host` and `Origin` on the way up.
+///
+/// dsh accepts an `/api` call when the Host is loopback (or listed with
+/// `--trusted-host`), and when any Origin present agrees with it. Pointing both
+/// at dsh's own address means the relay works from any client address —
+/// LAN, Tailscale, whatever — with no flags to keep in sync.
+///
+/// Everything else is copied untouched, and the moment a connection upgrades
+/// (WebSocket) it becomes a plain byte pipe again.
+async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
+        return;
+    };
+    let (client_read, mut client_write) = inbound.into_split();
+    let (mut server_read, mut server_write) = outbound.into_split();
+
+    // Downstream never needs touching.
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
+    });
+
+    let mut reader = BufReader::new(client_read);
+    loop {
+        // --- request line + headers ---
+        let mut head = Vec::new();
+        let mut upgrading = false;
+        let mut content_length = 0usize;
+        let mut chunked = false;
+
+        loop {
+            let mut line = Vec::new();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) => return, // client hung up
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            let is_blank = line == b"\r\n" || line == b"\n";
+            let lower = String::from_utf8_lossy(&line).to_ascii_lowercase();
+
+            if lower.starts_with("host:") {
+                head.extend_from_slice(format!("Host: {target}\r\n").as_bytes());
+            } else if lower.starts_with("origin:") {
+                head.extend_from_slice(format!("Origin: http://{target}\r\n").as_bytes());
+            } else if lower.starts_with("sec-fetch-site:") {
+                // A cross-site marker is refused outright; after the rewrite
+                // above the request genuinely is same-origin.
+                head.extend_from_slice(b"Sec-Fetch-Site: same-origin\r\n");
+            } else {
+                if lower.starts_with("upgrade:") {
+                    upgrading = true;
+                } else if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
+                    chunked = true;
+                }
+                head.extend_from_slice(&line);
+            }
+            if is_blank {
+                break;
+            }
+        }
+
+        if server_write.write_all(&head).await.is_err() {
+            return;
+        }
+
+        // --- body ---
+        if chunked {
+            // Rare from this client, and framing it wrongly would corrupt the
+            // stream; hand the rest over verbatim instead.
+            let _ = tokio::io::copy(&mut reader, &mut server_write).await;
+            return;
+        }
+        if content_length > 0 {
+            let mut body = vec![0u8; content_length];
+            if reader.read_exact(&mut body).await.is_err() {
                 return;
-            };
-            // Ignore the result: a peer hanging up is the normal way this ends.
-            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-        });
+            }
+            if server_write.write_all(&body).await.is_err() {
+                return;
+            }
+        }
+
+        if upgrading {
+            // Past the handshake this is no longer HTTP.
+            let _ = tokio::io::copy(&mut reader, &mut server_write).await;
+            return;
+        }
     }
 }
