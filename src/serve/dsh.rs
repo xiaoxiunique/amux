@@ -550,13 +550,30 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
     let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
         return;
     };
-    let (client_read, mut client_write) = inbound.into_split();
+    let (client_read, client_write) = inbound.into_split();
     let (mut server_read, mut server_write) = outbound.into_split();
 
-    // Downstream never needs touching.
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
-    });
+    // Downstream needs no changes, but the relay also writes its own replies,
+    // so both share the socket under a lock.
+    let client_out = std::sync::Arc::new(tokio::sync::Mutex::new(client_write));
+    {
+        let sink = client_out.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match server_read.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        let mut w = sink.lock().await;
+                        if w.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let mut client_out = client_out;
 
     let mut reader = BufReader::new(client_read);
     loop {
@@ -565,6 +582,7 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
         let mut upgrading = false;
         let mut content_length = 0usize;
         let mut chunked = false;
+        let mut request_line = String::new();
 
         loop {
             let mut line = Vec::new();
@@ -572,6 +590,9 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
                 Ok(0) => return, // client hung up
                 Ok(_) => {}
                 Err(_) => return,
+            }
+            if request_line.is_empty() {
+                request_line = String::from_utf8_lossy(&line).trim().to_string();
             }
             let is_blank = line == b"\r\n" || line == b"\n";
             let lower = String::from_utf8_lossy(&line).to_ascii_lowercase();
@@ -597,6 +618,45 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
             if is_blank {
                 break;
             }
+        }
+
+        // Two paths the relay answers itself.
+        let (method, path) = split_request_line(&request_line);
+        if path.starts_with(UI_STATE_PATH) {
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            if method == "POST" {
+                save_ui_state(&String::from_utf8_lossy(&body));
+                if write_simple(&mut client_out, "application/json", b"{\"ok\":true}")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            } else {
+                let state = load_ui_state();
+                if write_simple(&mut client_out, "application/json", state.as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            continue;
+        }
+        if method == "GET" && (path == "/" || path == "/index.html") {
+            if let Some(html) = injected_index().await {
+                if write_simple(&mut client_out, "text/html; charset=utf-8", &html)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
+            // Injection failed (dsh restarting?) — fall through and proxy it.
         }
 
         if server_write.write_all(&head).await.is_err() {
@@ -626,4 +686,135 @@ async fn relay_connection(inbound: tokio::net::TcpStream, target: String) {
             return;
         }
     }
+}
+
+/// Path the relay answers itself, for sharing UI state across origins.
+///
+/// Served from the relay's own port so the page can call it without CORS.
+const UI_STATE_PATH: &str = "/__amux/dsh-ui-state";
+
+fn ui_state_file() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".amux").join("dsh-ui-state.json"))
+}
+
+fn load_ui_state() -> String {
+    ui_state_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .filter(|s| s.trim_start().starts_with('{'))
+        .unwrap_or_else(|| "{}".to_string())
+}
+
+fn save_ui_state(body: &str) {
+    // Only accept a JSON object; anything else would break the page on load.
+    if !body.trim_start().starts_with('{') {
+        return;
+    }
+    if let Some(p) = ui_state_file() {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, body);
+    }
+}
+
+/// Script injected into dsh's page so every origin sees the same UI state.
+///
+/// dsh keeps "which session am I looking at", per-session drafts and the
+/// sidebar layout in localStorage, which browsers scope per origin — so the
+/// same dsh reached at `127.0.0.1:3080` and at a Tailscale address behaves
+/// like two installs. The session data itself is server-side and was always
+/// shared; only this view state was not.
+///
+/// The stored state is embedded rather than fetched: the script then runs
+/// synchronously ahead of dsh's bundle, so the app reads the restored values
+/// instead of racing them.
+fn injection(state: &str) -> String {
+    format!(
+        r#"<script>(function(){{
+try {{
+  var shared = {state};
+  for (var k in shared) {{ try {{ localStorage.setItem(k, shared[k]); }} catch (e) {{}} }}
+}} catch (e) {{}}
+var timer = null;
+function push() {{
+  var out = {{}};
+  for (var i = 0; i < localStorage.length; i++) {{
+    var k = localStorage.key(i);
+    if (k && k.indexOf('dsh.') === 0) out[k] = localStorage.getItem(k);
+  }}
+  fetch('{UI_STATE_PATH}', {{
+    method: 'POST',
+    headers: {{ 'content-type': 'application/json' }},
+    body: JSON.stringify(out)
+  }}).catch(function () {{}});
+}}
+var origSet = localStorage.setItem.bind(localStorage);
+localStorage.setItem = function (k, v) {{
+  origSet(k, v);
+  // Coalesce: dsh writes several keys per interaction.
+  if (String(k).indexOf('dsh.') === 0) {{
+    clearTimeout(timer);
+    timer = setTimeout(push, 400);
+  }}
+}};
+}})();</script>"#
+    )
+}
+
+/// Fetch dsh's root document and return it with the sync script inserted.
+async fn injected_index() -> Option<Vec<u8>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let base = base_url();
+    let html = client
+        .get(&base)
+        .header("Host", authority())
+        .header("Origin", &base)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+
+    // Right after <head> so it precedes every script dsh loads.
+    let script = injection(&load_ui_state());
+    let out = match html.find("<head>") {
+        Some(i) => {
+            let mut s = String::with_capacity(html.len() + script.len());
+            s.push_str(&html[..i + 6]);
+            s.push_str(&script);
+            s.push_str(&html[i + 6..]);
+            s
+        }
+        // No <head> means dsh restructured its shell; serve it unchanged
+        // rather than guessing where the script belongs.
+        None => html,
+    };
+    Some(out.into_bytes())
+}
+
+/// `("GET", "/path")` from a request line, empty on anything malformed.
+fn split_request_line(line: &str) -> (&str, &str) {
+    let mut parts = line.split(' ');
+    (parts.next().unwrap_or(""), parts.next().unwrap_or(""))
+}
+
+/// Write a complete, self-contained HTTP response to the client.
+async fn write_simple(
+    sink: &mut std::sync::Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nConnection: keep-alive\r\n\r\n",
+        body.len()
+    );
+    let mut w = sink.lock().await;
+    w.write_all(head.as_bytes()).await?;
+    w.write_all(body).await
 }
