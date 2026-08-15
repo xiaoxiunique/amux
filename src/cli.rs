@@ -76,10 +76,10 @@ pub enum Command {
         /// alongside the rmux sessions.
         #[arg(long)]
         herdr: bool,
-        /// Relay the DeepSeek Harness UI on this port so a phone can open it.
-        /// dsh binds loopback only; pair this with
-        /// `dsh web --trusted-host <address>`. The relay is unauthenticated
-        /// and dsh can run arbitrary code — use it only on a trusted network.
+        /// Port for the DeepSeek Harness UI relay (default: this port + 1).
+        /// Starts automatically when a `dsh web` is running, since dsh binds
+        /// loopback only and a phone cannot reach it otherwise. Pass 0 to
+        /// disable. Pair with `dsh web --trusted-host <address>`.
         #[arg(long, value_name = "PORT")]
         dsh_port: Option<u16>,
     },

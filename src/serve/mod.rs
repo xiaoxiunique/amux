@@ -124,8 +124,14 @@ pub fn serve(
         }
         let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
         rt.block_on(async {
-            if let Some(p) = dsh_port {
-                tokio::spawn(dsh::spawn_forwarder(p));
+            // Auto-enable when a `dsh web` answers: the relay is the only way a
+            // phone can reach it, since dsh binds loopback and refuses
+            // otherwise. Defaults to the port above amux's; --dsh-port 0 opts
+            // out entirely.
+            let relay = dsh_port.unwrap_or(port.saturating_add(1));
+            if relay != 0 && dsh::available() {
+                let host = host.to_string();
+                tokio::spawn(async move { dsh::spawn_forwarder(&host, relay).await });
             }
             server::run_server(host, port, token).await
         });

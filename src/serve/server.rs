@@ -2758,7 +2758,12 @@ static CAPABILITIES: LazyLock<serde_json::Value> = LazyLock::new(|| {
             "enabled": crate::serve::herdr::enabled(),
         },
         // dsh needs no flag: it is included whenever its web server answers.
-        "dsh": crate::serve::dsh::available(),
+        // `relayPort` is where its UI is reachable from outside this machine —
+        // the client builds a URL from it and its own host.
+        "dsh": {
+            "available": crate::serve::dsh::available(),
+            "relayPort": crate::serve::dsh::relay_port(),
+        },
         // Compiled-in feature set: the control-center / screenshot / push
         // endpoints only exist in `--features full` builds.
         "full": cfg!(feature = "full"),
@@ -2785,6 +2790,10 @@ async fn api_capabilities(
             "enabled".to_string(),
             json!(crate::serve::herdr::enabled()),
         );
+    }
+    // The relay binds after the cached probe, so this would otherwise be null.
+    if let Some(d) = body.get_mut("dsh").and_then(|d| d.as_object_mut()) {
+        d.insert("relayPort".to_string(), json!(crate::serve::dsh::relay_port()));
     }
     json_response(StatusCode::OK, json!({ "ok": true, "capabilities": body }))
 }

@@ -485,7 +485,18 @@ fn authority() -> String {
         .to_string()
 }
 
-/// Relay `0.0.0.0:<listen_port>` to the dsh server, byte for byte.
+/// Port the relay ended up on, for clients to discover via /api/capabilities.
+static RELAY_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// The relay's port, or `None` when it isn't running.
+pub fn relay_port() -> Option<u16> {
+    match RELAY_PORT.load(Ordering::Relaxed) {
+        0 => None,
+        p => Some(p),
+    }
+}
+
+/// Relay `<host>:<listen_port>` to the dsh server, byte for byte.
 ///
 /// dsh binds loopback only and rejects `--host 0.0.0.0` outright, so a phone
 /// cannot reach its UI. This carries the bytes across without interpreting
@@ -505,20 +516,24 @@ fn authority() -> String {
 /// # Exposure
 ///
 /// This does what dsh declines to do for you — its UI can run arbitrary code,
-/// and the relay has no authentication of its own (amux's `--token` does not
-/// apply to a raw byte stream). It is opt-in for that reason. Only enable it on
-/// a network you trust, or behind a VPN such as Tailscale.
-pub async fn spawn_forwarder(listen_port: u16) {
+/// and a byte relay has no authentication of its own, so amux's `--token` does
+/// not cover it. It binds the same host `amux serve` does, so
+/// `amux serve --host 127.0.0.1` keeps it local too.
+pub async fn spawn_forwarder(host: &str, listen_port: u16) {
     let target = authority();
-    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", listen_port)).await {
+    let listener = match tokio::net::TcpListener::bind((host, listen_port)).await {
         Ok(l) => l,
         Err(error) => {
-            eprintln!("[dsh] cannot listen on :{listen_port}: {error}");
+            eprintln!("[dsh] cannot listen on {host}:{listen_port}: {error}");
             return;
         }
     };
-    println!("dsh UI forwarded: http://0.0.0.0:{listen_port} -> {target}");
-    println!("  remember: dsh web --trusted-host <this machine's address>");
+    RELAY_PORT.store(listen_port, Ordering::Relaxed);
+    println!("dsh UI relayed on port {listen_port} -> {target}");
+    if host != "127.0.0.1" && host != "localhost" {
+        println!("  note: unauthenticated, and dsh can run code — trusted networks only");
+    }
+    println!("  dsh must allow it: dsh web --trusted-host <this machine's address>");
 
     loop {
         let Ok((mut inbound, _)) = listener.accept().await else {
