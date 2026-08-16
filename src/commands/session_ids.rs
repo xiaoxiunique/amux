@@ -44,15 +44,30 @@ pub fn store_id(session_name: &str, id: &str) {
 
 /// Args that make the agent resume a specific session id.
 pub fn resume_args(agent_name: &str, id: &str) -> Vec<String> {
+    resume_args_with(agent_name, id, false)
+}
+
+/// Same as [`resume_args`], but when the caller is launching with an explicit
+/// `--provider`, the provider is supplied by a dedicated profile (`-p
+/// amux-<name>`): its config points at the real upstream and its key is
+/// injected as an env var. Re-patching the session's recorded provider to point
+/// at the local cc-switch proxy — with `experimental_bearer_token =
+/// "PROXY_MANAGED"`, i.e. the *currently active* provider's key — would
+/// silently override both and talk to the wrong endpoint with the wrong key.
+pub fn resume_args_with(
+    agent_name: &str,
+    id: &str,
+    has_explicit_provider: bool,
+) -> Vec<String> {
     match agent_name {
         "codex" => {
-            // The provider a session was recorded under may no longer exist in
-            // config.toml — cc-switch replaces `model_providers` wholesale on
-            // every switch. Codex then refuses to open the session at all, so
-            // re-supply the name on the command line when it's missing.
-            let mut args = codex_session_provider(id)
-                .map(|p| codex_provider_patch(&p))
-                .unwrap_or_default();
+            let mut args = if has_explicit_provider {
+                Vec::new()
+            } else {
+                codex_session_provider(id)
+                    .map(|p| codex_provider_patch(&p))
+                    .unwrap_or_default()
+            };
             args.push("resume".into());
             args.push(id.to_string());
             args
@@ -635,6 +650,17 @@ mod tests {
             vec!["--resume".to_string(), "abc".to_string()]
         );
         assert!(super::resume_args("vim", "abc").is_empty());
+    }
+
+    #[test]
+    fn explicit_provider_skips_the_codex_patch() {
+        // With an explicit --provider the launch already carries `-p
+        // amux-<name>` plus the provider's key in the env, so the resume must
+        // not also inject a `-c …PROXY_MANAGED` override — that would point
+        // the session at the local proxy and authenticate with the *active*
+        // provider's key instead of the selected one.
+        let args = super::resume_args_with("codex", "019f9207-b3ec-7b82-8494-e123bdb77987", true);
+        assert_eq!(args, vec!["resume", "019f9207-b3ec-7b82-8494-e123bdb77987"]);
     }
 
     #[test]

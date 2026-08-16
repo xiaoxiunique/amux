@@ -49,7 +49,11 @@ pub fn run(agent: &Agent, extra: &[String], provider_name: Option<&str>, agents:
             .filter(|id| super::session_ids::session_file_exists(&agent.name, &cwd, id))
             .or_else(|| super::session_ids::current_id(&agent.name, &cwd));
         if let Some(id) = target {
-            resume = super::session_ids::resume_args(&agent.name, &id);
+            resume = super::session_ids::resume_args_with(
+                &agent.name,
+                &id,
+                provider_name.is_some(),
+            );
         }
     }
 
