@@ -106,6 +106,18 @@ pub fn agent_app_type(agent_name: &str) -> &'static str {
     }
 }
 
+/// Whether a bare first argument may be silently reinterpreted as a provider
+/// for this agent.
+///
+/// Only Claude and Codex have a settings/profile mechanism to inject into.
+/// Handing any other agent a `--settings <path>` it does not understand would
+/// break the launch, and the collision is realistic: `oc ds` reads as "opencode
+/// in the ds provider" but means "opencode, with `ds` as an argument". An
+/// explicit `--provider` is still honoured — that is the user asking for it.
+pub fn infers_provider_from_first_arg(agent_name: &str) -> bool {
+    matches!(agent_name, "claude" | "cc" | "codex" | "cx")
+}
+
 /// Resolve provider and prepare injection settings.
 pub fn resolve_settings(name: &str, app_type: &str) -> Result<ProviderSettings> {
     let Some(p) = db_path() else {
@@ -268,6 +280,18 @@ mod tests {
         assert_eq!(agent_app_type("codex"), "codex");
         assert_eq!(agent_app_type("cx"), "codex");
         assert_eq!(agent_app_type("gemini"), "claude"); // fallback
+    }
+
+    #[test]
+    fn only_claude_and_codex_infer_a_provider_from_the_first_arg() {
+        assert!(infers_provider_from_first_arg("claude"));
+        assert!(infers_provider_from_first_arg("cc"));
+        assert!(infers_provider_from_first_arg("codex"));
+        assert!(infers_provider_from_first_arg("cx"));
+        // opencode takes no --settings/-p, so `oc ds` must pass `ds` through
+        // as an ordinary argument rather than resolving it as a provider.
+        assert!(!infers_provider_from_first_arg("opencode"));
+        assert!(!infers_provider_from_first_arg("gemini"));
     }
 
     #[test]

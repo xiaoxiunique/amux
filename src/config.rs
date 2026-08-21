@@ -27,6 +27,13 @@ pub fn builtin_agents() -> Vec<Agent> {
             alias: "cx".into(),
             command: vec!["codex".into(), "--yolo".into()],
         },
+        Agent {
+            name: "opencode".into(),
+            alias: "oc".into(),
+            // `--auto` is opencode's counterpart to the two flags above:
+            // auto-approve anything not explicitly denied.
+            command: vec!["opencode".into(), "--auto".into()],
+        },
     ]
 }
 
@@ -126,7 +133,23 @@ mod tests {
         // claude overridden (command now single element), gemini appended
         assert_eq!(find(&merged, "claude").unwrap().command, vec!["claude".to_string()]);
         assert!(find(&merged, "gemini").is_some());
-        assert_eq!(merged.len(), 3);
+        // Only gemini is new; claude replaced its builtin in place.
+        assert_eq!(merged.len(), builtin_agents().len() + 1);
+    }
+
+    #[test]
+    fn builtins_cover_the_three_shipped_agents() {
+        let b = builtin_agents();
+        let by_alias = |a: &str| b.iter().find(|x| x.alias == a).cloned();
+        assert_eq!(by_alias("cc").unwrap().name, "claude");
+        assert_eq!(by_alias("cx").unwrap().name, "codex");
+        let oc = by_alias("oc").expect("opencode ships as a builtin");
+        assert_eq!(oc.name, "opencode");
+        assert_eq!(oc.command, vec!["opencode", "--auto"]);
+        validate(&b).unwrap();
+        // find() resolves an agent by either name or alias.
+        assert_eq!(find(&b, "oc").unwrap().name, "opencode");
+        assert_eq!(find(&b, "opencode").unwrap().alias, "oc");
     }
 
     #[test]
