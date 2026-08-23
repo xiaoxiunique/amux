@@ -1011,16 +1011,29 @@ fn project_session_name(agent: &str, path: &str) -> Result<String, String> {
 }
 
 fn agent_launch_command(agent: &str) -> Result<String, String> {
-    let (env_key, default_command) = match agent {
-        "claude" => ("AGENT_MONITOR_CC_COMMAND", "claude"),
-        "codex" => ("AGENT_MONITOR_CX_COMMAND", "codex --yolo"),
+    let env_key = match agent {
+        "claude" => "AGENT_MONITOR_CC_COMMAND",
+        "codex" => "AGENT_MONITOR_CX_COMMAND",
         _ => return Err(format!("unsupported agent: {agent}")),
     };
-
-    Ok(env::var(env_key)
+    if let Some(value) = env::var(env_key)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| default_command.to_string()))
+    {
+        return Ok(value);
+    }
+
+    // Same agent list `amux run` uses, rather than a second copy of the launch
+    // flags. The copy is how this drifted: the CLI launched Claude with
+    // `--dangerously-skip-permissions` while the app launched a bare `claude`,
+    // so a session resumed from the phone sat waiting for permission prompts.
+    // Reading the shared list also means a config.toml override applies to
+    // both, and a newly added agent needs no second edit here.
+    let agents =
+        crate::config::resolve_agents().unwrap_or_else(|_| crate::config::builtin_agents());
+    crate::config::find(&agents, agent)
+        .map(|a| crate::tmux::shell_join(&a.command))
+        .ok_or_else(|| format!("unsupported agent: {agent}"))
 }
 
 /// Same as [`agent_launch_command`], for sibling modules in `serve`.
@@ -5139,6 +5152,33 @@ async fn send_terminal_error(socket: &mut WebSocket, error: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app and the shell must launch an agent the same way.
+    ///
+    /// These used to be two hardcoded lists, and they drifted: `amux run cc`
+    /// passed `--dangerously-skip-permissions` while a session resumed from
+    /// the phone got a bare `claude` and then sat on a permission prompt
+    /// nobody was there to answer.
+    #[test]
+    fn launch_command_matches_the_cli_agent_list() {
+        let agents = crate::config::builtin_agents();
+        for name in ["claude", "codex"] {
+            let expected = crate::tmux::shell_join(
+                &crate::config::find(&agents, name).expect("builtin agent").command,
+            );
+            assert_eq!(
+                agent_launch_command(name).expect("known agent"),
+                expected,
+                "{name} launches differently in the server than in the CLI"
+            );
+        }
+        // Both permissive flags must actually survive that round-trip.
+        assert!(agent_launch_command("claude")
+            .unwrap()
+            .contains("--dangerously-skip-permissions"));
+        assert!(agent_launch_command("codex").unwrap().contains("--yolo"));
+        assert!(agent_launch_command("vim").is_err());
+    }
 
     fn pane(session: &str) -> BasePane {
         BasePane {
