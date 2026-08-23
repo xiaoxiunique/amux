@@ -32,7 +32,24 @@ pub fn builtin_agents() -> Vec<Agent> {
             alias: "oc".into(),
             // `--auto` is opencode's counterpart to the two flags above:
             // auto-approve anything not explicitly denied.
-            command: vec!["opencode".into(), "--auto".into()],
+            //
+            // `--mini` is not a cosmetic choice. opencode's default TUI draws
+            // into the terminal's *alternate screen*, which has no scrollback
+            // at all — `history-limit` does not apply to it, scrolling up
+            // shows nothing, and `capture-pane` (how the monitor builds a
+            // session's log) returns only the visible rows. The minimal
+            // interface writes to the normal buffer like Claude and Codex do,
+            // so history survives and the phone app can read it.
+            //
+            // `--continue` resumes that directory's last conversation and
+            // replays it into the buffer. It is scoped to the working
+            // directory, and falls back to a fresh session when there is none.
+            command: vec![
+                "opencode".into(),
+                "--auto".into(),
+                "--mini".into(),
+                "--continue".into(),
+            ],
         },
     ]
 }
@@ -145,7 +162,12 @@ mod tests {
         assert_eq!(by_alias("cx").unwrap().name, "codex");
         let oc = by_alias("oc").expect("opencode ships as a builtin");
         assert_eq!(oc.name, "opencode");
-        assert_eq!(oc.command, vec!["opencode", "--auto"]);
+        // --mini keeps opencode out of the alternate screen, which has no
+        // scrollback: without it the session's history is unrecoverable and
+        // the monitor can only ever capture the visible rows.
+        assert!(oc.command.contains(&"--mini".to_string()));
+        assert!(oc.command.contains(&"--continue".to_string()));
+        assert!(oc.command.contains(&"--auto".to_string()));
         validate(&b).unwrap();
         // find() resolves an agent by either name or alias.
         assert_eq!(find(&b, "oc").unwrap().name, "opencode");
