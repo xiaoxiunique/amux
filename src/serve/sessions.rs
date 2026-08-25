@@ -194,3 +194,105 @@ mod tests {
         assert!(resume(&tmp, "codex", "my-project", "x").is_err());
     }
 }
+
+// --------------------------------------------------------------- display labels
+
+/// `~/.amux/session-labels.json` — multiplexer session name -> display label.
+///
+/// A rename here is cosmetic on purpose. Session names encode
+/// `<alias>_<dirslug>_<hash8>`, and everything downstream depends on that:
+/// `amux run` recomputes the name from the directory to decide whether to
+/// re-attach, managed-session detection matches the pattern, and the
+/// conversation-id store is keyed by it. Renaming the real session would make
+/// a directory's session unfindable from the shell. So the name stays and only
+/// the label the client shows changes.
+fn labels_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".amux").join("session-labels.json"))
+}
+
+pub fn labels() -> std::collections::BTreeMap<String, String> {
+    let Some(p) = labels_path() else {
+        return Default::default();
+    };
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Set (or, with an empty label, clear) a session's display label.
+pub fn set_label(session: &str, label: &str) -> Result<(), String> {
+    let session = session.trim();
+    if session.is_empty() {
+        return Err("session is required".to_string());
+    }
+    let label = label.trim();
+    // Long enough for a sentence, short enough that it can't be used to stuff
+    // the snapshot every client polls.
+    if label.chars().count() > 80 {
+        return Err("label is too long (max 80 characters)".to_string());
+    }
+
+    let mut map = labels();
+    if label.is_empty() {
+        map.remove(session);
+    } else {
+        map.insert(session.to_string(), label.to_string());
+    }
+
+    let p = labels_path().ok_or("cannot determine home directory")?;
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
+    std::fs::write(&p, json).map_err(|e| format!("writing {}: {e}", p.display()))
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+
+    /// Isolated: these write to $HOME, so point it somewhere disposable.
+    fn with_temp_home(body: impl FnOnce()) {
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        body();
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn set_read_and_clear_a_label() {
+        with_temp_home(|| {
+            assert!(labels().is_empty());
+
+            set_label("cc_amux_4d8e0883", "重构登录").unwrap();
+            assert_eq!(
+                labels().get("cc_amux_4d8e0883").map(String::as_str),
+                Some("重构登录")
+            );
+
+            // Renaming again replaces rather than accumulating.
+            set_label("cc_amux_4d8e0883", "改成别的").unwrap();
+            assert_eq!(labels().len(), 1);
+
+            // An empty label is how the client clears one.
+            set_label("cc_amux_4d8e0883", "  ").unwrap();
+            assert!(labels().is_empty());
+        });
+    }
+
+    #[test]
+    fn rejects_an_empty_session_and_an_overlong_label() {
+        with_temp_home(|| {
+            assert!(set_label("  ", "x").is_err());
+            assert!(set_label("s", &"x".repeat(81)).is_err());
+            // Multi-byte counts as characters, not bytes, so a Chinese label
+            // well under the limit is not rejected for being 3 bytes a glyph.
+            assert!(set_label("s", &"名".repeat(80)).is_ok());
+        });
+    }
+}

@@ -478,6 +478,10 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         .route("/api/files/download", get(api_files_download))
         .route("/api/sessions", get(api_sessions))
         .route("/api/sessions/resume", post(api_sessions_resume))
+        .route(
+            "/api/session/labels",
+            get(api_session_labels).post(api_session_label_set),
+        )
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
         .route("/api/cron/jobs/running", get(api_cron_running))
@@ -2878,6 +2882,55 @@ struct ResumeSessionRequest {
 
 /// `POST /api/sessions/resume` — reopen a past conversation in its own
 /// multiplexer session, leaving the project's primary session running.
+/// `GET /api/session/labels` — every custom session label, as one map.
+///
+/// Returned whole rather than per-session: the map is a handful of short
+/// strings, and the home list would otherwise need one request per row.
+async fn api_session_labels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    json_response(
+        StatusCode::OK,
+        json!({ "ok": true, "labels": crate::serve::sessions::labels() }),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionLabelRequest {
+    session: String,
+    /// Empty clears the label and falls back to the derived project name.
+    #[serde(default)]
+    label: String,
+}
+
+/// `POST /api/session/labels` — set or clear one session's display label.
+async fn api_session_label_set(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<SessionLabelRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    match crate::serve::sessions::set_label(&body.session, &body.label) {
+        Ok(()) => json_response(
+            StatusCode::OK,
+            json!({ "ok": true, "labels": crate::serve::sessions::labels() }),
+        ),
+        Err(error) => json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "ok": false, "error": error }),
+        ),
+    }
+}
+
 async fn api_sessions_resume(
     State(state): State<AppState>,
     headers: HeaderMap,
