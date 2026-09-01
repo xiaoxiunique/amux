@@ -79,6 +79,27 @@ pub fn send_command(name: &str, shell_cmd: &str) -> Result<()> {
     Ok(())
 }
 
+/// Current visible contents of a session's active pane.
+///
+/// Used to decide what an agent is asking before answering it — see
+/// [`crate::commands::run::dismiss_codex_prompts`]. Empty on any failure, so a
+/// caller treats "can't tell" as "nothing to answer".
+pub fn capture_pane(name: &str) -> String {
+    Command::new(mux_bin())
+        .args(["capture-pane", "-p", "-t", name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// Send literal text (no trailing Enter) to a session's active pane.
+pub fn send_text(name: &str, text: &str) -> Result<()> {
+    Command::new(mux_bin())
+        .args(["send-keys", "-t", name, "-l", text])
+        .status()?;
+    Ok(())
+}
+
 /// Send a bare Enter keypress to a session's active pane.
 pub fn send_enter(name: &str) -> Result<()> {
     Command::new(mux_bin())

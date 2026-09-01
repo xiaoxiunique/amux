@@ -125,6 +125,53 @@ pub fn launch_new(
     )
 }
 
+/// Answer the prompts codex shows before it will open a conversation.
+///
+/// There are two, and they need *different* answers — which is why this reads
+/// the screen instead of sending a blind Enter:
+///
+///   - "Update available … 1. Update now / 2. Skip". Enter takes the default,
+///     **1**, which shells out to `bun install -g @openai/codex`. Answering
+///     this one by reflex upgrades codex behind the user's back, mid-session.
+///   - "Do you trust the contents of this directory? … 1. Yes, continue".
+///     Here the default is right, so Enter.
+///
+/// Codex re-asks the trust question on every launch even for trusted dirs, and
+/// the update prompt appears only when a release is out — so the order and the
+/// presence of each varies. Poll briefly and answer whatever is on screen.
+pub(crate) fn dismiss_codex_prompts(name: &str) {
+    use std::time::Duration;
+
+    let mut answered = false;
+    // ~8s of polling. Codex takes a couple of seconds to boot and redraws
+    // between the two prompts, and the update one only exists when a release
+    // is out — so a fixed sleep either fires too early or wastes time.
+    for _ in 0..16 {
+        std::thread::sleep(Duration::from_millis(500));
+        let screen = tmux::capture_pane(name);
+
+        if screen.contains("Update available") {
+            // Explicitly "2" (Skip). Never Enter: the default is "1. Update
+            // now", which shells out to a global package install.
+            let _ = tmux::send_text(name, "2");
+            answered = true;
+            continue;
+        }
+        if screen.contains("Do you trust") {
+            let _ = tmux::send_enter(name);
+            answered = true;
+            continue;
+        }
+
+        // Only leave early once a prompt has actually been dealt with.
+        // Returning on any non-empty screen would fire on the shell prompt
+        // that is still there before codex has even started drawing.
+        if answered {
+            return;
+        }
+    }
+}
+
 /// Create-or-attach the multiplexer session and hand the terminal over.
 #[allow(clippy::too_many_arguments)]
 fn launch(
@@ -167,14 +214,8 @@ fn launch(
         };
         tmux::send_command(name, &shell_cmd)?;
 
-        // Auto-confirm codex's directory-trust prompt. Codex re-prompts on every
-        // launch even for trusted dirs (regression: config/--yolo don't suppress
-        // it), so send an Enter — it selects the default "Yes, continue". The
-        // key is buffered in the pty until codex reads it; if no prompt appears
-        // it lands on the empty composer and is a harmless no-op.
         if agent.name == "codex" {
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-            let _ = tmux::send_enter(name);
+            dismiss_codex_prompts(name);
         }
     } else if track_conversation {
         // Session is alive: the running agent is writing the newest rollout for

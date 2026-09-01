@@ -307,6 +307,13 @@ pub fn restore(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<()> {
             format!("{} {}", env_prefix, tmux::shell_join(&argv))
         };
         tmux::send_command(&name, &shell_cmd)?;
+        // Same prompts `run` handles. Without this a restored codex session
+        // sits on "Update available" forever and never opens its conversation
+        // — which reads as "restore didn't bring my work back", because the
+        // resume argument was there but codex never got past the prompt.
+        if agent.name == "codex" {
+            super::run::dismiss_codex_prompts(&name);
+        }
         created += 1;
         if attach_to.is_none() {
             attach_to = Some(name.clone());
