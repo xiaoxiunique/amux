@@ -12,6 +12,26 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Command};
 
+/// Serializes tests that swap the process-global `HOME`.
+///
+/// Several modules point `HOME` at a temp dir to exercise their on-disk
+/// stores. The variable is per-process, so under the parallel test runner two
+/// such tests clobber each other and fail intermittently — which is worse than
+/// a slow test, because the failure looks like a real regression.
+#[cfg(test)]
+pub(crate) mod test_home {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// Hold the returned guard for as long as `HOME` is redirected.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 fn main() -> Result<()> {
     let parsed = Cli::parse();
     let agents = config::resolve_agents()?;

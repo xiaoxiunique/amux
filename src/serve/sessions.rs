@@ -254,6 +254,7 @@ mod label_tests {
 
     /// Isolated: these write to $HOME, so point it somewhere disposable.
     fn with_temp_home(body: impl FnOnce()) {
+        let _home_guard = crate::test_home::lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());

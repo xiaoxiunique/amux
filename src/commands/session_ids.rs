@@ -775,6 +775,7 @@ mod tests {
     #[test]
     fn store_roundtrip_isolated() {
         // Redirect HOME to a temp dir so we don't touch the real store.
+        let _home_guard = crate::test_home::lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", tmp.path());

@@ -134,17 +134,21 @@ pub fn kill_session(name: &str) -> Result<()> {
 ///
 /// Best-effort: a multiplexer without the option must not fail the launch.
 pub fn pin_window_size(name: &str) {
+    // Resize first, then set the option — not the other way round.
+    //
+    // `resize-window` switches a window to *manual* sizing; that is tmux's
+    // documented behaviour and rmux adopted it in 0.10.0. Setting `latest`
+    // first and resizing second therefore threw the pin away, leaving every
+    // new session manually sized and unable to follow its client. Doing the
+    // forced recompute first and setting the option last gets both: the size
+    // is correct now, and it keeps tracking on future attach/detach/resize.
     let _ = Command::new(mux_bin())
-        .args(["set-option", "-t", name, "window-size", "latest"])
+        .args(["resize-window", "-t", name, "-A"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    // Setting the option does not re-evaluate it: `latest` is recomputed on
-    // client attach/detach/resize, so a session whose terminal was resized
-    // *before* the option was set keeps the stale size indefinitely. `-A`
-    // forces that recompute now.
     let _ = Command::new(mux_bin())
-        .args(["resize-window", "-t", name, "-A"])
+        .args(["set-option", "-t", name, "window-size", "latest"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();

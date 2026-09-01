@@ -268,8 +268,25 @@ pub fn restore(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<()> {
             continue;
         }
 
+        // Same conversation resolution `amux run` does. Without it a restore
+        // brings back the *shape* of the workspace — right agent, right
+        // directory — but every session opens a blank conversation, which is
+        // the opposite of what restoring is for.
+        let resume = super::session_ids::load_id(&name)
+            .filter(|id| super::session_ids::session_file_exists(&agent.name, &cwd, id))
+            .or_else(|| super::session_ids::current_id(&agent.name, &cwd))
+            .map(|id| {
+                super::session_ids::resume_args_with(
+                    &agent.name,
+                    &id,
+                    entry.provider.is_some(),
+                )
+            })
+            .unwrap_or_default();
+
         // Resolve provider settings if needed
         let mut argv = agent.command.clone();
+        argv.extend(resume);
         let mut env_vars: Vec<(String, String)> = Vec::new();
         if let Some(p) = &entry.provider {
             let app_type = crate::provider::agent_app_type(&agent.name);
@@ -314,6 +331,31 @@ mod tests {
             Agent { name: "claude".into(), alias: "cc".into(), command: vec!["claude".into()] },
             Agent { name: "codex".into(), alias: "cx".into(), command: vec!["codex".into()] },
         ]
+    }
+
+    /// A restore that opens blank conversations defeats the point: the whole
+    /// reason to save and restore is to get the *work* back, not just a set of
+    /// correctly-named empty shells.
+    ///
+    /// Both `run` and `restore` build their resume args from the same helper,
+    /// so pinning the helper's output is what keeps them from drifting apart
+    /// again. Deliberately touches no global state — `HOME`-mutating tests
+    /// race each other under the parallel runner.
+    #[test]
+    fn restore_and_run_resolve_the_same_conversation() {
+        use crate::commands::session_ids::resume_args_with;
+
+        assert_eq!(
+            resume_args_with("claude", "abc-123", false),
+            vec!["--resume".to_string(), "abc-123".to_string()]
+        );
+        // With an explicit provider the codex patch stays suppressed here too —
+        // restore resolves providers just like run does, so re-supplying one
+        // would point the session at the proxy with the wrong key.
+        assert_eq!(
+            resume_args_with("codex", "abc-123", true),
+            vec!["resume".to_string(), "abc-123".to_string()]
+        );
     }
 
     #[test]
