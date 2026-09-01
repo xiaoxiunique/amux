@@ -299,6 +299,34 @@ pub fn current_id(agent_name: &str, cwd: &Path) -> Option<String> {
     }
 }
 
+/// The newest conversation for `cwd` that no *other* amux session has claimed.
+///
+/// Plain "newest" is wrong as soon as a directory holds more than one session:
+/// `amux new cx grok` and `amux new cx xhs` share a directory, so whichever
+/// launched last owns the newest rollout and the other would resume it. That
+/// is why tracking used to be skipped entirely for those sessions — but the
+/// cost was that a named session never recorded anything, and rebuilding it
+/// (after a restore, or a daemon restart) silently produced a blank
+/// conversation.
+///
+/// Claiming fixes the attribution without needing the agent to tell us
+/// anything: each session takes the newest rollout not already spoken for, so
+/// N sessions in a directory end up on N distinct conversations.
+pub fn current_unclaimed_id(agent_name: &str, cwd: &Path, for_session: &str) -> Option<String> {
+    let claimed: std::collections::BTreeSet<String> = read_store()
+        .iter()
+        .filter(|(session, _)| session.as_str() != for_session)
+        .map(|(_, id)| id.clone())
+        .collect();
+
+    // Bounded: a directory with more sessions than this is not a case worth
+    // scanning the whole history for.
+    recent_sessions(agent_name, cwd, 20)
+        .into_iter()
+        .map(|s| s.id)
+        .find(|id| !claimed.contains(id))
+}
+
 /// One past conversation for a directory, newest first.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -770,6 +798,59 @@ mod tests {
         assert_eq!(newest_codex_rollout_for(root, Path::new("/work/proj")).as_deref(), Some("id-new"));
         // unrelated cwd -> none
         assert!(newest_codex_rollout_for(root, Path::new("/work/nope")).is_none());
+    }
+
+    /// Two sessions in one directory must land on two different
+    /// conversations. Recording the plain newest gave the second session the
+    /// first one's thread; recording nothing lost named sessions entirely on
+    /// the first rebuild.
+    #[test]
+    fn claiming_keeps_sibling_sessions_off_each_others_conversations() {
+        let _home_guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        // Two rollouts for the same cwd, newest last.
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let root = tmp.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let write = |name: &str, id: &str| {
+            let p = root.join(name);
+            std::fs::write(
+                &p,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\",\"id\":\"{id}\"}}}}\n",
+                    cwd.display()
+                ),
+            )
+            .unwrap();
+        };
+        write("rollout-old.jsonl", "conv-old");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write("rollout-new.jsonl", "conv-new");
+
+        // First session claims the newest.
+        let a = current_unclaimed_id("codex", &cwd, "cx_proj_aaaa-one").unwrap();
+        assert_eq!(a, "conv-new");
+        store_id("cx_proj_aaaa-one", &a);
+
+        // Its sibling must not get the same one.
+        let b = current_unclaimed_id("codex", &cwd, "cx_proj_aaaa-two").unwrap();
+        assert_eq!(b, "conv-old", "sibling stole the claimed conversation");
+
+        // Re-resolving for the *same* session still returns its own claim —
+        // its own entry must not make its conversation look taken.
+        assert_eq!(
+            current_unclaimed_id("codex", &cwd, "cx_proj_aaaa-one").as_deref(),
+            Some("conv-new")
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]

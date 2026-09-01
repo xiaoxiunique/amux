@@ -64,7 +64,7 @@ pub fn run(agent: &Agent, extra: &[String], provider_name: Option<&str>, agents:
     argv.extend(provider_argv);
     argv.extend_from_slice(extra);
 
-    launch(agent, &cwd, &name, argv, env_vars, session_exists, tmux_ok, agents, true)
+    launch(agent, &cwd, &name, argv, env_vars, session_exists, tmux_ok, agents)
 }
 
 /// Attach to a specific past conversation, in its own directory.
@@ -96,14 +96,15 @@ pub fn run_in(
         super::session_ids::store_id(&name, session_id);
     }
 
-    launch(agent, &cwd, &name, argv, Vec::new(), session_exists, tmux_ok, agents, true)
+    launch(agent, &cwd, &name, argv, Vec::new(), session_exists, tmux_ok, agents)
 }
 
 /// Start (or reattach) a session under an explicit name, with a fresh agent.
 ///
-/// Backs `amux new`. No resume args and no recorded session id: this is a
-/// deliberately independent second workspace for the same directory, not a
-/// continuation of the directory's newest conversation.
+/// Backs `amux new`. No resume args: this is a deliberately independent second
+/// workspace for the same directory, not a continuation of the directory's
+/// newest conversation. Its conversation *is* recorded once it exists, so the
+/// session survives being rebuilt.
 pub fn launch_new(
     agent: &Agent,
     cwd: &std::path::Path,
@@ -121,7 +122,6 @@ pub fn launch_new(
         session_exists,
         tmux_ok,
         agents,
-        false,
     )
 }
 
@@ -183,9 +183,6 @@ fn launch(
     session_exists: bool,
     tmux_ok: bool,
     agents: &[Agent],
-    // Whether to remember the directory's newest conversation id under this
-    // session name. False when several sessions share the directory.
-    track_conversation: bool,
 ) -> Result<()> {
     if !tmux_ok {
         eprintln!("tmux not found; running '{}' directly", agent.name);
@@ -217,16 +214,21 @@ fn launch(
         if agent.name == "codex" {
             dismiss_codex_prompts(name);
         }
-    } else if track_conversation {
-        // Session is alive: the running agent is writing the newest rollout for
-        // this cwd. Record its id so a later relaunch resumes this exact session
-        // (agents create the rollout lazily on first interaction, so this
-        // re-attach path — not launch time — is where we reliably learn the id).
+    } else {
+        // Session is alive: the running agent is writing a rollout for this
+        // cwd. Record its id so a later relaunch resumes this exact
+        // conversation (agents create the rollout lazily on first interaction,
+        // so this re-attach path — not launch time — is where we reliably
+        // learn it).
         //
-        // Skipped for `amux new`: several sessions share this directory, so the
-        // newest rollout is just as likely to belong to one of the others. The
-        // extra session would then resume *their* conversation on relaunch.
-        if let Some(id) = super::session_ids::current_id(&agent.name, cwd) {
+        // Claim the newest rollout no *other* session already holds. Recording
+        // the plain newest would hand a second session in the same directory
+        // its neighbour's conversation; recording nothing — which is what
+        // `amux new` sessions used to do — meant a named session lost its work
+        // the first time it had to be rebuilt.
+        if let Some(id) =
+            super::session_ids::current_unclaimed_id(&agent.name, cwd, name)
+        {
             super::session_ids::store_id(name, &id);
         }
     }
