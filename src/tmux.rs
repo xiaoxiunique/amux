@@ -187,9 +187,14 @@ fn resize_after_attach(name: &str) {
     let spawned = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "sleep 0.4; {} resize-window -t {} -A >/dev/null 2>&1",
-            shell_quote(&bin),
-            shell_quote(name)
+            // Re-set the option after resizing: `resize-window` switches the
+            // window to *manual* sizing, so resizing alone would undo the pin
+            // `pin_window_size` just established — and this runs later, so it
+            // wins. That is why sessions kept coming back manually sized.
+            "sleep 0.4; {mux} resize-window -t {sess} -A >/dev/null 2>&1; \
+             {mux} set-option -t {sess} window-size latest >/dev/null 2>&1",
+            mux = shell_quote(&bin),
+            sess = shell_quote(name)
         ))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -199,7 +204,8 @@ fn resize_after_attach(name: &str) {
         .args([
             "/C",
             &format!(
-                "timeout /t 1 /nobreak >nul & \"{bin}\" resize-window -t \"{name}\" -A"
+                "timeout /t 1 /nobreak >nul & \"{bin}\" resize-window -t \"{name}\" -A \
+                 & \"{bin}\" set-option -t \"{name}\" window-size latest"
             ),
         ])
         .stdout(std::process::Stdio::null())
