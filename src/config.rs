@@ -46,7 +46,22 @@ pub fn builtin_agents() -> Vec<Agent> {
             // owns. `--continue` picks the directory's *latest*, so two
             // opencode sessions in one directory would both reopen the same
             // thread, and the second would appear to have lost its work.
-            command: vec!["opencode".into(), "--auto".into(), "--mini".into()],
+            //
+            // `--replay-limit` caps what mini reprints when a client attaches.
+            // Uncapped it replays the whole conversation *every* time —
+            // measured at 105KB against 19KB for Claude and 11KB for Codex on
+            // the same machine — which the TUI's terminal column turns into a
+            // full redraw each time the cursor lands on the session. Five
+            // messages is enough to show the session is alive without the
+            // scroll; `--no-replay` would leave the column blank until the
+            // agent next says something.
+            command: vec![
+                "opencode".into(),
+                "--auto".into(),
+                "--mini".into(),
+                "--replay-limit".into(),
+                "5".into(),
+            ],
         },
         Agent {
             name: "pi".into(),
@@ -181,6 +196,11 @@ mod tests {
         assert!(oc.command.contains(&"--mini".to_string()));
         // Resuming is amux's job (`--session <id>`), not a blanket --continue.
         assert!(!oc.command.contains(&"--continue".to_string()));
+        // Uncapped, mini reprints the whole conversation on every attach —
+        // which the TUI does each time the cursor lands on the session.
+        let limit = oc.command.iter().position(|a| a == "--replay-limit");
+        assert!(limit.is_some(), "replay is uncapped");
+        assert_eq!(oc.command.get(limit.unwrap() + 1).map(String::as_str), Some("5"));
         assert!(oc.command.contains(&"--auto".to_string()));
         let pi = by_alias("p").expect("pi ships as a builtin");
         assert_eq!(pi.name, "pi");
