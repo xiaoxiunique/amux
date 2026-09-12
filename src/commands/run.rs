@@ -204,6 +204,38 @@ pub(crate) fn dismiss_codex_prompts(name: &str) {
     }
 }
 
+/// Start a session and leave it running in the background.
+///
+/// Split out of [`launch`] so callers that must *not* hand over the terminal
+/// can reuse it — the TUI creates sessions without leaving the screen, which
+/// is the whole point of doing it from there rather than dropping to a shell.
+pub(crate) fn create_detached(
+    agent: &Agent,
+    cwd: &std::path::Path,
+    name: &str,
+    argv: &[String],
+    env_vars: &[(String, String)],
+) -> Result<()> {
+    tmux::new_session_detached(name, &cwd.to_string_lossy())?;
+
+    let shell_cmd = if env_vars.is_empty() {
+        tmux::shell_launch(argv)
+    } else {
+        let env_prefix: String = env_vars
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, tmux::shell_quote(v)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{} {}", env_prefix, tmux::shell_launch(argv))
+    };
+    tmux::send_command(name, &shell_cmd)?;
+
+    if agent.name == "codex" {
+        dismiss_codex_prompts(name);
+    }
+    Ok(())
+}
+
 /// Create-or-attach the multiplexer session and hand the terminal over.
 #[allow(clippy::too_many_arguments)]
 fn launch(
@@ -229,23 +261,7 @@ fn launch(
     }
 
     if !session_exists {
-        tmux::new_session_detached(name, &cwd.to_string_lossy())?;
-        // Build the command with env var prefixes for tmux send-keys
-        let shell_cmd = if env_vars.is_empty() {
-            tmux::shell_launch(&argv)
-        } else {
-            let env_prefix: String = env_vars
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, tmux::shell_quote(v)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("{} {}", env_prefix, tmux::shell_launch(&argv))
-        };
-        tmux::send_command(name, &shell_cmd)?;
-
-        if agent.name == "codex" {
-            dismiss_codex_prompts(name);
-        }
+        create_detached(agent, cwd, name, &argv, &env_vars)?;
     } else {
         // Session is alive: the running agent is writing a rollout for this
         // cwd. Record its id so a later relaunch resumes this exact

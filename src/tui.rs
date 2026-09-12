@@ -1,6 +1,6 @@
 use crate::commands::sessions::{managed_sessions, ManagedSession};
 use crate::config::Agent;
-use crate::{commands, tmux};
+use crate::tmux;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -56,10 +56,23 @@ pub struct AppState {
     /// `i` hands the keyboard to the selected session, vim-style: keys go to
     /// the agent instead of the UI until `Esc`.
     pub inserting: bool,
+    /// `a` opens a picker over the terminal column; the next key is an agent
+    /// alias. Shown rather than prompting on stdout, which would mean leaving
+    /// the screen for the one thing that should be fastest.
+    pub picking_agent: bool,
+    /// Configured agents, so the picker can list them and map alias -> agent.
+    pub agents: Vec<Agent>,
+    /// Transient message for the status line (what was just created, or why
+    /// nothing was).
+    pub notice: Option<String>,
 }
 
 impl AppState {
     pub fn new(projects: Vec<Project>) -> Self {
+        Self::with_agents(projects, Vec::new())
+    }
+
+    pub fn with_agents(projects: Vec<Project>, agents: Vec<Agent>) -> Self {
         Self {
             projects,
             focus: Column::Projects,
@@ -68,7 +81,20 @@ impl AppState {
             filter: String::new(),
             filtering: false,
             inserting: false,
+            picking_agent: false,
+            agents,
+            notice: None,
         }
+    }
+
+    /// The directory new sessions should be created in.
+    pub fn current_dir(&self) -> Option<String> {
+        self.current_project().map(|p| p.dir.clone())
+    }
+
+    /// Agents that already have a session in the selected project, by alias.
+    pub fn aliases_here(&self) -> Vec<String> {
+        self.current_sessions().iter().map(|s| s.alias.clone()).collect()
     }
 
     /// Projects matching the filter (case-insensitive, on name or path).
@@ -346,13 +372,12 @@ enum Outcome {
     Quit,
     Attach(String),
     Kill(String),
-    NewAgent,
 }
 
 pub fn run_tui(agents: &[Agent]) -> Result<()> {
     let all = tmux::list_session_names()?;
     let sessions = managed_sessions(&all, agents);
-    let mut state = AppState::new(group_by_project(sessions));
+    let mut state = AppState::with_agents(group_by_project(sessions), agents.to_vec());
 
     let outcome = event_loop(&mut state)?;
 
@@ -364,31 +389,9 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
             // re-enter the TUI with refreshed list
             run_tui(agents)
         }
-        Outcome::NewAgent => new_agent_in_cwd(agents),
     }
 }
 
-fn new_agent_in_cwd(agents: &[Agent]) -> Result<()> {
-    // Minimal v1: pick the first agent if exactly one; otherwise prompt by index.
-    if agents.is_empty() {
-        return Ok(());
-    }
-    println!("Pick an agent to start in this directory:");
-    for (i, a) in agents.iter().enumerate() {
-        println!("  {}) {} ({})", i + 1, a.name, a.alias);
-    }
-    print!("> ");
-    use std::io::Write;
-    stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let idx: usize = line.trim().parse().unwrap_or(0);
-    if idx >= 1 && idx <= agents.len() {
-        commands::run::run(&agents[idx - 1], &[], None, agents)
-    } else {
-        Ok(())
-    }
-}
 
 /// Size of the terminal column, in cells, for the current frame size.
 fn term_size(area: Rect) -> (u16, u16) {
@@ -445,6 +448,33 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 }
                 dirty = true;
 
+                // The picker eats exactly one key: an agent alias, or Esc.
+                if state.picking_agent {
+                    state.picking_agent = false;
+                    if key.code == KeyCode::Esc {
+                        continue;
+                    }
+                    if let KeyCode::Char(c) = key.code {
+                        let typed = c.to_string();
+                        let agent = state
+                            .agents
+                            .iter()
+                            .find(|a| a.alias == typed)
+                            .cloned();
+                        match agent {
+                            Some(agent) => {
+                                let created = spawn_agent(state, &agent, false);
+                                reload(state, created);
+                                live = None; // reattach to whatever is selected now
+                            }
+                            None => {
+                                state.notice = Some(format!("no agent with alias '{typed}'"));
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if state.inserting {
                     if key.code == KeyCode::Esc {
                         state.inserting = false;
@@ -491,7 +521,33 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         state.filtering = true;
                         state.filter.clear();
                     }
-                    KeyCode::Char('n') => break Outcome::NewAgent,
+                    KeyCode::Char('a') => {
+                        if state.current_dir().is_some() {
+                            state.picking_agent = true;
+                        }
+                    }
+                    KeyCode::Char('N') => {
+                        // Another session for the agent already selected here.
+                        let agent = state
+                            .current_session()
+                            .and_then(|s| {
+                                state.agents.iter().find(|a| a.alias == s.alias).cloned()
+                            });
+                        if let Some(agent) = agent {
+                            let created = spawn_agent(state, &agent, true);
+                            reload(state, created);
+                            live = None;
+                        }
+                    }
+                    KeyCode::Tab => {
+                        // Cycle sessions without moving the cursor between
+                        // columns — the fastest way to glance across a
+                        // directory's agents.
+                        let n = state.current_sessions().len();
+                        if n > 1 {
+                            state.session_idx = (state.session_idx + 1) % n;
+                        }
+                    }
                     KeyCode::Char('d') => {
                         if let Some(name) = state.current_name() {
                             break Outcome::Kill(name);
@@ -514,6 +570,65 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(result)
+}
+
+/// Start `agent` in the selected project's directory, without leaving the TUI.
+///
+/// Two shapes, which is the distinction the keys expose:
+///   - the directory's *primary* session for that agent, when it has none yet
+///   - an extra one, auto-suffixed `-2`, `-3`, … when it already does
+///
+/// Returns the new session's name so the caller can select it.
+fn spawn_agent(state: &mut AppState, agent: &Agent, force_extra: bool) -> Option<String> {
+    let dir = state.current_dir()?;
+    let cwd = std::path::PathBuf::from(&dir);
+    let base = crate::session::session_name(&agent.alias, &cwd);
+
+    let name = if force_extra || tmux::has_session(&base) {
+        format!("{base}-{}", crate::commands::new::next_free_suffix(&base))
+    } else {
+        base
+    };
+
+    // A fresh session picks up the conversation this directory was last on for
+    // that agent, the same way `amux run` does — an extra session deliberately
+    // does not, since it is a second workspace rather than a continuation.
+    let mut argv = agent.command.clone();
+    if !name.contains('-') || !force_extra {
+        if let Some(id) = crate::commands::session_ids::load_id(&name)
+            .filter(|id| crate::commands::session_ids::session_file_exists(&agent.name, &cwd, id))
+        {
+            argv.extend(crate::commands::session_ids::resume_args(&agent.name, &id));
+        }
+    }
+
+    match crate::commands::run::create_detached(agent, &cwd, &name, &argv, &[]) {
+        Ok(()) => {
+            state.notice = Some(format!("started {name}"));
+            Some(name)
+        }
+        Err(e) => {
+            state.notice = Some(format!("could not start {}: {e}", agent.name));
+            None
+        }
+    }
+}
+
+/// Re-read the session list, keeping `select` selected if it is still there.
+fn reload(state: &mut AppState, select: Option<String>) {
+    let all = tmux::list_session_names().unwrap_or_default();
+    state.projects = group_by_project(managed_sessions(&all, &state.agents));
+
+    if let Some(target) = select {
+        for (pi, project) in state.visible_projects().iter().enumerate() {
+            if let Some(si) = project.sessions.iter().position(|s| s.name == target) {
+                state.project_idx = pi;
+                state.session_idx = si;
+                return;
+            }
+        }
+    }
+    state.clamp();
 }
 
 /// Where the terminal column lands for a given frame, so the pty can be sized
@@ -621,7 +736,58 @@ fn render(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>) {
         render_terminal(f, state, live, columns[1]);
     }
 
+    if state.picking_agent {
+        render_agent_picker(f, state, outer[0]);
+    }
     render_status(f, state, outer[1]);
+}
+
+/// Overlay listing agents and the key that starts each one.
+///
+/// Marks the ones that already have a session here: choosing those opens an
+/// extra session rather than a first, and seeing that before pressing beats
+/// finding out afterwards.
+fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
+    let here = state.aliases_here();
+    let rows: Vec<Line> = state
+        .agents
+        .iter()
+        .map(|a| {
+            let running = here.iter().filter(|x| *x == &a.alias).count();
+            let suffix = match running {
+                0 => String::new(),
+                n => format!("  ({n} running — opens another)"),
+            };
+            Line::from(vec![
+                Span::styled(
+                    format!("  {}  ", a.alias),
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
+                Span::raw(format!(" {}{}", a.name, suffix)),
+            ])
+        })
+        .collect();
+
+    let height = (rows.len() as u16 + 2).min(area.height);
+    let width = 46.min(area.width);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" start which agent here? (Esc cancels) "),
+        ),
+        popup,
+    );
 }
 
 fn render_projects(f: &mut Frame, state: &AppState, area: Rect) {
@@ -735,6 +901,14 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
         return;
     }
 
+    if let Some(notice) = &state.notice {
+        f.render_widget(
+            Paragraph::new(notice.as_str()).style(Style::default().fg(Color::Green)),
+            area,
+        );
+        return;
+    }
+
     let help = if state.filtering {
         format!("/{}", state.filter)
     } else {
@@ -743,7 +917,10 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
         } else {
             format!("[/{}]  ", state.filter)
         };
-        format!("{filter}hjkl move  i insert  Enter attach  d kill  n new  / filter  q quit")
+        format!(
+            "{filter}hjkl move  Tab cycle  i insert  a add agent  N extra  \
+             Enter attach  d kill  / filter  q quit"
+        )
     };
     f.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -1041,6 +1218,96 @@ mod tests {
 
         assert!(text.contains("INSERT"), "no insert indicator");
         assert!(text.contains("Esc"), "no way out documented");
+    }
+
+    fn agents() -> Vec<Agent> {
+        vec![
+            Agent { name: "claude".into(), alias: "cc".into(), command: vec!["claude".into()] },
+            Agent { name: "codex".into(), alias: "cx".into(), command: vec!["codex".into()] },
+            Agent { name: "pi".into(), alias: "p".into(), command: vec!["pi".into()] },
+        ]
+    }
+
+    #[test]
+    fn tab_cycles_within_the_project_and_wraps() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.project_idx = 1; // two sessions
+
+        // Mirrors the Tab handler.
+        let cycle = |s: &mut AppState| {
+            let n = s.current_sessions().len();
+            if n > 1 {
+                s.session_idx = (s.session_idx + 1) % n;
+            }
+        };
+        cycle(&mut s);
+        assert_eq!(s.session_idx, 1);
+        cycle(&mut s);
+        assert_eq!(s.session_idx, 0, "Tab should wrap, not stop at the end");
+
+        // A lone session has nothing to cycle to.
+        s.project_idx = 0;
+        s.session_idx = 0;
+        cycle(&mut s);
+        assert_eq!(s.session_idx, 0);
+    }
+
+    #[test]
+    fn the_picker_reports_which_agents_are_already_here() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.project_idx = 1; // two cx sessions
+        let here = s.aliases_here();
+        assert_eq!(here.iter().filter(|a| *a == "cx").count(), 2);
+        assert!(!here.contains(&"cc".to_string()));
+
+        s.project_idx = 0; // one cc session
+        assert_eq!(s.aliases_here(), vec!["cc".to_string()]);
+    }
+
+    #[test]
+    fn the_picker_lists_every_configured_agent() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::with_agents(projects(), agents());
+        state.project_idx = 1;
+        state.picking_agent = true;
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 14)).unwrap();
+        terminal.draw(|f| render(f, &state, None)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        for agent in ["claude", "codex", "pi"] {
+            assert!(text.contains(agent), "{agent} missing from the picker");
+        }
+        // The two cx sessions already here are called out, so choosing cx is
+        // visibly "open another" rather than "open one".
+        assert!(text.contains("running"), "no indication of existing sessions");
+        assert!(text.contains("Esc"), "no way out documented");
+    }
+
+    #[test]
+    fn a_notice_replaces_the_help_line() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::with_agents(projects(), agents());
+        state.notice = Some("started cx_beta_22222222-2".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 10)).unwrap();
+        terminal.draw(|f| render(f, &state, None)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("started cx_beta_22222222-2"));
     }
 
     /// The layout is the whole point of this screen, so render it for real
