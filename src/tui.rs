@@ -2,23 +2,23 @@ use crate::commands::sessions::{managed_sessions, ManagedSession};
 use crate::config::Agent;
 use crate::{commands, tmux};
 use anyhow::Result;
-use ansi_to_tui::IntoText;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
 use std::io::stdout;
+use std::io::Write;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
+use tui_term::widget::PseudoTerminal;
 
-/// How often the selected session's terminal is re-captured while idle.
-///
-/// One capture costs ~18ms of subprocess spawn, so this is the dominant cost of
-/// the whole UI. Only the *selected* session is ever captured — the same choice
-/// yazi makes, previewing only the hovered file.
-const IDLE_POLL: Duration = Duration::from_millis(250);
+/// How long to wait for a keypress before going back round to drain terminal
+/// output. Short enough that output feels immediate, long enough not to spin.
+const POLL: Duration = Duration::from_millis(8);
 
 /// Floor between redraws, so a burst of output can't spin the renderer.
 const REDRAW_FLOOR: Duration = Duration::from_millis(16);
@@ -56,8 +56,6 @@ pub struct AppState {
     /// `i` hands the keyboard to the selected session, vim-style: keys go to
     /// the agent instead of the UI until `Esc`.
     pub inserting: bool,
-    /// Last captured screen of the selected session, raw with ANSI intact.
-    pub preview: String,
 }
 
 impl AppState {
@@ -70,7 +68,6 @@ impl AppState {
             filter: String::new(),
             filtering: false,
             inserting: false,
-            preview: String::new(),
         }
     }
 
@@ -198,53 +195,6 @@ impl AppState {
     }
 }
 
-/// What one keypress becomes when it is forwarded to an agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Forwarded {
-    /// Type these characters literally (`send-keys -l`).
-    Text(String),
-    /// Press this named key (`Enter`, `Up`, `C-c`, …).
-    Key(String),
-    /// Nothing the agent should see.
-    Ignore,
-}
-
-/// Translate a keypress into something `send-keys` understands.
-///
-/// Literal text and named keys are different `send-keys` modes: sending "Up"
-/// literally types those two letters instead of moving the cursor, which is
-/// why this distinction exists rather than one string.
-///
-/// `Esc` is deliberately absent — it leaves insert mode, and never reaches the
-/// agent. See `KEY_TO_INTERRUPT` for how to interrupt one instead.
-pub fn forward_key(code: KeyCode, modifiers: KeyModifiers) -> Forwarded {
-    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-
-    match code {
-        KeyCode::Char(c) if ctrl => Forwarded::Key(format!("C-{}", c.to_ascii_lowercase())),
-        // Send even a lone space literally: `send-keys Space` works, but going
-        // through the literal path keeps every printable character on one code
-        // path, including multi-byte ones an agent is routinely typed.
-        KeyCode::Char(c) => Forwarded::Text(c.to_string()),
-        KeyCode::Enter => Forwarded::Key("Enter".into()),
-        KeyCode::Backspace => Forwarded::Key("BSpace".into()),
-        KeyCode::Tab => Forwarded::Key("Tab".into()),
-        KeyCode::BackTab => Forwarded::Key("BTab".into()),
-        KeyCode::Delete => Forwarded::Key("DC".into()),
-        KeyCode::Insert => Forwarded::Key("IC".into()),
-        KeyCode::Home => Forwarded::Key("Home".into()),
-        KeyCode::End => Forwarded::Key("End".into()),
-        KeyCode::PageUp => Forwarded::Key("PageUp".into()),
-        KeyCode::PageDown => Forwarded::Key("PageDown".into()),
-        KeyCode::Up => Forwarded::Key("Up".into()),
-        KeyCode::Down => Forwarded::Key("Down".into()),
-        KeyCode::Left => Forwarded::Key("Left".into()),
-        KeyCode::Right => Forwarded::Key("Right".into()),
-        KeyCode::F(n) => Forwarded::Key(format!("F{n}")),
-        _ => Forwarded::Ignore,
-    }
-}
-
 /// Interrupting an agent normally means Esc, but Esc is spoken for — it is how
 /// you leave insert mode. `C-c` is forwarded and every agent here treats it as
 /// "stop", so it stands in.
@@ -275,6 +225,120 @@ pub fn group_by_project(sessions: Vec<ManagedSession>) -> Vec<Project> {
 
     projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     projects
+}
+
+/// A live terminal attached to one session.
+///
+/// This is a real multiplexer client in a pty, not a periodic screenshot — the
+/// difference is what makes it feel like a terminal rather than a slideshow.
+/// Attaching a second client turns out to be safe here: rmux 0.10.0 does not
+/// resize a session to match an attaching client, verified with both a 60- and
+/// a 200-column client against an 80x24 session.
+struct LiveTerm {
+    session: String,
+    parser: vt100::Parser,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    output: Receiver<Vec<u8>>,
+}
+
+impl LiveTerm {
+    /// Attach to `session` in a pty of the given size.
+    fn open(session: &str, cols: u16, rows: u16) -> Option<Self> {
+        let pair = native_pty_system()
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .ok()?;
+
+        let mut command = CommandBuilder::new(tmux::mux_bin());
+        command.arg("attach-session");
+        command.arg("-t");
+        command.arg(session);
+        // amux normally runs *inside* a session, and a surviving marker makes
+        // the multiplexer treat this attach as a switch-client — which fails
+        // with "requires an unambiguous attached client" and leaves the column
+        // showing that instead of a terminal.
+        //
+        // Both prefixes matter: rmux marks its clients with `RMUX`/`RMUX_PANE`,
+        // tmux with `TMUX`/`TMUX_PANE`, and the server's existing sanitiser only
+        // knows about the latter. Removed explicitly rather than by omission —
+        // the builder merges over the inherited environment, so leaving a
+        // variable out does not unset it.
+        for key in ["TMUX", "TMUX_PANE", "TMUX_PROGRAM", "RMUX", "RMUX_PANE", "RMUX_PROGRAM"] {
+            command.env_remove(key);
+        }
+        command.env("TERM", "xterm-256color");
+
+        let child = pair.slave.spawn_command(command).ok()?;
+        drop(pair.slave);
+
+        let mut reader = pair.master.try_clone_reader().ok()?;
+        let writer = pair.master.take_writer().ok()?;
+        let (tx, output) = mpsc::channel();
+
+        // A blocking read on its own thread: the loop stays responsive and the
+        // terminal keeps streaming while the user sits still.
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        Some(Self {
+            session: session.to_string(),
+            parser: vt100::Parser::new(rows, cols, 0),
+            master: pair.master,
+            writer,
+            child,
+            output,
+        })
+    }
+
+    /// Drain whatever the session has produced. True when anything arrived.
+    fn pump(&mut self) -> bool {
+        let mut got = false;
+        loop {
+            match self.output.try_recv() {
+                Ok(chunk) => {
+                    self.parser.process(&chunk);
+                    got = true;
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        got
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) {
+        if self.parser.screen().size() == (rows, cols) {
+            return;
+        }
+        self.parser.set_size(rows, cols);
+        let _ = self
+            .master
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let _ = self.writer.write_all(bytes);
+        let _ = self.writer.flush();
+    }
+}
+
+impl Drop for LiveTerm {
+    fn drop(&mut self) {
+        // Detaching the client must not take the session with it.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Outcome of the TUI loop, decided after the terminal is restored.
@@ -326,12 +390,10 @@ fn new_agent_in_cwd(agents: &[Agent]) -> Result<()> {
     }
 }
 
-/// Re-capture the selected session, if there is one.
-fn refresh_preview(state: &mut AppState) {
-    state.preview = match state.current_name() {
-        Some(name) => tmux::capture_pane_ansi(&name),
-        None => String::new(),
-    };
+/// Size of the terminal column, in cells, for the current frame size.
+fn term_size(area: Rect) -> (u16, u16) {
+    // Minus the border on each side.
+    (area.width.saturating_sub(2).max(20), area.height.saturating_sub(2).max(5))
 }
 
 fn event_loop(state: &mut AppState) -> Result<Outcome> {
@@ -341,50 +403,58 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut last_capture = Instant::now();
+    let mut live: Option<LiveTerm> = None;
     let mut last_draw = Instant::now() - REDRAW_FLOOR;
     let mut dirty = true;
-    refresh_preview(state);
 
     let result = loop {
         state.clamp();
 
+        // Attach to whatever is selected, and drop a terminal whose session is
+        // no longer the one in view.
+        let wanted = state.current_name();
+        if live.as_ref().map(|t| &t.session) != wanted.as_ref() {
+            live = None;
+            if let Some(name) = &wanted {
+                let (cols, rows) = term_size(terminal_column(terminal.get_frame().area(), state));
+                live = LiveTerm::open(name, cols, rows);
+            }
+            dirty = true;
+        }
+
+        if let Some(term) = live.as_mut() {
+            let (cols, rows) = term_size(terminal_column(terminal.get_frame().area(), state));
+            term.resize(cols, rows);
+            if term.pump() {
+                dirty = true;
+            }
+        }
+
         if dirty && last_draw.elapsed() >= REDRAW_FLOOR {
-            terminal.draw(|f| render(f, state))?;
+            terminal.draw(|f| render(f, state, live.as_ref()))?;
             last_draw = Instant::now();
             dirty = false;
         }
 
-        // Waking on a timeout rather than blocking on a key is the whole point:
-        // the terminal column has to keep updating while the user sits still.
-        if event::poll(REDRAW_FLOOR)? {
+        // A short poll rather than a blocking read: output arrives on its own
+        // schedule and has to be drained between keystrokes.
+        if event::poll(POLL)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 dirty = true;
 
-                // Insert mode first: while it's on, the agent owns the
-                // keyboard and none of the navigation keys apply.
                 if state.inserting {
                     if key.code == KeyCode::Esc {
                         state.inserting = false;
                         continue;
                     }
-                    if let Some(name) = state.current_name() {
-                        match forward_key(key.code, key.modifiers) {
-                            Forwarded::Text(text) => {
-                                let _ = tmux::send_text(&name, &text);
-                            }
-                            Forwarded::Key(k) => {
-                                let _ = tmux::send_key(&name, &k);
-                            }
-                            Forwarded::Ignore => continue,
+                    if let Some(term) = live.as_mut() {
+                        let bytes = encode_key(key.code, key.modifiers);
+                        if !bytes.is_empty() {
+                            term.write(&bytes);
                         }
-                        // Capture straight away: waiting out the idle interval
-                        // would make typing feel like it was going nowhere.
-                        refresh_preview(state);
-                        last_capture = Instant::now();
                     }
                     continue;
                 }
@@ -434,29 +504,75 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     }
                     _ => {}
                 }
-
-                // Moving the selection changes what the terminal column shows,
-                // so capture now instead of waiting out the idle interval.
-                refresh_preview(state);
-                last_capture = Instant::now();
-            }
-        }
-
-        if last_capture.elapsed() >= IDLE_POLL {
-            let before = std::mem::take(&mut state.preview);
-            refresh_preview(state);
-            last_capture = Instant::now();
-            // Only a change is worth a repaint — agents idle for long stretches.
-            if before != state.preview {
-                dirty = true;
             }
         }
     };
 
+    // Detach before restoring the screen, so the client goes away cleanly.
+    drop(live);
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(result)
+}
+
+/// Where the terminal column lands for a given frame, so the pty can be sized
+/// to it before the first draw.
+fn terminal_column(area: Rect, state: &AppState) -> Rect {
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area)[0];
+
+    if state.shows_session_column() {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Ratio(2, 11),
+                Constraint::Ratio(3, 11),
+                Constraint::Ratio(6, 11),
+            ])
+            .split(body)[2]
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(2, 11), Constraint::Ratio(9, 11)])
+            .split(body)[1]
+    }
+}
+
+/// Encode a keypress as the bytes a terminal application expects.
+///
+/// Writing straight into the pty means no translation table of key *names* —
+/// the agent sees exactly what it would from a real terminal, including the
+/// escape sequences for arrows and the control codes for chords.
+///
+/// `Esc` is absent on purpose: it leaves insert mode and never reaches the
+/// agent, so `KEY_TO_INTERRUPT` stands in for interrupting one.
+pub fn encode_key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        // Ctrl-A..Ctrl-Z are 0x01..0x1A.
+        KeyCode::Char(c) if ctrl && c.is_ascii_alphabetic() => {
+            vec![(c.to_ascii_lowercase() as u8) - b'a' + 1]
+        }
+        KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Up => b"\x1b[A".to_vec(),
+        KeyCode::Down => b"\x1b[B".to_vec(),
+        KeyCode::Right => b"\x1b[C".to_vec(),
+        KeyCode::Left => b"\x1b[D".to_vec(),
+        KeyCode::Home => b"\x1b[H".to_vec(),
+        KeyCode::End => b"\x1b[F".to_vec(),
+        KeyCode::PageUp => b"\x1b[5~".to_vec(),
+        KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        KeyCode::Delete => b"\x1b[3~".to_vec(),
+        KeyCode::Insert => b"\x1b[2~".to_vec(),
+        _ => Vec::new(),
+    }
 }
 
 /// Border style that marks which column owns the keyboard.
@@ -472,7 +588,7 @@ fn border_for(state: &AppState, column: Column) -> (BorderType, Style) {
     }
 }
 
-fn render(f: &mut Frame, state: &AppState) {
+fn render(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -494,7 +610,7 @@ fn render(f: &mut Frame, state: &AppState) {
 
         render_projects(f, state, columns[0]);
         render_sessions(f, state, columns[1]);
-        render_terminal(f, state, columns[2]);
+        render_terminal(f, state, live, columns[2]);
     } else {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -502,7 +618,7 @@ fn render(f: &mut Frame, state: &AppState) {
             .split(outer[0]);
 
         render_projects(f, state, columns[0]);
-        render_terminal(f, state, columns[1]);
+        render_terminal(f, state, live, columns[1]);
     }
 
     render_status(f, state, outer[1]);
@@ -569,7 +685,12 @@ fn render_sessions(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
-fn render_terminal(f: &mut Frame, state: &AppState, area: Rect) {
+fn render_terminal(
+    f: &mut Frame,
+    state: &AppState,
+    live: Option<&LiveTerm>,
+    area: Rect,
+) {
     let (border, style) = border_for(state, Column::Terminal);
     let title = match state.current_name() {
         Some(name) => format!(" {name} "),
@@ -581,15 +702,18 @@ fn render_terminal(f: &mut Frame, state: &AppState, area: Rect) {
         .border_style(style)
         .title(title);
 
-    // Captured output carries SGR sequences; parse them so the agent's own
-    // colours survive instead of arriving as literal escape codes.
-    let body = state
-        .preview
-        .as_bytes()
-        .into_text()
-        .unwrap_or_else(|_| Text::raw(state.preview.clone()));
-
-    f.render_widget(Paragraph::new(body).block(block), area);
+    match live {
+        // The real screen of a real client — cursor, colour and all.
+        Some(term) => {
+            f.render_widget(PseudoTerminal::new(term.parser.screen()).block(block), area)
+        }
+        None => f.render_widget(
+            Paragraph::new("no session selected")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block),
+            area,
+        ),
+    }
 }
 
 fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
@@ -812,9 +936,8 @@ mod tests {
         let render_at = |project_idx: usize| {
             let mut state = AppState::new(projects());
             state.project_idx = project_idx;
-            state.preview = "agent output".into();
             let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
-            terminal.draw(|f| render(f, &state)).unwrap();
+            terminal.draw(|f| render(f, &state, None)).unwrap();
             let buffer = terminal.backend().buffer().clone();
             buffer.content().iter().map(|c| c.symbol()).collect::<String>()
         };
@@ -823,57 +946,53 @@ mod tests {
         let lone = render_at(0);
         assert!(lone.contains("projects"));
         assert!(!lone.contains("sessions"), "middle column drawn for one session");
-        assert!(lone.contains("agent output"));
 
         // Two sessions: it comes back.
         let pair = render_at(1);
         assert!(pair.contains("sessions"), "middle column missing for two sessions");
     }
 
-    fn fwd(code: KeyCode) -> Forwarded {
-        forward_key(code, KeyModifiers::NONE)
+    fn enc(code: KeyCode) -> Vec<u8> {
+        encode_key(code, KeyModifiers::NONE)
     }
 
     #[test]
-    fn printable_keys_are_sent_literally() {
-        // Literally, not as a key name — `send-keys U` would press a key called
-        // "U", which is not the same as typing one.
-        assert_eq!(fwd(KeyCode::Char('a')), Forwarded::Text("a".into()));
-        assert_eq!(fwd(KeyCode::Char(' ')), Forwarded::Text(" ".into()));
-        assert_eq!(fwd(KeyCode::Char('你')), Forwarded::Text("你".into()));
-        // A digit is how you answer an agent's numbered prompt, so it must
-        // reach the agent rather than being read as a UI shortcut.
-        assert_eq!(fwd(KeyCode::Char('2')), Forwarded::Text("2".into()));
+    fn printable_keys_encode_as_themselves() {
+        assert_eq!(enc(KeyCode::Char('a')), b"a");
+        assert_eq!(enc(KeyCode::Char(' ')), b" ");
+        // Multi-byte input has to survive — agents here are driven in Chinese.
+        assert_eq!(enc(KeyCode::Char('你')), "你".as_bytes());
+        // A digit answers an agent's numbered prompt, so it must arrive as
+        // typed input rather than being read as a UI shortcut.
+        assert_eq!(enc(KeyCode::Char('2')), b"2");
     }
 
     #[test]
-    fn navigation_and_editing_keys_go_by_name() {
-        assert_eq!(fwd(KeyCode::Enter), Forwarded::Key("Enter".into()));
-        assert_eq!(fwd(KeyCode::Up), Forwarded::Key("Up".into()));
-        assert_eq!(fwd(KeyCode::Down), Forwarded::Key("Down".into()));
-        assert_eq!(fwd(KeyCode::Backspace), Forwarded::Key("BSpace".into()));
-        assert_eq!(fwd(KeyCode::Tab), Forwarded::Key("Tab".into()));
-        assert_eq!(fwd(KeyCode::F(3)), Forwarded::Key("F3".into()));
+    fn navigation_keys_encode_as_escape_sequences() {
+        // What a real terminal sends, so the agent needs no special casing.
+        assert_eq!(enc(KeyCode::Up), b"\x1b[A");
+        assert_eq!(enc(KeyCode::Down), b"\x1b[B");
+        assert_eq!(enc(KeyCode::Right), b"\x1b[C");
+        assert_eq!(enc(KeyCode::Left), b"\x1b[D");
+        assert_eq!(enc(KeyCode::Enter), b"\r");
+        assert_eq!(enc(KeyCode::Tab), b"\t");
+        // DEL, not BS — this is what terminals actually send for backspace.
+        assert_eq!(enc(KeyCode::Backspace), vec![0x7f]);
     }
 
     #[test]
-    fn control_chords_become_mux_chord_names() {
-        assert_eq!(
-            forward_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            Forwarded::Key("C-c".into())
-        );
-        // Shift+Ctrl still names the lowercase letter — `C-C` is not a thing.
-        assert_eq!(
-            forward_key(KeyCode::Char('C'), KeyModifiers::CONTROL),
-            Forwarded::Key("C-c".into())
-        );
+    fn control_chords_encode_as_control_codes() {
+        assert_eq!(encode_key(KeyCode::Char('c'), KeyModifiers::CONTROL), vec![0x03]);
+        assert_eq!(encode_key(KeyCode::Char('d'), KeyModifiers::CONTROL), vec![0x04]);
+        // Case doesn't change the control code.
+        assert_eq!(encode_key(KeyCode::Char('C'), KeyModifiers::CONTROL), vec![0x03]);
     }
 
     #[test]
     fn esc_is_never_forwarded() {
-        // Esc leaves insert mode. If it also reached the agent, leaving would
-        // interrupt whatever it was doing.
-        assert_eq!(fwd(KeyCode::Esc), Forwarded::Ignore);
+        // Esc leaves insert mode. Forwarding it too would interrupt the agent
+        // every time you left.
+        assert!(enc(KeyCode::Esc).is_empty());
     }
 
     #[test]
@@ -911,7 +1030,7 @@ mod tests {
         state.focus = Column::Terminal;
 
         let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
-        terminal.draw(|f| render(f, &state)).unwrap();
+        terminal.draw(|f| render(f, &state, None)).unwrap();
         let text: String = terminal
             .backend()
             .buffer()
@@ -933,10 +1052,9 @@ mod tests {
 
         let mut state = AppState::new(projects());
         state.project_idx = 1; // "beta", which has two sessions
-        state.preview = "hello from the agent".into();
 
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        terminal.draw(|f| render(f, &state)).unwrap();
+        terminal.draw(|f| render(f, &state, None)).unwrap();
 
         let rendered: String = terminal
             .backend()
@@ -949,34 +1067,10 @@ mod tests {
         assert!(rendered.contains("projects"), "project column missing");
         assert!(rendered.contains("sessions"), "session column missing");
         assert!(rendered.contains("alpha") && rendered.contains("beta"));
-        assert!(rendered.contains("hello from the agent"), "preview not drawn");
+        // With no live terminal attached the column says so.
+        assert!(rendered.contains("no session selected"));
         // The status line documents the vim keys.
         assert!(rendered.contains("hjkl"));
-    }
-
-    /// A pane's captured output carries SGR escapes; they must be parsed into
-    /// styles, not printed as literal `[38;5;246m` noise.
-    #[test]
-    fn ansi_in_the_capture_becomes_colour_not_text() {
-        use ratatui::backend::TestBackend;
-
-        let mut state = AppState::new(projects());
-        state.project_idx = 0;
-        state.preview = "\x1b[31mred\x1b[0m".into();
-
-        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        terminal.draw(|f| render(f, &state)).unwrap();
-
-        let buffer = terminal.backend().buffer();
-        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
-        assert!(text.contains("red"));
-        assert!(!text.contains("31m"), "escape leaked through as text");
-
-        let coloured = buffer
-            .content()
-            .iter()
-            .any(|c| c.fg == Color::Red);
-        assert!(coloured, "the escape was stripped instead of applied");
     }
 
     #[test]
