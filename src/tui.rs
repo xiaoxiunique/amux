@@ -53,6 +53,9 @@ pub struct AppState {
     /// filter — which leaves no room for hjkl, let alone forwarding keystrokes
     /// to an agent.
     pub filtering: bool,
+    /// `i` hands the keyboard to the selected session, vim-style: keys go to
+    /// the agent instead of the UI until `Esc`.
+    pub inserting: bool,
     /// Last captured screen of the selected session, raw with ANSI intact.
     pub preview: String,
 }
@@ -66,6 +69,7 @@ impl AppState {
             session_idx: 0,
             filter: String::new(),
             filtering: false,
+            inserting: false,
             preview: String::new(),
         }
     }
@@ -194,6 +198,58 @@ impl AppState {
     }
 }
 
+/// What one keypress becomes when it is forwarded to an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Forwarded {
+    /// Type these characters literally (`send-keys -l`).
+    Text(String),
+    /// Press this named key (`Enter`, `Up`, `C-c`, …).
+    Key(String),
+    /// Nothing the agent should see.
+    Ignore,
+}
+
+/// Translate a keypress into something `send-keys` understands.
+///
+/// Literal text and named keys are different `send-keys` modes: sending "Up"
+/// literally types those two letters instead of moving the cursor, which is
+/// why this distinction exists rather than one string.
+///
+/// `Esc` is deliberately absent — it leaves insert mode, and never reaches the
+/// agent. See `KEY_TO_INTERRUPT` for how to interrupt one instead.
+pub fn forward_key(code: KeyCode, modifiers: KeyModifiers) -> Forwarded {
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+
+    match code {
+        KeyCode::Char(c) if ctrl => Forwarded::Key(format!("C-{}", c.to_ascii_lowercase())),
+        // Send even a lone space literally: `send-keys Space` works, but going
+        // through the literal path keeps every printable character on one code
+        // path, including multi-byte ones an agent is routinely typed.
+        KeyCode::Char(c) => Forwarded::Text(c.to_string()),
+        KeyCode::Enter => Forwarded::Key("Enter".into()),
+        KeyCode::Backspace => Forwarded::Key("BSpace".into()),
+        KeyCode::Tab => Forwarded::Key("Tab".into()),
+        KeyCode::BackTab => Forwarded::Key("BTab".into()),
+        KeyCode::Delete => Forwarded::Key("DC".into()),
+        KeyCode::Insert => Forwarded::Key("IC".into()),
+        KeyCode::Home => Forwarded::Key("Home".into()),
+        KeyCode::End => Forwarded::Key("End".into()),
+        KeyCode::PageUp => Forwarded::Key("PageUp".into()),
+        KeyCode::PageDown => Forwarded::Key("PageDown".into()),
+        KeyCode::Up => Forwarded::Key("Up".into()),
+        KeyCode::Down => Forwarded::Key("Down".into()),
+        KeyCode::Left => Forwarded::Key("Left".into()),
+        KeyCode::Right => Forwarded::Key("Right".into()),
+        KeyCode::F(n) => Forwarded::Key(format!("F{n}")),
+        _ => Forwarded::Ignore,
+    }
+}
+
+/// Interrupting an agent normally means Esc, but Esc is spoken for — it is how
+/// you leave insert mode. `C-c` is forwarded and every agent here treats it as
+/// "stop", so it stands in.
+pub const KEY_TO_INTERRUPT: &str = "Ctrl-C";
+
 /// Group sessions into projects by their working directory.
 ///
 /// `session_cwd` is one subprocess per session, so this runs once per refresh
@@ -308,6 +364,31 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 }
                 dirty = true;
 
+                // Insert mode first: while it's on, the agent owns the
+                // keyboard and none of the navigation keys apply.
+                if state.inserting {
+                    if key.code == KeyCode::Esc {
+                        state.inserting = false;
+                        continue;
+                    }
+                    if let Some(name) = state.current_name() {
+                        match forward_key(key.code, key.modifiers) {
+                            Forwarded::Text(text) => {
+                                let _ = tmux::send_text(&name, &text);
+                            }
+                            Forwarded::Key(k) => {
+                                let _ = tmux::send_key(&name, &k);
+                            }
+                            Forwarded::Ignore => continue,
+                        }
+                        // Capture straight away: waiting out the idle interval
+                        // would make typing feel like it was going nowhere.
+                        refresh_preview(state);
+                        last_capture = Instant::now();
+                    }
+                    continue;
+                }
+
                 if state.filtering {
                     match key.code {
                         KeyCode::Esc | KeyCode::Enter => state.filtering = false,
@@ -330,6 +411,12 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     KeyCode::Char('k') | KeyCode::Up => state.move_up(),
                     KeyCode::Char('h') | KeyCode::Left => state.focus_left(),
                     KeyCode::Char('l') | KeyCode::Right => state.focus_right(),
+                    KeyCode::Char('i') => {
+                        if state.current_name().is_some() {
+                            state.inserting = true;
+                            state.focus = Column::Terminal;
+                        }
+                    }
                     KeyCode::Char('/') => {
                         state.filtering = true;
                         state.filter.clear();
@@ -374,7 +461,11 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
 
 /// Border style that marks which column owns the keyboard.
 fn border_for(state: &AppState, column: Column) -> (BorderType, Style) {
-    if state.focus == column {
+    if state.inserting && column == Column::Terminal {
+        // Distinct from ordinary focus: in insert mode a keypress goes to the
+        // agent, not the UI, and that had better be unmistakable.
+        (BorderType::Thick, Style::default().fg(Color::Green))
+    } else if state.focus == column && !state.inserting {
         (BorderType::Thick, Style::default().fg(Color::Cyan))
     } else {
         (BorderType::Plain, Style::default().fg(Color::DarkGray))
@@ -502,6 +593,24 @@ fn render_terminal(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
+    if state.inserting {
+        let name = state.current_name().unwrap_or_default();
+        let line = Line::from(vec![
+            Span::styled(
+                " -- INSERT -- ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  keys go to {name}   Esc leave   {KEY_TO_INTERRUPT} interrupt"
+            )),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     let help = if state.filtering {
         format!("/{}", state.filter)
     } else {
@@ -510,7 +619,7 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
         } else {
             format!("[/{}]  ", state.filter)
         };
-        format!("{filter}hjkl move  Enter attach  d kill  n new  / filter  q quit")
+        format!("{filter}hjkl move  i insert  Enter attach  d kill  n new  / filter  q quit")
     };
     f.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -719,6 +828,100 @@ mod tests {
         // Two sessions: it comes back.
         let pair = render_at(1);
         assert!(pair.contains("sessions"), "middle column missing for two sessions");
+    }
+
+    fn fwd(code: KeyCode) -> Forwarded {
+        forward_key(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn printable_keys_are_sent_literally() {
+        // Literally, not as a key name — `send-keys U` would press a key called
+        // "U", which is not the same as typing one.
+        assert_eq!(fwd(KeyCode::Char('a')), Forwarded::Text("a".into()));
+        assert_eq!(fwd(KeyCode::Char(' ')), Forwarded::Text(" ".into()));
+        assert_eq!(fwd(KeyCode::Char('你')), Forwarded::Text("你".into()));
+        // A digit is how you answer an agent's numbered prompt, so it must
+        // reach the agent rather than being read as a UI shortcut.
+        assert_eq!(fwd(KeyCode::Char('2')), Forwarded::Text("2".into()));
+    }
+
+    #[test]
+    fn navigation_and_editing_keys_go_by_name() {
+        assert_eq!(fwd(KeyCode::Enter), Forwarded::Key("Enter".into()));
+        assert_eq!(fwd(KeyCode::Up), Forwarded::Key("Up".into()));
+        assert_eq!(fwd(KeyCode::Down), Forwarded::Key("Down".into()));
+        assert_eq!(fwd(KeyCode::Backspace), Forwarded::Key("BSpace".into()));
+        assert_eq!(fwd(KeyCode::Tab), Forwarded::Key("Tab".into()));
+        assert_eq!(fwd(KeyCode::F(3)), Forwarded::Key("F3".into()));
+    }
+
+    #[test]
+    fn control_chords_become_mux_chord_names() {
+        assert_eq!(
+            forward_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Forwarded::Key("C-c".into())
+        );
+        // Shift+Ctrl still names the lowercase letter — `C-C` is not a thing.
+        assert_eq!(
+            forward_key(KeyCode::Char('C'), KeyModifiers::CONTROL),
+            Forwarded::Key("C-c".into())
+        );
+    }
+
+    #[test]
+    fn esc_is_never_forwarded() {
+        // Esc leaves insert mode. If it also reached the agent, leaving would
+        // interrupt whatever it was doing.
+        assert_eq!(fwd(KeyCode::Esc), Forwarded::Ignore);
+    }
+
+    #[test]
+    fn i_enters_insert_only_with_a_session_selected() {
+        let mut s = AppState::new(projects());
+        s.project_idx = 2; // "empty"
+        assert!(s.current_name().is_none());
+        // Mirrors the loop's guard: nothing to type into, so nothing happens.
+        assert!(!s.inserting);
+
+        s.project_idx = 0;
+        assert!(s.current_name().is_some());
+    }
+
+    #[test]
+    fn insert_mode_marks_the_terminal_column_differently_from_focus() {
+        let mut s = AppState::new(projects());
+        s.focus = Column::Terminal;
+
+        let (_, focused) = border_for(&s, Column::Terminal);
+        s.inserting = true;
+        let (_, inserting) = border_for(&s, Column::Terminal);
+        assert_ne!(
+            focused.fg, inserting.fg,
+            "insert looks identical to plain focus"
+        );
+    }
+
+    #[test]
+    fn the_status_line_announces_insert_mode() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(projects());
+        state.inserting = true;
+        state.focus = Column::Terminal;
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        terminal.draw(|f| render(f, &state)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(text.contains("INSERT"), "no insert indicator");
+        assert!(text.contains("Esc"), "no way out documented");
     }
 
     /// The layout is the whole point of this screen, so render it for real

@@ -130,8 +130,16 @@ pub fn send_text(name: &str, text: &str) -> Result<()> {
 
 /// Send a bare Enter keypress to a session's active pane.
 pub fn send_enter(name: &str) -> Result<()> {
+    send_key(name, "Enter")
+}
+
+/// Send one key by its multiplexer key name (`Enter`, `Up`, `BSpace`, `C-c`, …).
+///
+/// Distinct from [`send_text`], which sends its argument literally: a literal
+/// "Up" types those two letters, where this moves the cursor.
+pub fn send_key(name: &str, key: &str) -> Result<()> {
     Command::new(mux_bin())
-        .args(["send-keys", "-t", name, "Enter"])
+        .args(["send-keys", "-t", name, key])
         .status()?;
     Ok(())
 }
