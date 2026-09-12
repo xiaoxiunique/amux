@@ -41,15 +41,28 @@ pub fn builtin_agents() -> Vec<Agent> {
             // interface writes to the normal buffer like Claude and Codex do,
             // so history survives and the phone app can read it.
             //
-            // `--continue` resumes that directory's last conversation and
-            // replays it into the buffer. It is scoped to the working
-            // directory, and falls back to a fresh session when there is none.
-            command: vec![
-                "opencode".into(),
-                "--auto".into(),
-                "--mini".into(),
-                "--continue".into(),
-            ],
+            // No `--continue` here. Resuming is amux's job — it passes
+            // `--session <id>` for the conversation this session actually
+            // owns. `--continue` picks the directory's *latest*, so two
+            // opencode sessions in one directory would both reopen the same
+            // thread, and the second would appear to have lost its work.
+            command: vec!["opencode".into(), "--auto".into(), "--mini".into()],
+        },
+        Agent {
+            name: "pi".into(),
+            alias: "p".into(),
+            // No auto-approve flag here, because pi has no approval gate to
+            // switch off: its read/bash/edit/write tools run directly, which is
+            // exactly the state the other three need a flag to reach.
+            //
+            // `--approve` is a different thing — it trusts a directory's own
+            // extension and skill files, which are executable code shipped with
+            // the project rather than the agent. That stays opt-in (`p -a`).
+            //
+            // Nothing resumes here either: pi records a session id and its cwd,
+            // so `session_ids` pins the exact conversation the way it does for
+            // claude and codex, instead of the blunt `--continue` opencode needs.
+            command: vec!["pi".into()],
         },
     ]
 }
@@ -155,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn builtins_cover_the_three_shipped_agents() {
+    fn builtins_cover_the_shipped_agents() {
         let b = builtin_agents();
         let by_alias = |a: &str| b.iter().find(|x| x.alias == a).cloned();
         assert_eq!(by_alias("cc").unwrap().name, "claude");
@@ -166,12 +179,21 @@ mod tests {
         // scrollback: without it the session's history is unrecoverable and
         // the monitor can only ever capture the visible rows.
         assert!(oc.command.contains(&"--mini".to_string()));
-        assert!(oc.command.contains(&"--continue".to_string()));
+        // Resuming is amux's job (`--session <id>`), not a blanket --continue.
+        assert!(!oc.command.contains(&"--continue".to_string()));
         assert!(oc.command.contains(&"--auto".to_string()));
+        let pi = by_alias("p").expect("pi ships as a builtin");
+        assert_eq!(pi.name, "pi");
+        // pi runs its tools without an approval gate, so the command carries no
+        // auto-approve flag — and no `--continue`, because `session_ids` pins
+        // the exact conversation instead.
+        assert_eq!(pi.command, vec!["pi"]);
         validate(&b).unwrap();
         // find() resolves an agent by either name or alias.
         assert_eq!(find(&b, "oc").unwrap().name, "opencode");
         assert_eq!(find(&b, "opencode").unwrap().alias, "oc");
+        assert_eq!(find(&b, "p").unwrap().name, "pi");
+        assert_eq!(find(&b, "pi").unwrap().alias, "p");
     }
 
     #[test]

@@ -73,8 +73,27 @@ pub fn resume_args_with(
             args
         }
         "claude" => vec!["--resume".into(), id.to_string()],
+        // `--session <id>` reopens that exact conversation. Deliberately not
+        // `--continue`: continuing picks the directory's latest, so two
+        // sessions sharing a directory would both land on the same thread.
+        "opencode" => vec!["--session".into(), id.to_string()],
+        // `--session` takes a full or partial id and resolves it against this
+        // directory first, then every other one — so it reopens the exact
+        // conversation rather than the directory's latest.
+        "pi" => vec!["--session".into(), id.to_string()],
         _ => Vec::new(),
     }
+}
+
+/// Whether this agent records conversations we can list and resume by id.
+///
+/// Callers use this to avoid offering an agent whose listing would always be
+/// empty and whose resume would always fail.
+///
+/// opencode has no session *files* — its history lives in SQLite — so it needs
+/// naming here rather than being inferred from a storage root.
+pub fn supports_sessions(agent_name: &str) -> bool {
+    agent_name == "opencode" || agent_session_root(agent_name).is_some()
 }
 
 /// Root directory where an agent stores its per-session files.
@@ -83,6 +102,7 @@ fn agent_session_root(agent_name: &str) -> Option<PathBuf> {
     match agent_name {
         "codex" => Some(home.join(".codex").join("sessions")),
         "claude" => Some(home.join(".claude").join("projects")),
+        "pi" => Some(home.join(".pi").join("agent").join("sessions")),
         _ => None,
     }
 }
@@ -98,9 +118,29 @@ fn claude_project_dir(root: &Path, cwd: &Path) -> PathBuf {
     root.join(escaped)
 }
 
+/// pi escapes a cwd by dropping the leading separator, replacing `/`, `\` and
+/// `:` with `-`, and wrapping the result in `--` (e.g. `/a/b_c.d` ->
+/// `--a-b_c.d--`).
+///
+/// Deliberately narrower than Claude's rule: pi leaves every other character
+/// alone, so dots, underscores and non-ASCII names survive verbatim. Escaping
+/// more than it does would look for a directory that isn't there.
+fn pi_session_dir(root: &Path, cwd: &Path) -> PathBuf {
+    let trimmed = cwd.to_string_lossy().replace('\\', "/");
+    let trimmed = trimmed.strip_prefix('/').unwrap_or(&trimmed);
+    let escaped: String = trimmed
+        .chars()
+        .map(|c| if c == '/' || c == ':' { '-' } else { c })
+        .collect();
+    root.join(format!("--{escaped}--"))
+}
+
 /// Whether the recorded session `id` still has a backing file (so resuming it
 /// won't error). Best-effort; returns true when we can't tell.
 pub fn session_file_exists(agent_name: &str, cwd: &Path, id: &str) -> bool {
+    if agent_name == "opencode" {
+        return opencode_sessions(cwd, 200).iter().any(|s| s.id == id);
+    }
     let Some(root) = agent_session_root(agent_name) else {
         return true;
     };
@@ -110,8 +150,23 @@ pub fn session_file_exists(agent_name: &str, cwd: &Path, id: &str) -> bool {
             .exists(),
         // rollout filenames end with `-<id>.jsonl`
         "codex" => codex_rollout_with_id(&root, id).is_some(),
+        "pi" => pi_session_with_id(&root, cwd, id).is_some(),
         _ => true,
     }
+}
+
+/// pi names a session file `<timestamp>_<id>.jsonl`; the timestamp has no
+/// underscore of its own, so the tail after the last one is the id.
+fn pi_id_from_name(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    stem.rsplit_once('_').map(|(_, id)| id.to_string())
+}
+
+/// The pi session file for `id` under `cwd`'s directory, if it is still there.
+fn pi_session_with_id(root: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+    jsonl_files_in(&pi_session_dir(root, cwd))
+        .into_iter()
+        .find(|p| pi_id_from_name(p).as_deref() == Some(id))
 }
 
 fn mtime_epoch(p: &Path) -> f64 {
@@ -147,6 +202,27 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(p);
         }
     }
+}
+
+/// `*.jsonl` files directly inside `dir` (not recursive), newest mtime first.
+///
+/// Both claude and pi key their sessions by an escaped cwd, so locating a
+/// directory's conversations is a plain read of one directory — no scan limit
+/// needed, unlike codex's single flat tree.
+fn jsonl_files_in(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect();
+    files.sort_by(|a, b| {
+        mtime_epoch(b)
+            .partial_cmp(&mtime_epoch(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    files
 }
 
 /// First-line JSON of a codex rollout -> (cwd, id) from its `session_meta`.
@@ -256,18 +332,12 @@ fn codex_rollout_with_id(root: &Path, id: &str) -> Option<PathBuf> {    let need
 
 /// Newest claude session file for a cwd (its project dir).
 fn newest_claude_session_path(root: &Path, cwd: &Path) -> Option<PathBuf> {
-    let dir = claude_project_dir(root, cwd);
-    let mut best: Option<(PathBuf, f64)> = None;
-    for e in std::fs::read_dir(&dir).ok()?.flatten() {
-        let p = e.path();
-        if p.extension().is_some_and(|x| x == "jsonl") {
-            let m = mtime_epoch(&p);
-            if best.as_ref().map(|(_, bm)| m > *bm).unwrap_or(true) {
-                best = Some((p, m));
-            }
-        }
-    }
-    best.map(|(p, _)| p)
+    jsonl_files_in(&claude_project_dir(root, cwd)).into_iter().next()
+}
+
+/// Newest pi session file for a cwd (its escaped session dir).
+fn newest_pi_session_path(root: &Path, cwd: &Path) -> Option<PathBuf> {
+    jsonl_files_in(&pi_session_dir(root, cwd)).into_iter().next()
 }
 
 /// Newest claude session id for a cwd (its project dir).
@@ -283,6 +353,7 @@ pub fn session_file_for(agent_name: &str, cwd: &Path) -> Option<PathBuf> {
     match agent_name {
         "codex" => newest_codex_rollout_path(&root, cwd),
         "claude" => newest_claude_session_path(&root, cwd),
+        "pi" => newest_pi_session_path(&root, cwd),
         _ => None,
     }
 }
@@ -291,10 +362,15 @@ pub fn session_file_for(agent_name: &str, cwd: &Path) -> Option<PathBuf> {
 /// resume target on relaunch and to opportunistically record the live session's
 /// id on re-attach (a running agent writes the newest rollout for its cwd).
 pub fn current_id(agent_name: &str, cwd: &Path) -> Option<String> {
+    // opencode keeps no session files, so it never has a root.
+    if agent_name == "opencode" {
+        return opencode_sessions(cwd, 1).into_iter().next().map(|s| s.id);
+    }
     let root = agent_session_root(agent_name)?;
     match agent_name {
         "codex" => newest_codex_rollout_for(&root, cwd),
         "claude" => newest_claude_session(&root, cwd),
+        "pi" => newest_pi_session_path(&root, cwd).as_deref().and_then(pi_id_from_name),
         _ => None,
     }
 }
@@ -413,8 +489,7 @@ pub fn find_by_id_prefix(prefix: &str) -> Vec<FoundSession> {
     }
 
     // Codex: id is inside the file, and so is the cwd.
-    if let Some(root) = agent_session_root("codex") {
-        for p in jsonl_files_by_mtime(&root).into_iter().take(SCAN_LIMIT) {
+    if let Some(root) = agent_session_root("codex") {        for p in jsonl_files_by_mtime(&root).into_iter().take(SCAN_LIMIT) {
             // Cheap pre-filter: the id is also in the filename.
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
             if !name
@@ -436,7 +511,44 @@ pub fn find_by_id_prefix(prefix: &str) -> Vec<FoundSession> {
         }
     }
 
+    // pi: id is the tail of the filename, and the header line carries the cwd.
+    // Its directory names escape `/` to `-` without being reversible, same as
+    // Claude's, so the file is what says where the conversation belongs.
+    if let Some(root) = agent_session_root("pi") {
+        if let Ok(dirs) = std::fs::read_dir(&root) {
+            for d in dirs.flatten() {
+                for p in jsonl_files_in(&d.path()) {
+                    let Some(id) = pi_id_from_name(&p) else {
+                        continue;
+                    };
+                    if !id.to_lowercase().starts_with(&needle) {
+                        continue;
+                    }
+                    if let Some(cwd) = pi_cwd(&p) {
+                        out.push(FoundSession {
+                            agent: "pi",
+                            summary: session_summary(&p, "pi"),
+                            id,
+                            cwd,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     out
+}
+
+/// The cwd a pi transcript recorded in its header line.
+fn pi_cwd(path: &Path) -> Option<PathBuf> {
+    use std::io::{BufRead, BufReader};
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    BufReader::new(file).read_line(&mut first).ok()?;
+    let v: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+    v.get("cwd").and_then(|c| c.as_str()).map(PathBuf::from)
 }
 
 /// The cwd a Claude transcript recorded for itself.
@@ -530,18 +642,17 @@ fn first_user_prompt(path: &Path, agent: &str) -> Option<String> {
                 .filter(|t| t.as_str() == Some("user"))
                 .and(v.get("message"))
                 .and_then(|m| m.get("content"))
-                .and_then(|c| match c {
-                    serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Array(items) => {
-                        let joined: String = items
-                            .iter()
-                            .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        (!joined.is_empty()).then_some(joined)
-                    }
-                    _ => None,
-                }),
+                .and_then(content_text),
+            // {"type":"message","message":{"role":"user","content":[{"type":"text",…}]}}
+            // pi tags every turn `message` and puts the speaker inside, so the
+            // role — not the outer type — is what separates a user turn here.
+            "pi" => v
+                .get("type")
+                .filter(|t| t.as_str() == Some("message"))
+                .and(v.get("message"))
+                .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+                .and_then(|m| m.get("content"))
+                .and_then(content_text),
             _ => None,
         };
 
@@ -552,6 +663,24 @@ fn first_user_prompt(path: &Path, agent: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A message `content` as plain text: a bare string, or the `text` parts of a
+/// block array. Shared by claude and pi, which differ in how they mark a user
+/// turn but agree on how they carry its text.
+fn content_text(c: &serde_json::Value) -> Option<String> {
+    match c {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => {
+            let joined: String = items
+                .iter()
+                .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
 }
 
 /// Collapse whitespace and drop turns that aren't the user talking: tool
@@ -570,6 +699,74 @@ fn clean_prompt(raw: &str) -> String {
     collapsed
 }
 
+/// opencode's session store: one SQLite database, not a file per conversation.
+fn opencode_db() -> Option<PathBuf> {
+    let p = dirs::home_dir()?
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    p.exists().then_some(p)
+}
+
+/// opencode sessions for `cwd`, newest first.
+///
+/// Everything else here walks `*.jsonl` files; opencode keeps its history in
+/// SQLite, so it needs its own reader. Opened read-only — this is the running
+/// agent's live database.
+///
+/// Blank sessions are skipped: opencode creates one every time its UI opens a
+/// new tab, and they would otherwise crowd out the real conversations. A
+/// session is blank when it still carries the generated `New session - <ts>`
+/// title *and* has burned no tokens.
+fn opencode_sessions(cwd: &Path, limit: usize) -> Vec<PastSession> {
+    let Some(db) = opencode_db() else {
+        return Vec::new();
+    };
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Vec::new();
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT id, title, time_updated, tokens_input + tokens_output
+         FROM session
+         WHERE directory = ?1
+         ORDER BY time_updated DESC",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map([cwd.to_string_lossy().as_ref()], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1).unwrap_or_default(),
+            r.get::<_, i64>(2).unwrap_or(0),
+            r.get::<_, i64>(3).unwrap_or(0),
+        ))
+    });
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+
+    rows.filter_map(Result::ok)
+        .filter(|(_, title, _, tokens)| !(title.starts_with("New session - ") && *tokens == 0))
+        .take(limit)
+        .map(|(id, title, updated_ms, _)| PastSession {
+            id,
+            // No per-conversation file exists; the database stands in.
+            path: db.clone(),
+            modified: updated_ms as f64 / 1000.0,
+            // Deliberately 0: this field means bytes on disk, and opencode has
+            // none to report. Rendering a token count through a byte formatter
+            // would print "1.9 MB" for a conversation that occupies no file.
+            size: 0,
+            summary: (!title.is_empty()).then_some(title),
+        })
+        .collect()
+}
+
 /// The most recent `limit` sessions an agent recorded for `cwd`, newest first.
 ///
 /// Codex stores every rollout in one flat tree and records the cwd inside the
@@ -581,6 +778,10 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
     /// file read (only the first line is parsed), and rollouts for other
     /// projects are interleaved, so this trades completeness for speed.
     const SCAN_LIMIT: usize = 400;
+
+    if agent_name == "opencode" {
+        return opencode_sessions(cwd, limit);
+    }
 
     let Some(root) = agent_session_root(agent_name) else {
         return Vec::new();
@@ -612,20 +813,7 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
                 .collect()
         }
         "claude" => {
-            let dir = claude_project_dir(&root, cwd);
-            let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-                .collect();
-            files.sort_by(|a, b| {
-                mtime_epoch(b)
-                    .partial_cmp(&mtime_epoch(a))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            files
+            jsonl_files_in(&claude_project_dir(&root, cwd))
                 .into_iter()
                 .take(limit)
                 .map(|p| {
@@ -638,6 +826,11 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
                 })
                 .collect()
         }
+        "pi" => jsonl_files_in(&pi_session_dir(&root, cwd))
+            .into_iter()
+            .filter_map(|p| pi_id_from_name(&p).map(|id| describe(p, id)))
+            .take(limit)
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -765,6 +958,66 @@ mod tests {
         assert_eq!(d, Path::new("/root/-Users-me-proj-x-y"));
     }
 
+    /// pi drops the leading slash, maps only `/`, `\` and `:` to `-`, and wraps
+    /// the result in `--`. Escaping like Claude does (every non-alphanumeric)
+    /// would point at a directory that does not exist, and every pi resume
+    /// would silently come up empty.
+    #[test]
+    fn pi_session_dir_matches_pi_s_own_encoding() {
+        let root = Path::new("/root");
+        assert_eq!(
+            pi_session_dir(root, Path::new("/Users/not/projects/iotex")),
+            Path::new("/root/--Users-not-projects-iotex--")
+        );
+        // Dots, underscores and dashes survive — unlike Claude's rule.
+        assert_eq!(
+            pi_session_dir(root, Path::new("/Users/me/proj_x.y-z")),
+            Path::new("/root/--Users-me-proj_x.y-z--")
+        );
+        // Non-ASCII names are left alone too.
+        assert_eq!(
+            pi_session_dir(root, Path::new("/tmp/项目")),
+            Path::new("/root/--tmp-项目--")
+        );
+    }
+
+    /// The id is the tail after the last underscore; pi's timestamp prefix uses
+    /// dashes, so it never contributes one.
+    #[test]
+    fn pi_id_comes_from_the_filename_tail() {
+        assert_eq!(
+            pi_id_from_name(Path::new(
+                "/s/2026-09-03T02-07-50-766Z_01a06505-bfee-72c8-9325-064633e3831a.jsonl"
+            ))
+            .as_deref(),
+            Some("01a06505-bfee-72c8-9325-064633e3831a")
+        );
+        assert_eq!(pi_id_from_name(Path::new("/s/nounderscore.jsonl")), None);
+    }
+
+    /// pi marks a user turn by `message.role`, not by the outer entry type the
+    /// way Claude does — reading it Claude's way yields no summary at all.
+    #[test]
+    fn reads_a_pi_opening_prompt_and_resume_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("2026-09-03T02-07-50-766Z_01a06505-bfee.jsonl");
+        std::fs::write(
+            &f,
+            concat!(
+                r#"{"type":"session","version":3,"id":"01a06505-bfee","cwd":"/Users/not/projects/iotex"}"#, "\n",
+                r#"{"type":"model_change","provider":"cc-switch-claude-cn"}"#, "\n",
+                r#"{"type":"message","message":{"role":"user","content":[{"type":"text","text":"只回复四个字：配置成功"}]}}"#, "\n",
+                r#"{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"配置成功"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(session_summary(&f, "pi").as_deref(), Some("只回复四个字：配置成功"));
+        // The header line is where a pi transcript records its directory.
+        assert_eq!(pi_cwd(&f).as_deref(), Some(Path::new("/Users/not/projects/iotex")));
+        // `--session` reopens that exact conversation.
+        assert_eq!(resume_args("pi", "01a06505-bfee"), vec!["--session", "01a06505-bfee"]);
+    }
+
     #[test]
     fn newest_codex_rollout_matches_cwd_and_mtime() {
         let tmp = tempfile::tempdir().unwrap();
@@ -804,6 +1057,30 @@ mod tests {
     /// conversations. Recording the plain newest gave the second session the
     /// first one's thread; recording nothing lost named sessions entirely on
     /// the first rebuild.
+    /// opencode keeps history in SQLite, not files, so it needs its own
+    /// wiring at every point the other agents get for free from a storage
+    /// root. Pin the parts that don't need a database to check.
+    #[test]
+    fn opencode_is_a_first_class_session_agent() {
+        assert!(supports_sessions("opencode"));
+        assert!(supports_sessions("claude"));
+        assert!(!supports_sessions("gemini"));
+
+        // `--session <id>` reopens one exact conversation. `--continue` would
+        // take the directory's latest, which is wrong the moment two opencode
+        // sessions share a directory.
+        assert_eq!(
+            resume_args_with("opencode", "ses_abc123", false),
+            vec!["--session".to_string(), "ses_abc123".to_string()]
+        );
+        // An explicit provider changes nothing here — that flag only suppresses
+        // the codex provider patch.
+        assert_eq!(
+            resume_args_with("opencode", "ses_abc123", true),
+            vec!["--session".to_string(), "ses_abc123".to_string()]
+        );
+    }
+
     #[test]
     fn claiming_keeps_sibling_sessions_off_each_others_conversations() {
         let _home_guard = crate::test_home::lock();

@@ -18,7 +18,12 @@ pub fn list_sessions(limit: Option<usize>) -> Result<()> {
 
     println!("{}", cwd.display());
 
-    for (agent, label) in [("claude", "Claude Code"), ("codex", "Codex")] {
+    for (agent, label) in [
+        ("claude", "Claude Code"),
+        ("codex", "Codex"),
+        ("opencode", "opencode"),
+        ("pi", "pi"),
+    ] {
         let sessions = recent_sessions(agent, &cwd, limit);
         println!();
         if sessions.is_empty() {
@@ -30,10 +35,18 @@ pub fn list_sessions(limit: Option<usize>) -> Result<()> {
             // id + when + size on one line, the prompt indented under it —
             // descriptions are long and variable, so a column layout would
             // either truncate them harshly or push the metadata off-screen.
+            // opencode stores its history in SQLite, so it has no per-session
+            // file to measure. Printing "0B" would read as an empty
+            // conversation rather than an unavailable number.
+            let size = if s.size == 0 {
+                String::new()
+            } else {
+                human_size(s.size)
+            };
             println!(
                 "  {}  {:>8}  {}",
                 short_id(&s.id),
-                human_size(s.size),
+                size,
                 relative_time(s.modified),
             );
             if let Some(summary) = &s.summary {
@@ -98,9 +111,16 @@ pub fn resume_by_id(prefix: &str, agents: &[crate::config::Agent]) -> Result<()>
 }
 
 /// First 8 chars — enough to identify a session, and what the agents' own
-/// resume UIs display.
-fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
+/// resume UIs display. Also names the side session `amux <id>` opens when the
+/// directory's primary one is busy, so the name shows the id that was asked for.
+/// Enough of an id to identify and to retype.
+///
+/// opencode prefixes every id with a constant `ses_`, so a blind 8-character
+/// cut leaves only four that distinguish anything. Drop the prefix first and
+/// the budget goes to the part that varies.
+pub(crate) fn short_id(id: &str) -> String {
+    let body = id.strip_prefix("ses_").unwrap_or(id);
+    body.chars().take(8).collect()
 }
 
 /// Cut to `max` characters, counting by char so multi-byte text (these
