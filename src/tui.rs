@@ -4,6 +4,9 @@ use crate::tmux;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -19,6 +22,16 @@ use tui_term::widget::PseudoTerminal;
 /// How long to wait for a keypress before going back round to drain terminal
 /// output. Short enough that output feels immediate, long enough not to spin.
 const POLL: Duration = Duration::from_millis(8);
+
+/// How often to re-read the session list.
+///
+/// Sessions come and go outside this screen — `amux <id>` in another terminal,
+/// a `cc` in a new directory, an agent exiting. Reading the list once at
+/// startup meant none of that ever showed up.
+///
+/// Only the *names* are compared on each tick; the expensive part (a
+/// `session_cwd` subprocess per session) runs only when they actually differ.
+const RELOAD_EVERY: Duration = Duration::from_millis(1500);
 
 /// Floor between redraws, so a burst of output can't spin the renderer.
 const REDRAW_FLOOR: Duration = Duration::from_millis(16);
@@ -62,6 +75,9 @@ pub struct AppState {
     pub picking_agent: bool,
     /// Configured agents, so the picker can list them and map alias -> agent.
     pub agents: Vec<Agent>,
+    /// Session awaiting a kill confirmation. `d` is one key away from ending a
+    /// running agent, so it asks first.
+    pub confirming_kill: Option<String>,
     /// Transient message for the status line (what was just created, or why
     /// nothing was).
     pub notice: Option<String>,
@@ -82,6 +98,7 @@ impl AppState {
             filtering: false,
             inserting: false,
             picking_agent: false,
+            confirming_kill: None,
             agents,
             notice: None,
         }
@@ -402,12 +419,16 @@ fn term_size(area: Rect) -> (u16, u16) {
 fn event_loop(state: &mut AppState) -> Result<Outcome> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
     let mut live: Option<LiveTerm> = None;
     let mut last_draw = Instant::now() - REDRAW_FLOOR;
+    let mut last_reload = Instant::now();
+    let mut known: Vec<String> = managed_names(&state.agents);
+    // What was in use before insert mode switched to ASCII.
+    let mut saved_ime: Option<String> = None;
     let mut dirty = true;
 
     let result = loop {
@@ -439,14 +460,68 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             dirty = false;
         }
 
+        // Sessions appear and disappear outside this screen. Compare names
+        // first — regrouping means a `session_cwd` subprocess per session, and
+        // most ticks find nothing changed.
+        if last_reload.elapsed() >= RELOAD_EVERY {
+            last_reload = Instant::now();
+            let names = managed_names(&state.agents);
+            if names != known {
+                known = names;
+                let keep = state.current_name();
+                reload(state, keep);
+                dirty = true;
+            }
+        }
+
         // A short poll rather than a blocking read: output arrives on its own
         // schedule and has to be drained between keystrokes.
         if event::poll(POLL)? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+
+            if let Event::Mouse(MouseEvent { kind, column, row, .. }) = ev {
+                // Only the terminal column forwards — a wheel over the lists
+                // should move the selection, not scroll someone's agent.
+                let area = terminal_column(terminal.get_frame().area(), state);
+                let inside = column > area.x
+                    && column < area.x + area.width.saturating_sub(1)
+                    && row > area.y
+                    && row < area.y + area.height.saturating_sub(1);
+                if inside {
+                    if let Some(term) = live.as_mut() {
+                        let bytes = encode_mouse(kind, column - area.x - 1, row - area.y - 1);
+                        if !bytes.is_empty() {
+                            term.write(&bytes);
+                        }
+                    }
+                } else {
+                    match kind {
+                        MouseEventKind::ScrollDown => state.move_down(),
+                        MouseEventKind::ScrollUp => state.move_up(),
+                        _ => {}
+                    }
+                    dirty = true;
+                }
+                continue;
+            }
+
+            if let Event::Key(key) = ev {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 dirty = true;
+
+                // A pending kill takes the next key: y confirms, anything
+                // else cancels. Deliberately not Enter — the point is that a
+                // stray keystroke must not be able to confirm it.
+                if let Some(target) = state.confirming_kill.clone() {
+                    state.confirming_kill = None;
+                    if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                        break Outcome::Kill(target);
+                    }
+                    state.notice = Some("kill cancelled".into());
+                    continue;
+                }
 
                 // The picker eats exactly one key: an agent alias, or Esc.
                 if state.picking_agent {
@@ -478,6 +553,8 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 if state.inserting {
                     if key.code == KeyCode::Esc {
                         state.inserting = false;
+                        // Back to ASCII so hjkl navigate instead of typing.
+                        saved_ime = ime::drop_to_ascii();
                         continue;
                     }
                     if let Some(term) = live.as_mut() {
@@ -515,6 +592,8 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         if state.current_name().is_some() {
                             state.inserting = true;
                             state.focus = Column::Terminal;
+                            // Put back whatever was being typed with before.
+                            ime::restore(saved_ime.take());
                         }
                     }
                     KeyCode::Char('/') => {
@@ -549,9 +628,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         }
                     }
                     KeyCode::Char('d') => {
-                        if let Some(name) = state.current_name() {
-                            break Outcome::Kill(name);
-                        }
+                        state.confirming_kill = state.current_name();
                     }
                     KeyCode::Enter => {
                         if let Some(name) = state.current_name() {
@@ -564,12 +641,63 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
         }
     };
 
+    // Leave the input method as it was found, not as insert mode left it.
+    ime::restore(saved_ime.take());
     // Detach before restoring the screen, so the client goes away cleanly.
     drop(live);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     Ok(result)
+}
+
+/// Remember and restore the input method around insert mode.
+///
+/// Leaving insert mode with a CJK method still active makes `hjkl` type
+/// characters instead of moving — the navigation keys are unreachable exactly
+/// when you want them. Dropping to ASCII on the way out and restoring on the
+/// way back in keeps both halves usable.
+///
+/// Depends on `im-select`, which most machines will not have. Every failure is
+/// silent and leaves the input method alone: navigation must not break because
+/// a helper is missing.
+mod ime {
+    use std::process::Command;
+
+    const ASCII: &str = "com.apple.keylayout.ABC";
+
+    fn current() -> Option<String> {
+        let out = Command::new("im-select").output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    fn select(source: &str) {
+        let _ = Command::new("im-select")
+            .arg(source)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    /// Switch to ASCII, returning what was in use so it can be put back.
+    pub(super) fn drop_to_ascii() -> Option<String> {
+        let previous = current()?;
+        if previous == ASCII {
+            return None;
+        }
+        select(ASCII);
+        Some(previous)
+    }
+
+    pub(super) fn restore(previous: Option<String>) {
+        if let Some(source) = previous {
+            select(&source);
+        }
+    }
 }
 
 /// Start `agent` in the selected project's directory, without leaving the TUI.
@@ -614,6 +742,17 @@ fn spawn_agent(state: &mut AppState, agent: &Agent, force_extra: bool) -> Option
     }
 }
 
+/// Every managed session name currently on the server, sorted.
+fn managed_names(agents: &[Agent]) -> Vec<String> {
+    let all = tmux::list_session_names().unwrap_or_default();
+    let mut names: Vec<String> = managed_sessions(&all, agents)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    names.sort();
+    names
+}
+
 /// Re-read the session list, keeping `select` selected if it is still there.
 fn reload(state: &mut AppState, select: Option<String>) {
     let all = tmux::list_session_names().unwrap_or_default();
@@ -654,6 +793,29 @@ fn terminal_column(area: Rect, state: &AppState) -> Rect {
             .constraints([Constraint::Ratio(2, 11), Constraint::Ratio(9, 11)])
             .split(body)[1]
     }
+}
+
+/// Encode a mouse event as an SGR report, the way a real terminal would.
+///
+/// The attached client has `mouse on`, so forwarding these is what lets the
+/// wheel walk a session's scrollback — rmux enters copy-mode on its own,
+/// exactly as it does under a normal attach. Coordinates are relative to the
+/// terminal column and 1-based, which is what the protocol expects.
+pub fn encode_mouse(kind: MouseEventKind, col: u16, row: u16) -> Vec<u8> {
+    let button = match kind {
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Down(MouseButton::Middle) => 1,
+        MouseEventKind::Down(MouseButton::Right) => 2,
+        // Releases report the button that went up; the terminal only needs the
+        // final `m` to know it was a release.
+        MouseEventKind::Up(_) => {
+            return format!("\x1b[<0;{};{}m", col + 1, row + 1).into_bytes()
+        }
+        _ => return Vec::new(),
+    };
+    format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
 }
 
 /// Encode a keypress as the bytes a terminal application expects.
@@ -896,6 +1058,21 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
             Span::raw(format!(
                 "  keys go to {name}   Esc leave   {KEY_TO_INTERRUPT} interrupt"
             )),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    if let Some(target) = &state.confirming_kill {
+        let line = Line::from(vec![
+            Span::styled(
+                " kill? ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {target}   y to confirm, any other key cancels")),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -1308,6 +1485,55 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(text.contains("started cx_beta_22222222-2"));
+    }
+
+    #[test]
+    fn d_asks_before_killing() {
+        let mut s = AppState::with_agents(projects(), agents());
+        assert!(s.confirming_kill.is_none());
+
+        // `d` only arms it — the session is still there.
+        s.confirming_kill = s.current_name();
+        assert_eq!(s.confirming_kill.as_deref(), Some("cc_alpha_11111111"));
+    }
+
+    #[test]
+    fn the_confirmation_names_the_session_and_the_key() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::with_agents(projects(), agents());
+        state.confirming_kill = Some("cc_alpha_11111111".into());
+
+        let mut terminal = Terminal::new(TestBackend::new(110, 10)).unwrap();
+        terminal.draw(|f| render(f, &state, None)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        // Which session is about to die has to be on screen — that is the
+        // whole point of asking.
+        assert!(text.contains("cc_alpha_11111111"));
+        assert!(text.contains("kill?"));
+        assert!(text.contains('y'), "the confirming key is not documented");
+    }
+
+    #[test]
+    fn wheel_events_encode_as_sgr_reports() {
+        // What a real terminal sends, so the attached client's own `mouse on`
+        // handles scrollback without amux knowing anything about copy-mode.
+        assert_eq!(encode_mouse(MouseEventKind::ScrollUp, 0, 0), b"\x1b[<64;1;1M");
+        assert_eq!(encode_mouse(MouseEventKind::ScrollDown, 4, 9), b"\x1b[<65;5;10M");
+        // Coordinates are 1-based in the protocol, 0-based coming in.
+        assert_eq!(
+            encode_mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+            b"\x1b[<0;3;4M"
+        );
+        // Movement without a button carries no meaning here.
+        assert!(encode_mouse(MouseEventKind::Moved, 1, 1).is_empty());
     }
 
     /// The layout is the whole point of this screen, so render it for real
