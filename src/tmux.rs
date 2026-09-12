@@ -107,6 +107,19 @@ pub fn capture_pane(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Like [`capture_pane`], but keeping the SGR escapes.
+///
+/// The TUI's terminal column renders an agent's own colours, which `-e` is the
+/// only way to get — a plain capture flattens everything to the default
+/// foreground and an agent's UI becomes unreadable grey.
+pub fn capture_pane_ansi(name: &str) -> String {
+    Command::new(mux_bin())
+        .args(["capture-pane", "-p", "-e", "-t", name])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
 /// Send literal text (no trailing Enter) to a session's active pane.
 pub fn send_text(name: &str, text: &str) -> Result<()> {
     Command::new(mux_bin())

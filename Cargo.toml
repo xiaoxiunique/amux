@@ -39,6 +39,7 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 # Optional — only pulled in by the `full` feature (agent-port host build).
 jsonwebtoken = { version = "9", optional = true }
+ansi-to-tui = "6.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
