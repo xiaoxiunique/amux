@@ -297,14 +297,14 @@ pub fn restore(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<()> {
 
         tmux::new_session_detached(&name, &cwd.to_string_lossy())?;
         let shell_cmd = if env_vars.is_empty() {
-            tmux::shell_join(&argv)
+            tmux::shell_launch(&argv)
         } else {
             let env_prefix: String = env_vars
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, tmux::shell_quote(v)))
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!("{} {}", env_prefix, tmux::shell_join(&argv))
+            format!("{} {}", env_prefix, tmux::shell_launch(&argv))
         };
         tmux::send_command(&name, &shell_cmd)?;
         // Same prompts `run` handles. Without this a restored codex session

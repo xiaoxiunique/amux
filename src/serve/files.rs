@@ -504,6 +504,7 @@ mod tests {
     fn nested_roots_collapse_into_their_ancestor() {
         // Uses real project paths: tempdirs live under /var/folders, which the
         // forbidden-root guard (correctly) rejects.
+        let _home_guard = crate::test_home::lock();
         let home = dirs::home_dir().unwrap();
         let outer = home.join("projects/devs/opensource");
         let inner = outer.join("amux");
@@ -525,6 +526,7 @@ mod tests {
         // and "/private/tmp". Because roots absorb their descendants, those
         // entries turned credential stores and the whole home directory into
         // browsable space. All must be dropped outright.
+        let _home_guard = crate::test_home::lock();
         let home = dirs::home_dir().unwrap();
         let hs = |sub: &str| home.join(sub).to_string_lossy().into_owned();
         let rs = roots(
@@ -552,6 +554,7 @@ mod tests {
     fn a_project_under_home_is_still_allowed() {
         // The guard rejects $HOME and its dot/Library subtrees, not every path
         // beneath it — a normal project directory must still be browsable.
+        let _home_guard = crate::test_home::lock();
         let home = dirs::home_dir().unwrap();
         let proj = home.join("projects/devs/opensource/amux");
         if !proj.is_dir() {

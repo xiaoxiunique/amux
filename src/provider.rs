@@ -291,6 +291,7 @@ mod tests {
         // opencode takes no --settings/-p, so `oc ds` must pass `ds` through
         // as an ordinary argument rather than resolving it as a provider.
         assert!(!infers_provider_from_first_arg("opencode"));
+        assert!(!infers_provider_from_first_arg("pi"));
         assert!(!infers_provider_from_first_arg("gemini"));
     }
 

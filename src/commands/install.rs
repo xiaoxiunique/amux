@@ -63,6 +63,8 @@ pub fn install_agents(agents: &[crate::config::Agent], china: bool) -> Result<()
         let (npm_pkg, brew_formula) = match name.as_str() {
             "claude" => ("@anthropic-ai/claude-code", Some("claude-cli")),
             "codex" => ("@openai/codex", Some("codex")),
+            // npm only — pi ships no brew formula.
+            "pi" => ("@earendil-works/pi-coding-agent", None),
             _ => continue,
         };
 

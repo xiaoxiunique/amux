@@ -81,22 +81,54 @@ pub fn run_in(
     let cwd = cwd
         .canonicalize()
         .with_context(|| format!("cannot canonicalize {}", cwd.display()))?;
-    let name = session::session_name(&agent.alias, &cwd);
+    let base = session::session_name(&agent.alias, &cwd);
 
     let tmux_ok = tmux::is_available();
-    let session_exists = tmux_ok && tmux::has_session(&name);
+    let live = |n: &str| tmux_ok && tmux::has_session(n);
 
-    // Pin the resume target to the requested id. A live session for this
-    // directory is re-attached as-is: the agent is already running in it, and
-    // relaunching would abandon that process.
+    // Which session should hold this conversation?
+    //
+    // The directory's primary session is its home only while it is free, or
+    // already on this very thread. Once it is busy with a *different* one,
+    // taking it over would abandon the agent running there — so the request
+    // used to be dropped instead, silently re-attaching the caller to whatever
+    // was already open. Give the conversation a session of its own, named the
+    // way `amux new` names a second workspace for a directory.
+    let (name, session_exists) = if !live(&base) || already_open(agent, &cwd, &base, session_id) {
+        let exists = live(&base);
+        (base, exists)
+    } else {
+        let side = format!("{base}-{}", super::list::short_id(session_id));
+        let exists = live(&side);
+        if !exists {
+            println!("{base} is on another conversation — opening {side} alongside it");
+        }
+        (side, exists)
+    };
+
+    // Pin the resume target to the requested id.
     let mut argv = agent.command.clone();
     if !session_exists {
         argv.extend(super::session_ids::resume_args(&agent.name, session_id));
-        // Remember it, so a later plain `cc`/`cx` here resumes the same thread.
+        // Remember it, so relaunching this session resumes the same thread.
         super::session_ids::store_id(&name, session_id);
     }
 
     launch(agent, &cwd, &name, argv, Vec::new(), session_exists, tmux_ok, agents)
+}
+
+/// Whether the directory's primary session is already holding `session_id`.
+///
+/// The recorded id is the authoritative answer — every attach writes it. Only
+/// when nothing is recorded (a session predating the store, or one rebuilt
+/// after it was cleared) does the directory's newest conversation stand in,
+/// since a live session is the process writing it. Answering "no" wrongly
+/// starts a second agent on a transcript that already has a writer.
+fn already_open(agent: &Agent, cwd: &std::path::Path, base: &str, session_id: &str) -> bool {
+    match super::session_ids::load_id(base) {
+        Some(id) => id == session_id,
+        None => super::session_ids::current_id(&agent.name, cwd).as_deref() == Some(session_id),
+    }
 }
 
 /// Start (or reattach) a session under an explicit name, with a fresh agent.
@@ -200,14 +232,14 @@ fn launch(
         tmux::new_session_detached(name, &cwd.to_string_lossy())?;
         // Build the command with env var prefixes for tmux send-keys
         let shell_cmd = if env_vars.is_empty() {
-            tmux::shell_join(&argv)
+            tmux::shell_launch(&argv)
         } else {
             let env_prefix: String = env_vars
                 .iter()
                 .map(|(k, v)| format!("{}={}", k, tmux::shell_quote(v)))
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!("{} {}", env_prefix, tmux::shell_join(&argv))
+            format!("{} {}", env_prefix, tmux::shell_launch(&argv))
         };
         tmux::send_command(name, &shell_cmd)?;
 
@@ -236,4 +268,73 @@ fn launch(
     // Auto-save session list before attaching (exec replaces the process)
     super::sessions::auto_save(agents);
     tmux::attach_or_switch(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::session_ids;
+    use crate::config::Agent;
+
+    fn claude() -> Agent {
+        Agent {
+            name: "claude".into(),
+            alias: "cc".into(),
+            command: vec!["claude".into()],
+        }
+    }
+
+    /// Claude's escaping of a cwd into its project directory name.
+    fn project_dir(home: &std::path::Path, cwd: &std::path::Path) -> std::path::PathBuf {
+        let escaped: String = cwd
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        home.join(".claude").join("projects").join(escaped)
+    }
+
+    /// The question `amux <id>` gets wrong in both directions if this lies: a
+    /// "yes" for a session busy with another thread silently drops the id (the
+    /// caller lands back in whatever was already open), while a "no" for the
+    /// session already holding it starts a second agent on one transcript.
+    #[test]
+    fn a_busy_primary_session_is_not_mistaken_for_the_requested_one() {
+        let _home_guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // The recorded id is the answer when there is one.
+        session_ids::store_id("cc_proj_1a2b3c4d", "conv-a");
+        assert!(already_open(&claude(), &cwd, "cc_proj_1a2b3c4d", "conv-a"));
+        assert!(!already_open(&claude(), &cwd, "cc_proj_1a2b3c4d", "conv-b"));
+
+        // With nothing recorded, the directory's newest transcript stands in —
+        // a live session is the process writing it.
+        let dir = project_dir(tmp.path(), &cwd);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("conv-newest.jsonl"), "{}\n").unwrap();
+        assert!(already_open(&claude(), &cwd, "cc_proj_unrecorded", "conv-newest"));
+        assert!(!already_open(&claude(), &cwd, "cc_proj_unrecorded", "conv-older"));
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    /// The side session must stay an amux-managed name, or `amux ls` and the
+    /// monitor would both lose track of it.
+    #[test]
+    fn the_side_session_name_is_still_managed() {
+        let base = session::session_name("cc", std::path::Path::new("/tmp/proj"));
+        let side = format!("{base}-{}", super::super::list::short_id("38977f06-5144-4e3c"));
+        assert_eq!(side, format!("{base}-38977f06"));
+        let managed = super::super::sessions::managed_sessions(&[side.clone()], &[claude()]);
+        assert_eq!(managed.len(), 1, "{side} must be recognized as managed");
+    }
 }

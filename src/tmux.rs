@@ -14,6 +14,21 @@ pub fn shell_join(argv: &[String]) -> String {
     argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
 }
 
+/// Like [`shell_join`], but for a line we are about to *type into a shell*.
+///
+/// `send_command` drives an interactive shell, which expands aliases and
+/// functions. That turns a natural alias into an infinite loop: with
+/// `alias pi='amux run pi'`, amux builds the line `pi`, sends it, the shell
+/// expands it back to `amux run pi`, and amux starts over — forever. The trap
+/// only springs when an alias shares a name with the agent's binary, which is
+/// why `cc`/`cx`/`oc` never hit it and `pi` does.
+///
+/// `command` is the POSIX builtin that skips alias and function lookup, so the
+/// real executable runs no matter what the user's rc file defines.
+pub fn shell_launch(argv: &[String]) -> String {
+    format!("command {}", shell_join(argv))
+}
+
 use anyhow::{bail, Result};
 use std::process::Command;
 
@@ -263,9 +278,26 @@ mod tests {
         assert_eq!(shell_join(&["claude".into(), "--yolo".into()]), "claude --yolo");
     }
 
+    /// A launch line must run the binary, not whatever the user's rc file bound
+    /// that name to. `alias pi='amux run pi'` is the natural alias to write, and
+    /// without `command` it makes amux relaunch itself forever: the shell that
+    /// `send_command` types into expands the alias right back into `amux run`.
     #[test]
-    fn spaces_and_quotes_are_escaped() {
-        let joined = shell_join(&["echo".into(), "a b".into()]);
+    fn launch_lines_bypass_aliases() {
+        assert_eq!(shell_launch(&["pi".into()]), "command pi");
+        // Quoting still applies to the arguments.
+        assert_eq!(
+            shell_launch(&["pi".into(), "--session".into(), "a b".into()]),
+            "command pi --session 'a b'"
+        );
+        // An env prefix composes in front of it: `KEY=v command pi …` is still
+        // a valid line, with `command` in the command position where it counts.
+        let line = format!("KEY=v {}", shell_launch(&["pi".into()]));
+        assert_eq!(line, "KEY=v command pi");
+    }
+
+    #[test]
+    fn spaces_and_quotes_are_escaped() {        let joined = shell_join(&["echo".into(), "a b".into()]);
         assert_eq!(joined, "echo 'a b'");
         let joined = shell_join(&["echo".into(), "it's".into()]);
         assert_eq!(joined, r#"echo 'it'\''s'"#);

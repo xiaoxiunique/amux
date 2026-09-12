@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentSessions {
-    /// "claude" or "codex".
+    /// The agent's configured name, e.g. "claude", "codex" or "pi".
     pub agent: String,
     pub sessions: Vec<PastSession>,
 }
@@ -29,18 +29,33 @@ pub const DEFAULT_LIMIT: usize = 20;
 /// Cap on `limit`, so a client can't ask us to parse thousands of transcripts.
 const MAX_LIMIT: usize = 100;
 
-/// List recent conversations for `dir`, newest first, for both agents.
+/// Every configured agent whose conversations can be listed and resumed.
+///
+/// Driven by the agent list rather than a hardcoded pair, so an agent added to
+/// config.toml (or shipped as a new builtin) shows up here too. Agents without
+/// a session store are skipped — an always-empty group is noise to the client.
+fn listable_agents() -> Vec<String> {
+    let agents =
+        crate::config::resolve_agents().unwrap_or_else(|_| crate::config::builtin_agents());
+    agents
+        .into_iter()
+        .filter(|a| session_ids::supports_sessions(&a.name))
+        .map(|a| a.name)
+        .collect()
+}
+
+/// List recent conversations for `dir`, newest first, for every listable agent.
 ///
 /// Blocking: reads and parses transcript files. Call inside `spawn_blocking`.
 pub fn list(dir: &str, limit: Option<usize>) -> Result<Vec<AgentSessions>, String> {
     let cwd = canonical_project_dir(dir)?;
     let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 
-    Ok(["claude", "codex"]
+    Ok(listable_agents()
         .into_iter()
         .map(|agent| AgentSessions {
-            agent: agent.to_string(),
-            sessions: session_ids::recent_sessions(agent, &cwd, limit),
+            sessions: session_ids::recent_sessions(&agent, &cwd, limit),
+            agent,
         })
         .collect())
 }
@@ -59,7 +74,7 @@ pub fn resume(
 ) -> Result<String, String> {
     let cwd = canonical_project_dir(dir)?;
     let agent = agent.trim().to_ascii_lowercase();
-    if agent != "claude" && agent != "codex" {
+    if !session_ids::supports_sessions(&agent) {
         return Err(format!("unsupported agent: {agent}"));
     }
     if session_id.trim().is_empty() {
@@ -70,10 +85,18 @@ pub fn resume(
     }
     let suffix = sanitize_suffix(suffix)?;
 
-    let alias = if agent == "codex" { "cx" } else { "cc" };
+    // The alias comes from the agent list, so the name matches what the CLI
+    // would build. Deriving it as "cx for codex, cc for everything else" put
+    // every other agent's session under a `cc_` name that pointed at the wrong
+    // agent entirely.
+    let agents =
+        crate::config::resolve_agents().unwrap_or_else(|_| crate::config::builtin_agents());
+    let alias = crate::config::find(&agents, &agent)
+        .map(|a| a.alias.clone())
+        .ok_or_else(|| format!("unsupported agent: {agent}"))?;
     let name = format!(
         "{}-{}",
-        crate::session::session_name(alias, &cwd),
+        crate::session::session_name(&alias, &cwd),
         suffix
     );
 

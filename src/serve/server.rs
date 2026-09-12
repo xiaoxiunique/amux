@@ -969,16 +969,43 @@ fn project_name_from_path(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn session_agent_alias(session: &str) -> Option<&str> {
+/// The configured agent list, resolved once per daemon.
+///
+/// `build_snapshot` consults this for every pane on every poll, so re-reading
+/// config.toml each time would cost a file read per pane per cycle. A daemon
+/// that outlives a config edit is the accepted trade: picking up a new agent
+/// already means restarting `amux serve` for the new binary anyway.
+fn configured_agents() -> &'static [crate::config::Agent] {
+    static AGENTS: LazyLock<Vec<crate::config::Agent>> = LazyLock::new(|| {
+        crate::config::resolve_agents().unwrap_or_else(|_| crate::config::builtin_agents())
+    });
+    &AGENTS
+}
+
+/// The agent an amux session name belongs to, or None when the name wasn't
+/// produced by amux.
+///
+/// Names are `<alias>[-<provider>]_<slug>_<hash8>[-<suffix>]`, so the alias is
+/// everything before the first `_` minus any `-<provider>` tail. Resolving it
+/// against the configured list — rather than a hardcoded `cc`/`cx` pair — is
+/// what lets a newly added agent be recognised here without a second edit.
+fn session_agent_name(session: &str) -> Option<&'static str> {
     let prefix = session.split_once('_')?.0;
     let alias = prefix
         .split_once('-')
         .map(|(alias, _)| alias)
         .unwrap_or(prefix);
-    match alias {
-        "cc" | "cx" => Some(alias),
-        _ => None,
-    }
+    configured_agents()
+        .iter()
+        .find(|a| a.alias == alias)
+        .map(|a| a.name.as_str())
+}
+
+/// The session-name alias for an agent, from the configured list.
+fn agent_alias(agent: &str) -> Result<&'static str, String> {
+    crate::config::find(configured_agents(), agent)
+        .map(|a| a.alias.as_str())
+        .ok_or_else(|| format!("unsupported agent: {agent}"))
 }
 
 fn agent_kind_for_pane(pane: &BasePane, tail: &str) -> Option<&'static str> {
@@ -986,10 +1013,8 @@ fn agent_kind_for_pane(pane: &BasePane, tail: &str) -> Option<&'static str> {
     // even when its terminal is full of the word "codex" (e.g. a conversation
     // *about* codex), and vice versa. Content sniffing is only a fallback for
     // panes not launched by amux.
-    match session_agent_alias(&pane.session) {
-        Some("cx") => return Some("codex"),
-        Some("cc") => return Some("claude"),
-        _ => {}
+    if let Some(name) = session_agent_name(&pane.session) {
+        return Some(name);
     }
 
     if is_codex_pane(pane, tail) {
@@ -1005,7 +1030,7 @@ fn agent_kind_for_pane(pane: &BasePane, tail: &str) -> Option<&'static str> {
 }
 
 fn project_session_name(agent: &str, path: &str) -> Result<String, String> {
-    let alias = if agent == "codex" { "cx" } else { "cc" };
+    let alias = agent_alias(agent)?;
     // Reuse the CLI's naming (crate::session) so a project launched from the web
     // UI / app lands on the SAME tmux session `amux run` would create for that
     // directory. Canonicalize first to match run.rs's cwd handling and its
@@ -1015,13 +1040,15 @@ fn project_session_name(agent: &str, path: &str) -> Result<String, String> {
 }
 
 fn agent_launch_command(agent: &str) -> Result<String, String> {
+    // Legacy per-agent overrides. Only these two ever had one; every other
+    // agent goes straight to the shared list rather than being rejected.
     let env_key = match agent {
-        "claude" => "AGENT_MONITOR_CC_COMMAND",
-        "codex" => "AGENT_MONITOR_CX_COMMAND",
-        _ => return Err(format!("unsupported agent: {agent}")),
+        "claude" => Some("AGENT_MONITOR_CC_COMMAND"),
+        "codex" => Some("AGENT_MONITOR_CX_COMMAND"),
+        _ => None,
     };
-    if let Some(value) = env::var(env_key)
-        .ok()
+    if let Some(value) = env_key
+        .and_then(|key| env::var(key).ok())
         .filter(|value| !value.trim().is_empty())
     {
         return Ok(value);
@@ -1033,9 +1060,7 @@ fn agent_launch_command(agent: &str) -> Result<String, String> {
     // so a session resumed from the phone sat waiting for permission prompts.
     // Reading the shared list also means a config.toml override applies to
     // both, and a newly added agent needs no second edit here.
-    let agents =
-        crate::config::resolve_agents().unwrap_or_else(|_| crate::config::builtin_agents());
-    crate::config::find(&agents, agent)
+    crate::config::find(configured_agents(), agent)
         .map(|a| crate::tmux::shell_join(&a.command))
         .ok_or_else(|| format!("unsupported agent: {agent}"))
 }
@@ -1087,16 +1112,20 @@ pub(crate) fn mux_new_session(name: &str, cwd: &str, command: &str) -> Result<()
 }
 
 fn is_codex_pane(pane: &BasePane, tail: &str) -> bool {
+    // A recognised amux prefix settles it. Falling through to content sniffing
+    // for a known non-codex agent is how a pi or opencode pane got called codex
+    // the moment its terminal mentioned "gpt-".
+    if let Some(name) = session_agent_name(&pane.session) {
+        return name == "codex";
+    }
+
     let haystack = format!(
         "{}\n{}\n{}\n{}",
         pane.session, pane.command, pane.title, tail
     )
     .to_lowercase();
 
-    session_agent_alias(&pane.session) == Some("cx")
-        || pane.command == "codex"
-        || haystack.contains("codex")
-        || haystack.contains("gpt-")
+    pane.command == "codex" || haystack.contains("codex") || haystack.contains("gpt-")
 }
 
 fn hook_status_for_pane(pane: &BasePane) -> Option<(PaneStatus, String)> {
@@ -1252,6 +1281,19 @@ fn infer_status(
         .join("\n")
         .to_lowercase();
 
+    // A live interrupt spinner proves the agent is mid-turn *right now*, so it
+    // outranks the keyword scans below. Those read the bottom of the screen,
+    // which for codex also carries tool-call echoes ("Search …|confirm in
+    // main.rs") and start-up warnings ("MCP startup incomplete (failed: …)").
+    // Reading that content as a prompt reported a working agent as Waiting and
+    // a healthy one as Failed — and it latched, because a quiet pane keeps
+    // those lines on screen indefinitely. A real confirmation prompt replaces
+    // the spinner rather than sitting beside it, so nothing that genuinely
+    // needs input gets masked by this.
+    if agent_like && agent_actively_working(tail) {
+        return (PaneStatus::Running, "agent reports active work".to_string());
+    }
+
     // A crash or an on-screen prompt at the bottom of the pane needs the user's
     // attention and takes priority even over active work — check these first,
     // but only against `prompt_zone` so scrollback that merely mentions the
@@ -1299,18 +1341,15 @@ fn infer_status(
         return (PaneStatus::Waiting, "looks like it needs input".to_string());
     }
 
-    // Liveness: an agent actively writing its session file (or showing the live
-    // "esc to interrupt" spinner) is Running. When no session file is found,
-    // fall back to the terminal change signal.
+    // Liveness: an agent actively writing its session file is Running. When no
+    // session file is found, fall back to the terminal change signal. (The live
+    // spinner is handled above, before the keyword scans.)
     let file_fresh = file_age.map(|a| a < RUNNING_WINDOW_SECS).unwrap_or(false);
-    let live_agent_work = agent_actively_working(tail);
     let file_fallback = file_age.is_none() && changed_recently;
 
-    if agent_like && (file_fresh || live_agent_work || file_fallback) {
+    if agent_like && (file_fresh || file_fallback) {
         let why = if file_fresh {
             "session file is actively being written"
-        } else if live_agent_work {
-            "agent reports active work"
         } else {
             "recent output changed"
         };
@@ -3243,14 +3282,12 @@ async fn api_pane_context(
     )
 }
 
-/// Field-based Claude detection mirroring `agent_kind_for_pane`: the `cc_`/`cx_`
+/// Field-based Claude detection mirroring `agent_kind_for_pane`: the amux
 /// session prefix is authoritative, so a Claude pane whose terminal mentions
 /// "codex" is still Claude (and its queue isn't stranded).
 pub(crate) fn pane_is_claude(session: &str, command: &str, title: &str) -> bool {
-    match session_agent_alias(session) {
-        Some("cc") => return true,
-        Some("cx") => return false,
-        _ => {}
+    if let Some(name) = session_agent_name(session) {
+        return name == "claude";
     }
     if command == "codex" {
         return false;
@@ -3263,10 +3300,8 @@ pub(crate) fn pane_is_claude(session: &str, command: &str, title: &str) -> bool 
 }
 
 pub(crate) fn pane_is_codex(session: &str, command: &str, title: &str) -> bool {
-    match session_agent_alias(session) {
-        Some("cx") => return true,
-        Some("cc") => return false,
-        _ => {}
+    if let Some(name) = session_agent_name(session) {
+        return name == "codex";
     }
     let hay = format!("{session}\n{command}\n{title}").to_lowercase();
     command == "codex" || hay.contains("codex") || hay.contains("gpt-")
@@ -5283,6 +5318,37 @@ mod tests {
         assert_eq!(s, PaneStatus::Failed);
     }
 
+    /// A working agent must not be reported as Waiting/Failed because of text
+    /// it printed itself. Both tails below are real: codex echoes its tool
+    /// calls (a search for the literal word "confirm") and leaves the start-up
+    /// MCP warning on screen. With the keyword scans running first, a session
+    /// that was actively working showed up as "needs input" / "failed", and it
+    /// stayed that way for as long as the pane stayed quiet.
+    #[test]
+    fn a_live_spinner_outranks_stray_keywords() {
+        let p = pane("cx_proj_1a2b3c4d");
+
+        let echoed_tool_call = "Read main.rs\n\
+             Search upload|cloud|mark_session_ready|confirm in main.rs\n\
+             • Working (3m 51s • esc to interrupt) · 2 background terminals running · /stop to close\n\
+             › Explain this codebase";
+        let (s, _) = infer_status(&p, echoed_tool_call, false, None);
+        assert_eq!(s, PaneStatus::Running, "tool-call echo must not read as a prompt");
+
+        let startup_warning = "ConnectionRefusedError: [Errno 61] Connection refused\n\
+             ⚠ MCP startup incomplete (failed: ida-pro-mcp)\n\
+             • Working (12s • esc to interrupt) · /stop to close";
+        let (s, _) = infer_status(&p, startup_warning, false, None);
+        assert_eq!(s, PaneStatus::Running, "start-up warning must not latch Failed");
+
+        // Without the spinner the prompt still wins — a real confirmation
+        // replaces the spinner rather than sitting beside it.
+        let (s, _) = infer_status(&p, "Do you want to proceed?", false, None);
+        assert_eq!(s, PaneStatus::Waiting);
+        let (s, _) = infer_status(&p, "ConnectionRefusedError: [Errno 61] refused", false, None);
+        assert_eq!(s, PaneStatus::Failed);
+    }
+
     #[test]
     fn session_prefix_wins_over_tail_content() {
         // A Claude pane whose terminal is full of "codex"/"gpt-" must still be
@@ -5309,6 +5375,57 @@ mod tests {
         );
         assert!(!pane_is_claude(&cx.session, &cx.command, &cx.title));
         assert!(is_codex_pane(&cx, ""));
+    }
+
+    /// Every configured agent must be identifiable from its session prefix, not
+    /// just the original `cc`/`cx` pair. While only those two were recognised,
+    /// a `p_` pane fell through to content sniffing: it was classified as codex
+    /// the moment its terminal said "gpt-", never updated the project history,
+    /// and the UI derived a `cc_`/`cx_` name that pointed at the wrong session.
+    #[test]
+    fn every_configured_agent_is_recognised_by_its_prefix() {
+        let pi = pane("p_proj_1a2b3c4d");
+        assert_eq!(agent_kind_for_pane(&pi, "about gpt-5 and claude"), Some("pi"));
+        // A known non-codex agent must not be sniffed into codex.
+        assert!(!is_codex_pane(&pi, "about gpt-5 and codex"));
+        assert!(!pane_is_claude(&pi.session, &pi.command, &pi.title));
+        assert!(!pane_is_codex(&pi.session, &pi.command, &pi.title));
+
+        let oc = pane("oc_proj_1a2b3c4d");
+        assert_eq!(agent_kind_for_pane(&oc, ""), Some("opencode"));
+
+        // A provider-suffixed name resolves to the same agent: `cx-ds_…` is
+        // codex, and must be recognised without help from the terminal text.
+        let dsp = pane("cx-ds_proj_1a2b3c4d");
+        assert_eq!(agent_kind_for_pane(&dsp, ""), Some("codex"));
+
+        // A name amux did not produce still falls back to content sniffing.
+        // (codex sniffing reads the tail; claude's reads session/command/title.)
+        let stray = pane("randomshell");
+        assert_eq!(agent_kind_for_pane(&stray, "codex is running"), Some("codex"));
+        let stray_cc = pane("my-claude-shell");
+        assert_eq!(agent_kind_for_pane(&stray_cc, ""), Some("claude"));
+    }
+
+    /// The session name the UI launches into must use the agent's own alias.
+    /// "cx for codex, cc for everything else" sent pi and opencode to a `cc_`
+    /// session belonging to Claude.
+    #[test]
+    fn project_session_name_uses_each_agents_alias() {
+        let name = project_session_name("pi", "/tmp").expect("pi is configured");
+        assert!(name.starts_with("p_"), "expected a p_ session, got {name}");
+        let name = project_session_name("codex", "/tmp").expect("codex is configured");
+        assert!(name.starts_with("cx_"), "expected a cx_ session, got {name}");
+        assert!(project_session_name("nosuchagent", "/tmp").is_err());
+    }
+
+    /// Launching from the app must work for any configured agent; the old
+    /// env-key match rejected everything but claude and codex outright.
+    #[test]
+    fn launch_command_covers_agents_without_an_env_override() {
+        assert_eq!(agent_launch_command("pi").unwrap(), "pi");
+        assert!(agent_launch_command("claude").unwrap().starts_with("claude"));
+        assert!(agent_launch_command("nosuchagent").is_err());
     }
 
     #[test]
