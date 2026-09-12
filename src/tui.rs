@@ -99,6 +99,16 @@ impl AppState {
         self.current_session().map(|s| s.name.clone())
     }
 
+    /// Whether the session column is worth showing.
+    ///
+    /// With a single session the column is a one-row list that can only ever
+    /// have that row selected — it costs a third of the width to say nothing.
+    /// Collapsing it gives the terminal the space instead, and the project row
+    /// already stands in as the selection.
+    pub fn shows_session_column(&self) -> bool {
+        self.current_sessions().len() > 1
+    }
+
     /// `j` / `k` — move within the focused column.
     pub fn move_down(&mut self) {
         match self.focus {
@@ -136,7 +146,10 @@ impl AppState {
     /// `l` — descend a column, the way yazi enters a directory.
     pub fn focus_right(&mut self) {
         self.focus = match self.focus {
-            Column::Projects if !self.current_sessions().is_empty() => Column::Sessions,
+            // With the session column collapsed there is nothing to stop at
+            // between the project and its terminal.
+            Column::Projects if self.shows_session_column() => Column::Sessions,
+            Column::Projects if !self.current_sessions().is_empty() => Column::Terminal,
             Column::Projects => Column::Projects,
             Column::Sessions => Column::Terminal,
             Column::Terminal => Column::Terminal,
@@ -146,7 +159,8 @@ impl AppState {
     /// `h` — back out a column.
     pub fn focus_left(&mut self) {
         self.focus = match self.focus {
-            Column::Terminal => Column::Sessions,
+            Column::Terminal if self.shows_session_column() => Column::Sessions,
+            Column::Terminal => Column::Projects,
             Column::Sessions => Column::Projects,
             Column::Projects => Column::Projects,
         };
@@ -170,6 +184,12 @@ impl AppState {
             }
         } else if self.session_idx >= sessions {
             self.session_idx = sessions - 1;
+        }
+
+        // A sibling session ended and the column it lived in is gone; leaving
+        // focus there would strand the cursor on something no longer drawn.
+        if self.focus == Column::Sessions && !self.shows_session_column() {
+            self.focus = Column::Terminal;
         }
     }
 }
@@ -367,20 +387,33 @@ fn render(f: &mut Frame, state: &AppState) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
 
-    // Projects : sessions : terminal. The terminal gets the most room — an
-    // agent's boxed UI wraps badly below roughly 60 columns.
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(2, 11),
-            Constraint::Ratio(3, 11),
-            Constraint::Ratio(6, 11),
-        ])
-        .split(outer[0]);
+    // The terminal always takes the lion's share — an agent's boxed UI wraps
+    // badly below roughly 60 columns. The session column only appears when the
+    // project actually has more than one, and its width comes out of the
+    // terminal's rather than the project list's.
+    if state.shows_session_column() {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Ratio(2, 11),
+                Constraint::Ratio(3, 11),
+                Constraint::Ratio(6, 11),
+            ])
+            .split(outer[0]);
 
-    render_projects(f, state, columns[0]);
-    render_sessions(f, state, columns[1]);
-    render_terminal(f, state, columns[2]);
+        render_projects(f, state, columns[0]);
+        render_sessions(f, state, columns[1]);
+        render_terminal(f, state, columns[2]);
+    } else {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(2, 11), Constraint::Ratio(9, 11)])
+            .split(outer[0]);
+
+        render_projects(f, state, columns[0]);
+        render_terminal(f, state, columns[1]);
+    }
+
     render_status(f, state, outer[1]);
 }
 
@@ -535,6 +568,9 @@ mod tests {
     #[test]
     fn hjkl_moves_between_columns() {
         let mut s = AppState::new(projects());
+        // "beta" has two sessions, so all three columns exist — the collapsed
+        // case is covered by `navigation_skips_the_collapsed_column`.
+        s.project_idx = 1;
         assert_eq!(s.focus, Column::Projects);
 
         s.focus_right();
@@ -610,6 +646,79 @@ mod tests {
         assert_eq!(s.focus, Column::Projects);
         assert_eq!(s.session_idx, 0);
         assert!(s.current_name().is_none());
+    }
+
+    #[test]
+    fn a_lone_session_collapses_the_middle_column() {
+        let mut s = AppState::new(projects());
+
+        s.project_idx = 0; // "alpha" — one session
+        assert!(!s.shows_session_column());
+
+        s.project_idx = 1; // "beta" — two sessions
+        assert!(s.shows_session_column());
+    }
+
+    #[test]
+    fn navigation_skips_the_collapsed_column() {
+        let mut s = AppState::new(projects());
+        s.project_idx = 0; // one session, so no middle column
+
+        // `l` goes straight to the terminal rather than stopping on a column
+        // that isn't drawn.
+        s.focus_right();
+        assert_eq!(s.focus, Column::Terminal);
+        // And `h` comes straight back.
+        s.focus_left();
+        assert_eq!(s.focus, Column::Projects);
+
+        // With two sessions the middle column is real and gets a stop.
+        s.project_idx = 1;
+        s.focus_right();
+        assert_eq!(s.focus, Column::Sessions);
+        s.focus_right();
+        assert_eq!(s.focus, Column::Terminal);
+        s.focus_left();
+        assert_eq!(s.focus, Column::Sessions);
+    }
+
+    #[test]
+    fn focus_leaves_the_session_column_when_it_collapses() {
+        // A sibling session ends while the cursor is sitting in that column.
+        let mut s = AppState::new(projects());
+        s.project_idx = 1;
+        s.focus_right();
+        assert_eq!(s.focus, Column::Sessions);
+
+        s.projects[1].sessions.pop();
+        s.clamp();
+        assert!(!s.shows_session_column());
+        assert_eq!(s.focus, Column::Terminal, "stranded on an undrawn column");
+    }
+
+    #[test]
+    fn two_column_layout_gives_the_terminal_the_extra_width() {
+        use ratatui::backend::TestBackend;
+
+        let render_at = |project_idx: usize| {
+            let mut state = AppState::new(projects());
+            state.project_idx = project_idx;
+            state.preview = "agent output".into();
+            let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+            terminal.draw(|f| render(f, &state)).unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            buffer.content().iter().map(|c| c.symbol()).collect::<String>()
+        };
+
+        // One session: no session column at all.
+        let lone = render_at(0);
+        assert!(lone.contains("projects"));
+        assert!(!lone.contains("sessions"), "middle column drawn for one session");
+        assert!(lone.contains("agent output"));
+
+        // Two sessions: it comes back.
+        let pair = render_at(1);
+        assert!(pair.contains("sessions"), "middle column missing for two sessions");
     }
 
     /// The layout is the whole point of this screen, so render it for real
