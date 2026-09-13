@@ -400,6 +400,9 @@ pub struct AppState {
     /// A click arrives as a screen position, and turning that back into a row
     /// needs to know where the list started — rows are not a fixed height, and
     /// the list scrolls.
+    /// What amux is costing, for the footer. None until the first sample —
+    /// and on a platform with no way to ask.
+    pub usage: Option<crate::usage::Usage>,
     pub view_offset: std::cell::Cell<usize>,
     /// Lines the tree had room for, recorded each frame.
     pub view_height: std::cell::Cell<u16>,
@@ -461,6 +464,7 @@ impl AppState {
             browsing: false,
             pending_g: false,
             pinned: Vec::new(),
+            usage: None,
             view_offset: std::cell::Cell::new(0),
             view_height: std::cell::Cell::new(20),
             draft: None,
@@ -575,6 +579,11 @@ impl AppState {
 
     /// The row `line` lines below the top of the drawn list, if any.
     pub fn row_at_line(&self, line: u16) -> Option<usize> {
+        // Below the drawn list is the footer, which is not a row. Without this
+        // a click on it lands on whatever row the arithmetic happens to reach.
+        if line >= self.view_height.get() {
+            return None;
+        }
         let rows = self.rows();
         let mut y = 0u16;
         for index in self.view_offset.get()..rows.len() {
@@ -1328,6 +1337,10 @@ fn focused_term<'a>(live: &'a mut [LiveTerm], state: &AppState) -> Option<&'a mu
     live.iter_mut().find(|t| t.session == wanted)
 }
 
+/// How often amux reads its own cost. Frequent enough to answer for the moment,
+/// slow enough that the figure is readable rather than twitching.
+const USAGE_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Size of the terminal column, in cells, for the current frame size.
 fn term_size(area: Rect) -> (u16, u16) {
     // Minus the border on each side.
@@ -1349,6 +1362,8 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     let mut last_draw = Instant::now() - REDRAW_FLOOR;
     let mut last_reload = Instant::now();
     let mut known: Vec<String> = managed_names(&state.agents);
+    let mut usage = crate::usage::Sampler::default();
+    let mut last_usage = Instant::now() - USAGE_INTERVAL;
     // What was in use before insert mode switched to ASCII.
     let mut saved_ime: Option<String> = None;
     ime::learn_current();
@@ -1422,6 +1437,23 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 dirty = true;
             }
         }
+        // A reading of amux and everything it started. Two seconds is short
+        // enough that the number answers for what is happening now and long
+        // enough that it settles rather than flickering between frames.
+        if last_usage.elapsed() >= USAGE_INTERVAL {
+            last_usage = Instant::now();
+            let children: Vec<u32> = live
+                .iter()
+                .chain(tool.iter())
+                .filter_map(|t| t.child.process_id())
+                .collect();
+            let next = usage.sample(&children);
+            if next != state.usage {
+                state.usage = next;
+                dirty = true;
+            }
+        }
+
         if let Some(term) = tool.as_mut() {
             let (cols, rows) = term_size(terminal_column(terminal.get_frame().area()));
             term.resize(cols, rows);
@@ -3260,20 +3292,47 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
     }
 
     let (border, style) = border_for(state, Column::Tree);
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(border)
-                .border_style(style)
-                .title(" sessions "),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    f.render_stateful_widget(list, area, &mut list_state);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(border)
+        .border_style(style)
+        .title(" sessions ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // The footer holds the bottom row for itself rather than scrolling with the
+    // list: a reading of what amux costs is only worth having if it is there
+    // without being looked for. Dropped entirely on a box too short to spare
+    // the row, where the sessions are the thing that matters.
+    let (list_area, footer) = match (state.usage.as_ref(), inner.height > 3) {
+        (Some(usage), true) => {
+            let split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(inner);
+            (split[0], Some((usage, split[1])))
+        }
+        _ => (inner, None),
+    };
+
+    let list =
+        List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, list_area, &mut list_state);
+
+    if let Some((usage, area)) = footer {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!("  {}", crate::usage::summarise(usage, area.width.saturating_sub(2))),
+                Style::default().fg(Color::DarkGray),
+            )),
+            area,
+        );
+    }
+
     // Rendering is what decides where the list starts scrolling from, so record
     // it here — a click has only a screen position to work back from.
     state.view_offset.set(list_state.offset());
-    state.view_height.set(area.height.saturating_sub(2));
+    state.view_height.set(list_area.height);
 }
 
 /// Where each pane goes, for `pinned` held sessions plus a browsing pane.
@@ -4086,6 +4145,72 @@ mod tests {
         // Ordinary output must not be mistaken for a query.
         let mut carry = Vec::new();
         assert_eq!(count_attribute_queries(&mut carry, b"\x1b[2J\x1b[1;1Hhello"), 0);
+    }
+
+    /// The footer holds the bottom row, and the list gives that row up.
+    ///
+    /// Both halves matter: a footer drawn over the last session hides a
+    /// session, and a list that still believes it owns the row maps a click on
+    /// the footer onto whatever row the arithmetic reaches.
+    #[test]
+    fn the_usage_footer_takes_a_row_from_the_list() {
+        use ratatui::backend::TestBackend;
+        let mut state = AppState::with_agents(projects(), crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
+        let without = state.view_height.get();
+        let text: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(!text.contains("amux  "), "no reading yet, so nothing to show");
+
+        state.usage = Some(crate::usage::Usage {
+            cpu: Some(0.4),
+            rss: 21 * 1024 * 1024,
+            procs: 2,
+        });
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
+        let text: String =
+            terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("21.0 MB"), "the footer is not drawn");
+        assert!(text.contains("2 procs"));
+        assert_eq!(
+            state.view_height.get(),
+            without - 1,
+            "the list kept the row the footer is drawn on"
+        );
+
+        // Clicking the footer selects nothing rather than a row below the fold.
+        // Enough projects that the list runs past the bottom of the box —
+        // otherwise the line simply has no row under it and the guard is never
+        // the reason nothing is selected.
+        let many: Vec<Project> = (0..12)
+            .map(|i| Project {
+                dir: format!("/work/p{i}"),
+                name: format!("p{i}"),
+                alias: None,
+                sessions: vec![session(&format!("cc_p{i}_1111111{i}"), "cc")],
+            })
+            .collect();
+        let mut state = AppState::with_agents(many, crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+        state.usage = Some(crate::usage::Usage {
+            cpu: Some(0.4),
+            rss: 21 * 1024 * 1024,
+            procs: 2,
+        });
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
+
+        let last = state.view_height.get();
+        assert!(
+            state.row_at_line(last - 1).is_some(),
+            "the test needs more rows than fit, or it proves nothing"
+        );
+        assert!(
+            state.row_at_line(last).is_none(),
+            "a click on the footer selected a session"
+        );
     }
 
     /// A path too long for the popup must lose its *front*. The tail is what

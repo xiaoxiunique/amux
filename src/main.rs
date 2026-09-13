@@ -8,6 +8,7 @@ mod state;
 mod store;
 mod tmux;
 mod tui;
+mod usage;
 
 use anyhow::Result;
 use clap::Parser;
