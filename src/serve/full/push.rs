@@ -71,12 +71,16 @@ fn lock_recover<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 // Local persistence (SQLite)
 // ===========================================================================
 
-/// State directory: `$AGENT_MONITOR_STATE_DIR` if set, else `~/.amux`.
+/// `~/.amux/agent-port.db`.
+///
+/// Deliberately does not honour `AGENT_MONITOR_STATE_DIR`. It used to, while
+/// falling back to `~/.amux` — but that variable names the *agent-monitor*
+/// state directory, whose default is `~/.agent-monitor`. Borrowing the variable
+/// without its default meant the database moved between two directories
+/// depending on whether the variable happened to be set, and both copies exist
+/// on disk today.
 fn db_path() -> Option<PathBuf> {
-    let dir = match env::var_os("AGENT_MONITOR_STATE_DIR") {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => dirs::home_dir()?.join(".amux"),
-    };
+    let dir = dirs::home_dir()?.join(".amux");
     fs::create_dir_all(&dir).ok()?;
     Some(dir.join("agent-port.db"))
 }

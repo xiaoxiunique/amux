@@ -65,8 +65,6 @@ static SYSINFO: LazyLock<Mutex<sysinfo::System>> =
 static PANE_LOG_REFRESH_BURST_IDS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static CC_SWITCH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static PROJECT_HISTORY_CACHE: LazyLock<Mutex<Option<Vec<ProjectHistoryEntry>>>> =
-    LazyLock::new(|| Mutex::new(None));
 static DEVICE_INFO_CACHE: LazyLock<Option<DeviceInfo>> =
     LazyLock::new(collect_device_info_uncached);
 static TMUX_PROGRAM_PATH: LazyLock<String> = LazyLock::new(resolve_tmux_program_path);
@@ -898,22 +896,21 @@ fn upload_output_dir() -> PathBuf {
     agent_monitor_state_dir().join("mobile-uploads")
 }
 
+/// The user's home directory.
+///
+/// `dirs::home_dir()`, matching every other path helper in the crate. Reading
+/// `HOME` directly and falling back to `.` — which this used to do — resolves
+/// to the process working directory when `HOME` is unset, and that is `/` when
+/// the bundled app is launched from Finder. See the note on
+/// [`upload_output_dir`], which was written about exactly that hazard.
 fn user_home_dir() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn agent_monitor_state_dir() -> PathBuf {
     env::var_os("AGENT_MONITOR_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| user_home_dir().join(".agent-monitor"))
-}
-
-fn project_history_path() -> PathBuf {
-    env::var_os("AGENT_MONITOR_PROJECT_HISTORY_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| agent_monitor_state_dir().join("project-history.json"))
 }
 
 fn cc_switch_db_path() -> PathBuf {
@@ -4160,31 +4157,30 @@ async fn api_project_history_launch(
     }
 }
 
+/// Project history, newest first.
+///
+/// Queried rather than cached in memory: the cache this replaced had no
+/// invalidation at all, so once it was warm nothing outside this process could
+/// ever change the list — including `amux alias`, which runs in a different
+/// process entirely.
 fn load_project_history() -> Result<Vec<ProjectHistoryEntry>, String> {
-    {
-        let cache = PROJECT_HISTORY_CACHE
-            .lock()
-            .map_err(|_| "project history cache lock is poisoned".to_string())?;
-        if let Some(entries) = cache.as_ref() {
-            return Ok(sorted_project_history(entries.clone()));
-        }
-    }
-
-    let path = project_history_path();
-    let entries = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .map_err(|error| format!("failed to read project history: {error}"))?;
-        serde_json::from_str::<Vec<ProjectHistoryEntry>>(&raw)
-            .map_err(|error| format!("failed to parse project history: {error}"))?
-    } else {
-        Vec::new()
-    };
-    let entries = sorted_project_history(entries);
-    let mut cache = PROJECT_HISTORY_CACHE
-        .lock()
-        .map_err(|_| "project history cache lock is poisoned".to_string())?;
-    *cache = Some(entries.clone());
-    Ok(entries)
+    let entries = crate::store::projects()
+        .into_iter()
+        // A row that has never recorded an agent was never launched from — it
+        // exists only because `amux alias` named the directory. Serving it
+        // would be more than cosmetic: this list is the allowlist
+        // `browsable_roots` hands to `/api/files/*`, so naming a folder would
+        // quietly expose it over HTTP.
+        .filter(|row| !row.last_agent.is_empty())
+        .map(|row| ProjectHistoryEntry {
+            path: row.path,
+            name: row.name,
+            last_agent: row.last_agent,
+            last_seen_at: row.last_seen_at,
+            launch_count: row.launch_count,
+        })
+        .collect();
+    Ok(sorted_project_history(entries))
 }
 
 fn sorted_project_history(mut entries: Vec<ProjectHistoryEntry>) -> Vec<ProjectHistoryEntry> {
@@ -4198,15 +4194,21 @@ fn sorted_project_history(mut entries: Vec<ProjectHistoryEntry>) -> Vec<ProjectH
 }
 
 fn save_project_history(entries: &[ProjectHistoryEntry]) -> Result<(), String> {
-    let path = project_history_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create project history directory: {error}"))?;
-    }
-    let data = serde_json::to_vec_pretty(entries)
-        .map_err(|error| format!("failed to encode project history: {error}"))?;
-    fs::write(&path, [data, b"\n".to_vec()].concat())
-        .map_err(|error| format!("failed to write project history: {error}"))
+    let rows: Vec<crate::store::ProjectRow> = entries
+        .iter()
+        .map(|entry| crate::store::ProjectRow {
+            path: entry.path.clone(),
+            name: entry.name.clone(),
+            // Aliases are the user's, not ours. `replace_projects` preserves
+            // whatever is already stored rather than taking this field.
+            alias: None,
+            last_agent: entry.last_agent.clone(),
+            last_seen_at: entry.last_seen_at.clone(),
+            launch_count: entry.launch_count,
+        })
+        .collect();
+    crate::store::replace_projects(&rows);
+    Ok(())
 }
 
 fn remember_project_history_entries(updates: Vec<(String, String)>, now: &str) {
@@ -4262,11 +4264,6 @@ fn persist_project_history(entries: Vec<ProjectHistoryEntry>) {
     let entries = sorted_project_history(entries);
     if let Err(error) = save_project_history(&entries) {
         eprintln!("[agent-monitor] failed to save project history: {error}");
-        return;
-    }
-
-    if let Ok(mut cache) = PROJECT_HISTORY_CACHE.lock() {
-        *cache = Some(entries);
     }
 }
 

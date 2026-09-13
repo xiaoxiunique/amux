@@ -8,38 +8,23 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-/// `~/.amux/session-ids.json` — maps tmux session name -> agent session id.
-fn store_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".amux").join("session-ids.json"))
-}
-
 fn read_store() -> BTreeMap<String, String> {
-    let Some(p) = store_path() else {
-        return BTreeMap::new();
-    };
-    let Ok(text) = std::fs::read_to_string(&p) else {
-        return BTreeMap::new();
-    };
-    serde_json::from_str(&text).unwrap_or_default()
+    crate::store::conversation_ids()
 }
 
 /// The agent session id recorded for a tmux session, if any.
 pub fn load_id(session_name: &str) -> Option<String> {
-    read_store().get(session_name).cloned()
+    crate::store::conversation_id(session_name)
 }
 
 /// Record (or overwrite) the agent session id for a tmux session. Best-effort.
+///
+/// Writes one row. This used to rewrite a whole JSON map with no lock, from
+/// three different processes — `amux run` at launch, the daemon on resume and
+/// the TUI on relaunch — so two sessions starting together could lose each
+/// other's id and then resume the wrong conversation.
 pub fn store_id(session_name: &str, id: &str) {
-    let mut map = read_store();
-    map.insert(session_name.to_string(), id.to_string());
-    if let Some(p) = store_path() {
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(json) = serde_json::to_string_pretty(&map) {
-            let _ = std::fs::write(&p, json);
-        }
-    }
+    crate::store::set_conversation_id(session_name, id);
 }
 
 /// Args that make the agent resume a specific session id.
@@ -587,7 +572,36 @@ fn claude_cwd(path: &Path) -> Option<PathBuf> {
 /// as the conversation evolves) and that is what its resume picker shows, so we
 /// use the last one. Codex records no title at all, so its opening user prompt
 /// stands in — the same thing its own picker falls back to.
+/// A session's summary, recomputed only when its transcript changes.
+///
+/// The uncached cost is not incidental: for Claude it means scanning the whole
+/// transcript (see [`last_ai_title`]), measured at 1.6-1.9s on a 286MB file,
+/// and `/api/sessions` asks for one per session — up to a hundred of them. The
+/// mtime is the cache key, so a transcript the agent is still appending to
+/// recomputes and a finished one never does.
 fn session_summary(path: &Path, agent: &str) -> Option<String> {
+    let key = path.to_string_lossy().into_owned();
+    let mtime = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64());
+
+    // Without an mtime there is nothing to invalidate against, so skip the
+    // cache entirely rather than store an entry that can never expire.
+    let Some(mtime) = mtime else {
+        return session_summary_uncached(path, agent);
+    };
+
+    if let Some(hit) = crate::store::cached_summary(&key, mtime) {
+        return hit;
+    }
+    let computed = session_summary_uncached(path, agent);
+    crate::store::put_summary(&key, agent, computed.as_deref(), mtime);
+    computed
+}
+
+fn session_summary_uncached(path: &Path, agent: &str) -> Option<String> {
     match agent {
         "claude" => last_ai_title(path).or_else(|| first_user_prompt(path, agent)),
         _ => first_user_prompt(path, agent),
@@ -917,6 +931,7 @@ mod tests {
     fn prefers_the_last_ai_title_for_claude() {
         // Claude appends ai-title records and refines them as the session
         // goes; its resume picker shows the final one, so we must too.
+        let _db = crate::test_home::scratch_db();
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("s.jsonl");
         std::fs::write(
@@ -1011,6 +1026,7 @@ mod tests {
     /// way Claude does — reading it Claude's way yields no summary at all.
     #[test]
     fn reads_a_pi_opening_prompt_and_resume_args() {
+        let _db = crate::test_home::scratch_db();
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("2026-09-03T02-07-50-766Z_01a06505-bfee.jsonl");
         std::fs::write(

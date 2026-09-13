@@ -229,18 +229,8 @@ mod tests {
 /// conversation-id store is keyed by it. Renaming the real session would make
 /// a directory's session unfindable from the shell. So the name stays and only
 /// the label the client shows changes.
-fn labels_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".amux").join("session-labels.json"))
-}
-
 pub fn labels() -> std::collections::BTreeMap<String, String> {
-    let Some(p) = labels_path() else {
-        return Default::default();
-    };
-    std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    crate::store::labels()
 }
 
 /// Set (or, with an empty label, clear) a session's display label.
@@ -256,19 +246,10 @@ pub fn set_label(session: &str, label: &str) -> Result<(), String> {
         return Err("label is too long (max 80 characters)".to_string());
     }
 
-    let mut map = labels();
-    if label.is_empty() {
-        map.remove(session);
-    } else {
-        map.insert(session.to_string(), label.to_string());
-    }
-
-    let p = labels_path().ok_or("cannot determine home directory")?;
-    if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let json = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
-    std::fs::write(&p, json).map_err(|e| format!("writing {}: {e}", p.display()))
+    // One row, rather than rewriting a map of every label that exists: two
+    // clients renaming different sessions used to race here.
+    crate::store::set_label(session, label);
+    Ok(())
 }
 
 #[cfg(test)]

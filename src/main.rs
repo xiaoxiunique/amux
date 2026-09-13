@@ -5,6 +5,7 @@ mod provider;
 mod serve;
 mod session;
 mod state;
+mod store;
 mod tmux;
 mod tui;
 
@@ -31,6 +32,37 @@ pub(crate) mod test_home {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Redirect the metadata database at a throwaway file for one test.
+    ///
+    /// Anything reaching `crate::store` — labels, conversation ids, summary
+    /// caching — otherwise opens the user's real `~/.amux/amux.db`. Worse, the
+    /// connection behind it is a shared static keyed on `AMUX_DB_PATH`, so a
+    /// test that sets the variable and leaves it set steers every later test to
+    /// a database that no longer exists. Restoring on drop is what stops one
+    /// test's isolation from becoming another's bug.
+    pub(crate) struct ScratchDb {
+        _guard: MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ScratchDb {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("AMUX_DB_PATH", value),
+                None => std::env::remove_var("AMUX_DB_PATH"),
+            }
+        }
+    }
+
+    pub(crate) fn scratch_db() -> ScratchDb {
+        let guard = lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let previous = std::env::var_os("AMUX_DB_PATH");
+        std::env::set_var("AMUX_DB_PATH", dir.path().join("amux.db"));
+        ScratchDb { _guard: guard, _dir: dir, previous }
     }
 }
 
