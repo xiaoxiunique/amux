@@ -345,6 +345,12 @@ pub struct AppState {
     pub cursor_before_draft: Option<usize>,
     /// The settings view, open while `,` has been pressed.
     pub settings: bool,
+    /// The key list, open while `~` has been pressed.
+    ///
+    /// The status line cannot hold fourteen bindings; trying to made it a
+    /// listing that kept losing entries to make room — `A fullscreen` fell off
+    /// it twice. yazi answers the same problem the same way.
+    pub helping: bool,
     /// First item the tree drew, recorded each frame.
     ///
     /// A click arrives as a screen position, and turning that back into a row
@@ -406,6 +412,7 @@ impl AppState {
             agents,
             notice: None,
             settings: false,
+            helping: false,
             browsing: false,
             pending_g: false,
             pinned: Vec::new(),
@@ -533,6 +540,15 @@ impl AppState {
             y += height;
         }
         None
+    }
+
+    /// Which pin holds `name`, 1-based, if any.
+    ///
+    /// The number rather than a tick: three pins occupy three different
+    /// quadrants, and the useful question in the tree is which pane a row
+    /// corresponds to.
+    pub fn pin_index(&self, name: &str) -> Option<usize> {
+        self.pinned.iter().position(|p| p == name).map(|i| i + 1)
     }
 
     /// How many sessions may be held on screen at once.
@@ -1087,16 +1103,26 @@ fn status_marker(status: Option<&crate::serve::server::SessionStatus>) -> (&'sta
 }
 
 /// Which stacked pane the screen row `row` falls in.
-fn pane_at(live: &[LiveTerm], area: Rect, row: u16) -> Option<String> {
+fn pane_at(
+    live: &[LiveTerm],
+    area: Rect,
+    pinned: usize,
+    browse: bool,
+    column: u16,
+    row: u16,
+) -> Option<String> {
     if live.len() <= 1 {
         return live.first().map(|t| t.session.clone());
     }
-    let each = area.height / live.len() as u16;
-    if each == 0 {
-        return None;
-    }
-    let index = ((row.saturating_sub(area.y)) / each) as usize;
-    live.get(index.min(live.len() - 1)).map(|t| t.session.clone())
+    // Ask the layout, rather than re-deriving it. An earlier version divided
+    // the height by the pane count and ignored the column entirely — which was
+    // right for the equal stack it was written for, and wrong for every pinned
+    // arrangement, so a click in one quadrant typed into another.
+    let rects = pane_rects(area, pinned, browse);
+    let index = rects.iter().position(|r| {
+        column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+    })?;
+    live.get(index).map(|t| t.session.clone())
 }
 
 /// Move the cursor onto `name`, if it is on screen.
@@ -1332,7 +1358,14 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     // whichever the tree happens to be on. Then hand the click
                     // to the agent as well, so selecting text still works.
                     if clicked {
-                        if let Some(name) = pane_at(&live, area, row) {
+                        if let Some(name) = pane_at(
+                            &live,
+                            area,
+                            state.pinned.len(),
+                            state.has_browse_pane(),
+                            column,
+                            row,
+                        ) {
                             select_session(state, &name);
                         }
                         state.focus = Column::Terminal;
@@ -1412,6 +1445,11 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             term.write(&bytes);
                         }
                     }
+                    dirty = true;
+                    continue;
+                }
+                if state.helping {
+                    state.helping = false;
                     dirty = true;
                     continue;
                 }
@@ -1708,19 +1746,20 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     // With the terminal focused these walk its scrollback
                     // instead of the tree. Moving the selection from here
                     // would swap out the very session being read.
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        if state.focus == Column::Terminal {
-                            scroll_live(focused_term(&mut live, state), MouseEventKind::ScrollDown);
-                        } else {
-                            state.move_down();
-                        }
+                    // Always the cursor, whichever column has the focus.
+                    // Scrolling used to take these whenever the terminal was
+                    // focused, which meant landing in a pane — by clicking it,
+                    // say — silently stopped hjkl from navigating.
+                    KeyCode::Char('j') | KeyCode::Down => state.move_down(),
+                    KeyCode::Char('k') | KeyCode::Up => state.move_up(),
+                    // Scrollback moved to the shifted pair, following yazi,
+                    // where `j`/`k` walk the list and `J`/`K` seek within the
+                    // preview beside it.
+                    KeyCode::Char('J') => {
+                        scroll_live(focused_term(&mut live, state), MouseEventKind::ScrollDown)
                     }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        if state.focus == Column::Terminal {
-                            scroll_live(focused_term(&mut live, state), MouseEventKind::ScrollUp);
-                        } else {
-                            state.move_up();
-                        }
+                    KeyCode::Char('K') => {
+                        scroll_live(focused_term(&mut live, state), MouseEventKind::ScrollUp)
                     }
                     KeyCode::Char('h') | KeyCode::Left => state.focus_left(),
                     KeyCode::Char('l') | KeyCode::Right => state.focus_right(),
@@ -1795,6 +1834,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             state.notice = Some(why);
                         }
                     }
+                    KeyCode::Char('~') | KeyCode::F(1) => state.helping = true,
                     KeyCode::Char(',') => state.settings = true,
                     KeyCode::Char('o') => {
                         state.draft =
@@ -2354,7 +2394,9 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
 
     let columns = columns_of(outer[0]);
     render_tree(f, state, columns[0]);
-    if state.browsing {
+    if state.helping {
+        render_help(f, columns[1]);
+    } else if state.browsing {
         render_tool(f, tool, columns[1]);
     } else if state.settings {
         render_settings(f, columns[1]);
@@ -2491,6 +2533,65 @@ fn render_tool(f: &mut Frame, tool: Option<&LiveTerm>, area: Rect) {
     f.render_widget(block, area);
     if let Some(term) = tool {
         f.render_widget(PseudoTerminal::new(term.parser.screen()), inner);
+    }
+}
+
+/// Everything the tree responds to.
+fn render_help(f: &mut Frame, area: Rect) {
+    const KEYS: &[(&str, &str)] = &[
+        ("hjkl / arrows", "move around the tree"),
+        ("gg / G", "first / last session"),
+        ("^u ^d ^b ^f", "half and whole pages"),
+        ("JK", "scroll the pane's history"),
+        ("Enter / i", "type into the selected session"),
+        ("Esc", "stop typing"),
+        ("^↑ ^↓", "switch sessions while typing"),
+        ("p", "pin this session, or let it go"),
+        ("o", "open a project from history"),
+        ("O", "conversations of this project"),
+        ("a", "start an agent here"),
+        ("N", "another session for this agent"),
+        ("Tab", "next session of this project"),
+        ("Y", "browse files with yazi"),
+        ("A", "attach full screen, leaving amux"),
+        ("d", "kill the selected session"),
+        ("/", "filter projects"),
+        (",", "settings"),
+        ("~", "this list"),
+        ("q", "quit"),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" keys — any key closes ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Two columns, because twenty bindings do not fit a short terminal in one
+    // and a list you have to scroll to see is barely better than the status
+    // line this replaced.
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(inner);
+    let per_column = KEYS.len().div_ceil(2);
+
+    for (half, chunk) in halves.iter().zip(KEYS.chunks(per_column)) {
+        let rows: Vec<Line> = chunk
+            .iter()
+            .map(|(key, what)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {key:>12} ", key = truncate(key, 12)),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(truncate(what, half.width.saturating_sub(15) as usize)),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(rows), *half);
     }
 }
 
@@ -2745,8 +2846,19 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                 // Same column order as the session rows below — what it is,
                 // then how it is doing — so the two line up when a project's
                 // children are open.
+                let pin = project
+                    .sessions
+                    .first()
+                    .filter(|_| !expandable)
+                    .and_then(|s| state.pin_index(&s.name));
                 let mut lines = vec![Line::from(vec![
-                    Span::raw(format!("{marker} ")),
+                    match pin {
+                        Some(n) => Span::styled(
+                            format!("{n} "),
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                        ),
+                        None => Span::raw(format!("{marker} ")),
+                    },
                     Span::styled(
                         // Twelve keeps the duration on screen at 100 columns:
                         // the status word alone is eight cells, and anything
@@ -2804,8 +2916,15 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                 // column: what a session is about does not fit beside four
                 // other fields, and the tree is capped precisely so it cannot
                 // try.
+                let pin = state.pin_index(&session.name);
                 let mut lines = vec![Line::from(vec![
-                    Span::raw("  ├ "),
+                    match pin {
+                        Some(n) => Span::styled(
+                            format!(" {n}├ "),
+                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                        ),
+                        None => Span::raw("  ├ "),
+                    },
                     Span::styled(
                         format!("{:<9}", agent_name(&state.agents, &session.alias)),
                         Style::default().fg(Color::Cyan),
@@ -3039,12 +3158,11 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
         // listing both and leaving the reader to guess.
         match state.focus {
             Column::Terminal => format!(
-                "{filter}jk scroll  h back  i insert  Enter attach  q quit"
+                "{filter}hjkl move  JK scroll  Enter/i type here  ~ keys  q quit"
             ),
             Column::Tree => format!(
-                "{filter}hjkl move  gg/G ends  ^u^d page  Enter/i open  p pin  \
-                 o project  O here  a agent  N extra  Y files  A fullscreen  \
-                 d kill  / filter  , settings  q quit"
+                "{filter}hjkl move  JK scroll  Enter/i open  p pin  o project  \
+                 a agent  d kill  / filter  ~ keys  q quit"
             ),
         }
     };
@@ -3441,10 +3559,14 @@ mod tests {
                 .collect::<String>()
         };
 
-        assert!(render_with(Column::Tree).contains("hjkl move"));
-        let term = render_with(Column::Terminal);
-        assert!(term.contains("jk scroll"), "scrolling not advertised");
-        assert!(!term.contains("hjkl move"), "stale hint for the other column");
+        // Navigation is the same from both columns now, so both must say so —
+        // it used to be that focusing the terminal silently took hjkl away.
+        for focus in [Column::Tree, Column::Terminal] {
+            let text = render_with(focus);
+            assert!(text.contains("hjkl move"), "{focus:?} hides navigation");
+            assert!(text.contains("JK scroll"), "{focus:?} hides scrolling");
+            assert!(text.contains("~ keys"), "{focus:?} does not point at the key list");
+        }
     }
 
     /// Folding a project must not hide an agent that is blocked on you.
@@ -3744,11 +3866,20 @@ mod tests {
             .collect();
 
         assert!(text.contains("Enter/i open"), "Enter is not described as opening");
-        assert!(text.contains("A fullscreen"), "the fullscreen key is unlisted");
         assert!(
             !text.contains("Enter attach"),
             "the hints still promise the old take-over-the-terminal behaviour"
         );
+
+        // The status line cannot hold every binding — it kept losing entries to
+        // make room — so the full list moved behind `~`, and must be complete.
+        let mut helping = AppState::new(projects());
+        helping.cursor = helping.first_selectable();
+        helping.helping = true;
+        let keys = drawn(&helping, 140);
+        for expected in ["A", "attach full screen", "Y", "p", "gg / G", "^u ^d"] {
+            assert!(keys.contains(expected), "the key list omits {expected}");
+        }
     }
 
     /// The placeholder must be a real, selectable row — and only exist while a
@@ -4247,6 +4378,94 @@ mod tests {
         let text = drawn(&state, 140);
         assert!(text.contains("g top"), "the continuation is not offered");
         assert!(text.contains("any other key cancels"));
+    }
+
+    /// A pinned row says so, and says *which* pin — the three occupy three
+    /// different quadrants, so the number is what connects a row to a pane.
+    #[test]
+    fn a_pinned_row_is_marked_with_its_number() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+
+        let plain = drawn(&state, 140);
+        assert!(plain.contains("├"), "child rows should be drawn");
+
+        // A single-session project carries the mark where its marker goes.
+        state.pinned.push("cc_alpha_11111111".into());
+        assert_eq!(state.pin_index("cc_alpha_11111111"), Some(1));
+        assert!(
+            drawn(&state, 140).contains("1 alpha"),
+            "the project row does not show which pin holds it"
+        );
+
+        // A child row keeps its branch and gains the number beside it.
+        state.pinned.push("cx_beta_22222222".into());
+        assert_eq!(state.pin_index("cx_beta_22222222"), Some(2));
+        assert!(
+            drawn(&state, 140).contains("2├"),
+            "the session row does not show which pin holds it"
+        );
+
+        // Unpinned rows are unchanged.
+        assert_eq!(state.pin_index("cx_beta_22222222-grok"), None);
+    }
+
+    /// A click has to reach the pane it landed in. The quadrants are not
+    /// equal horizontal bands, so dividing the height by the pane count — as
+    /// an earlier version did — typed into the wrong session.
+    #[test]
+    fn a_click_reaches_the_pane_it_landed_in() {
+        let area = Rect { x: 0, y: 0, width: 100, height: 40 };
+        let rects = pane_rects(area, 3, true);
+        assert_eq!(rects.len(), 4);
+
+        // Sample the middle of each quadrant and ask which index it is.
+        for (want, r) in rects.iter().enumerate() {
+            let cx = r.x + r.width / 2;
+            let cy = r.y + r.height / 2;
+            let got = rects.iter().position(|q| {
+                cx >= q.x && cx < q.x + q.width && cy >= q.y && cy < q.y + q.height
+            });
+            assert_eq!(got, Some(want), "a click in pane {want} resolved elsewhere");
+        }
+
+        // The bottom-right quadrant is the browsing pane, and must not be
+        // confused with the top-right pin beside it.
+        let browse = rects[3];
+        let pin_right = rects[2];
+        assert!(browse.y > pin_right.y, "browsing sits below the third pin");
+        assert_eq!(browse.x, pin_right.x, "both occupy the right column");
+    }
+
+    /// Navigation must not depend on which column has the focus. Landing in
+    /// a pane — by clicking one, say — used to stop hjkl from moving, which
+    /// left the cursor stuck with no visible reason.
+    #[test]
+    fn navigation_works_from_either_column() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let start = state.cursor;
+
+        state.focus = Column::Tree;
+        state.move_down();
+        let from_tree = state.cursor;
+        assert_ne!(from_tree, start);
+
+        state.cursor = start;
+        state.focus = Column::Terminal;
+        state.move_down();
+        assert_eq!(
+            state.cursor, from_tree,
+            "the cursor moved differently with the terminal focused"
+        );
+
+        // Both hint lines have to name the keys that actually work there.
+        for focus in [Column::Tree, Column::Terminal] {
+            state.focus = focus;
+            let text = drawn(&state, 140);
+            assert!(text.contains("hjkl move"), "{focus:?} does not offer navigation");
+            assert!(text.contains("JK scroll"), "{focus:?} does not offer scrolling");
+        }
     }
 
     #[test]
