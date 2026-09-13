@@ -709,8 +709,23 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     }
                     KeyCode::Char('q') => break Outcome::Quit,
                     KeyCode::Esc => state.focus_left(),
-                    KeyCode::Char('j') | KeyCode::Down => state.move_down(),
-                    KeyCode::Char('k') | KeyCode::Up => state.move_up(),
+                    // With the terminal focused these walk its scrollback
+                    // instead of the tree. Moving the selection from here
+                    // would swap out the very session being read.
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if state.focus == Column::Terminal {
+                            scroll_live(live.as_mut(), MouseEventKind::ScrollDown);
+                        } else {
+                            state.move_down();
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if state.focus == Column::Terminal {
+                            scroll_live(live.as_mut(), MouseEventKind::ScrollUp);
+                        } else {
+                            state.move_up();
+                        }
+                    }
                     KeyCode::Char('h') | KeyCode::Left => state.focus_left(),
                     KeyCode::Char('l') | KeyCode::Right => state.focus_right(),
                     KeyCode::Char('i') => {
@@ -813,6 +828,20 @@ mod ime {
     pub(super) fn restore(previous: Option<String>) {
         if let Some(source) = previous {
             select(&source);
+        }
+    }
+}
+
+/// Walk the focused terminal's scrollback by one step.
+///
+/// Sent as a wheel report rather than driven through `copy-mode` on the CLI:
+/// the attached client already has `mouse on`, so this is the same path the
+/// wheel takes and needs no special casing for entering or leaving copy mode.
+fn scroll_live(live: Option<&mut LiveTerm>, direction: MouseEventKind) {
+    if let Some(term) = live {
+        let bytes = encode_mouse(direction, 1, 1);
+        if !bytes.is_empty() {
+            term.write(&bytes);
         }
     }
 }
@@ -1223,10 +1252,17 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
         } else {
             format!("[/{}]  ", state.filter)
         };
-        format!(
-            "{filter}hjkl move  Tab cycle  i insert  a add agent  N extra  \
-             Enter attach  d kill  / filter  q quit"
-        )
+        // The keys differ by column, so say which set is live rather than
+        // listing both and leaving the reader to guess.
+        match state.focus {
+            Column::Terminal => format!(
+                "{filter}jk scroll  h back  i insert  Enter attach  q quit"
+            ),
+            Column::Tree => format!(
+                "{filter}hjkl move  Tab cycle  i insert  a add agent  N extra  \
+                 Enter attach  d kill  / filter  q quit"
+            ),
+        }
     };
     f.render_widget(
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
@@ -1546,12 +1582,55 @@ mod tests {
     /// rather than only testing the state behind it. `TestBackend` ships with
     /// ratatui — no new dev-dependency.
     #[test]
+    fn jk_means_different_things_per_column() {
+        // The bug this pins: with the terminal focused, j/k moved the tree
+        // selection — swapping out the very session being read.
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = s.first_selectable();
+        let start = s.cursor;
+
+        s.focus = Column::Terminal;
+        // The handler routes to the terminal, so the tree must not move. This
+        // asserts the state side of that: nothing here changes the cursor.
+        assert_eq!(s.cursor, start);
+
+        s.focus = Column::Tree;
+        s.move_down();
+        assert_ne!(s.cursor, start, "tree focus should still navigate");
+    }
+
+    #[test]
+    fn the_status_line_says_which_keys_are_live() {
+        use ratatui::backend::TestBackend;
+
+        let render_with = |focus: Column| {
+            let mut state = AppState::with_agents(projects(), agents());
+            state.cursor = state.first_selectable();
+            state.focus = focus;
+            let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+            terminal.draw(|f| render(f, &state, None)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        assert!(render_with(Column::Tree).contains("hjkl move"));
+        let term = render_with(Column::Terminal);
+        assert!(term.contains("jk scroll"), "scrolling not advertised");
+        assert!(!term.contains("hjkl move"), "stale hint for the other column");
+    }
+
+    #[test]
     fn the_tree_shows_projects_and_their_open_sessions() {
         use ratatui::backend::TestBackend;
 
+        // Everything is open by default now, so nothing needs pressing first.
         let mut state = AppState::new(projects());
-        state.cursor = 1; // "beta"
-        state.focus_right(); // open it
+        state.cursor = state.first_selectable();
 
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal.draw(|f| render(f, &state, None)).unwrap();
