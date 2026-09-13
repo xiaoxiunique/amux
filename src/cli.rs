@@ -103,6 +103,12 @@ pub enum Command {
         #[arg(long)]
         message: Option<String>,
     },
+    /// Name the current directory, so lists show that instead of the folder
+    /// name. With no argument, print every name that has been set.
+    Alias {
+        /// The name to give this directory. Pass an empty string to clear it.
+        name: Option<String>,
+    },
     /// Stop the agent monitor daemon.
     Stop,
     /// Save the current session list to a file.

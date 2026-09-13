@@ -186,6 +186,32 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string(&event)?);
             Ok(())
         }
+        Some(Command::Alias { name }) => {
+            let cwd = std::env::current_dir()?.canonicalize()?;
+            match name {
+                Some(name) => {
+                    store::set_alias(&cwd.to_string_lossy(), &name);
+                    if name.trim().is_empty() {
+                        println!("Cleared the name for {}", cwd.display());
+                    } else {
+                        println!("{} is now \"{}\"", cwd.display(), name.trim());
+                    }
+                }
+                None => {
+                    let named: Vec<_> = store::projects()
+                        .into_iter()
+                        .filter(|p| p.alias.is_some())
+                        .collect();
+                    if named.is_empty() {
+                        println!("No directories have been named yet. Try: amux alias <name>");
+                    }
+                    for project in named {
+                        println!("{:<28} {}", project.alias.unwrap_or_default(), project.path);
+                    }
+                }
+            }
+            Ok(())
+        }
         Some(Command::Stop) => serve::stop(),
         Some(Command::InstallCli) => commands::init::install_cli(&agents),
         Some(Command::Install { china }) => commands::install::install_agents(&agents, china),
