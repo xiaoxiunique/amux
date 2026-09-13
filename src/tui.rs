@@ -161,6 +161,12 @@ pub struct SessionPicker {
     /// True until the background listing lands. Drawn as "loading…" rather than
     /// as an empty list, which would read as "this project has no history".
     pub loading: bool,
+    /// Narrows the list. A long-lived project has dozens of conversations, and
+    /// the one you want is known by what it was about, not by where it sits.
+    pub query: String,
+    /// Whether keystrokes go to the query. `j`/`k` have to mean the letters
+    /// while typing, so this cannot be inferred from the query being non-empty.
+    pub filtering: bool,
 }
 
 impl SessionPicker {
@@ -172,6 +178,8 @@ impl SessionPicker {
             entries: Vec::new(),
             cursor: 0,
             loading: true,
+            query: String::new(),
+            filtering: false,
         }
     }
 
@@ -180,16 +188,39 @@ impl SessionPicker {
         Self { from_project_list: true, ..Self::new(dir, label) }
     }
 
+    /// Conversations matching the query, by case-insensitive substring over the
+    /// summary, the agent and the id — the same rule the project picker uses,
+    /// so `codex` narrows by agent and `xhs` by what the conversation was about.
+    pub fn matches(&self) -> Vec<&SessionEntry> {
+        let q = self.query.trim().to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| {
+                q.is_empty()
+                    || e.agent.to_lowercase().contains(&q)
+                    || e.id.to_lowercase().contains(&q)
+                    || e.summary.as_deref().is_some_and(|s| s.to_lowercase().contains(&q))
+            })
+            .collect()
+    }
+
     pub fn selected(&self) -> Option<&SessionEntry> {
-        self.entries.get(self.cursor)
+        self.matches().get(self.cursor).copied()
+    }
+
+    /// Keep the cursor on a row that exists; typing narrows the list under it.
+    pub fn clamp(&mut self) {
+        let len = self.matches().len();
+        self.cursor = if len == 0 { 0 } else { self.cursor.min(len - 1) };
     }
 
     pub fn move_by(&mut self, delta: isize) {
-        if self.entries.is_empty() {
+        let len = self.matches().len();
+        if len == 0 {
             return;
         }
         let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, self.entries.len() as isize - 1) as usize;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
     }
 }
 
@@ -1648,6 +1679,29 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             }
                             _ => {}
                         },
+                        // Typing the query. Taken before the commands below,
+                        // so `j`/`k`/`n` mean their letters while searching —
+                        // and Enter only confirms the query, never resumes:
+                        // landing on a conversation because you finished typing
+                        // is not something you can take back.
+                        Some(Draft::Session(picker)) if picker.filtering => {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Enter => picker.filtering = false,
+                                KeyCode::Backspace => {
+                                    picker.query.pop();
+                                    picker.clamp();
+                                }
+                                KeyCode::Down => picker.move_by(1),
+                                KeyCode::Up => picker.move_by(-1),
+                                KeyCode::Char(c) => {
+                                    picker.query.push(c);
+                                    picker.clamp();
+                                }
+                                _ => {}
+                            }
+                            dirty = true;
+                            continue;
+                        }
                         Some(Draft::Session(picker)) => match key.code {
                             // Back to the directory list rather than out
                             // altogether: picking the wrong project is the
@@ -1656,6 +1710,13 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             // directory list — `O` starts here — in which case
                             // going "back" to one would be inventing a step the
                             // user never took.
+                            // A query in place is the first thing Esc undoes:
+                            // clearing what you typed is the step you meant far
+                            // more often than leaving the project entirely.
+                            KeyCode::Esc if !picker.query.is_empty() => {
+                                picker.query.clear();
+                                picker.clamp();
+                            }
                             KeyCode::Esc => {
                                 if picker.from_project_list {
                                     state.draft = Some(Draft::Project(ProjectPicker::new(
@@ -1670,6 +1731,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             }
                             KeyCode::Down | KeyCode::Char('j') => picker.move_by(1),
                             KeyCode::Up | KeyCode::Char('k') => picker.move_by(-1),
+                            KeyCode::Char('f') => picker.filtering = true,
                             KeyCode::Char('n') => {
                                 // A fresh conversation rather than a recorded
                                 // one. Not `force_extra`: a project reached this
@@ -2682,6 +2744,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("p", "pin this session, or let it go"),
         ("o", "open a project from history"),
         ("O", "conversations of this project"),
+        ("f", "search the conversations"),
         ("a", "start an agent here"),
         ("N", "another session for this agent"),
         ("Tab", "next session of this project"),
@@ -2839,6 +2902,7 @@ fn render_draft(f: &mut Frame, draft: &Draft, area: Rect) {
         }
         Draft::Session(picker) => {
             let mut rows: Vec<Line> = Vec::new();
+            let shown = picker.matches();
             if picker.loading {
                 rows.push(Line::styled("  loading…", Style::default().fg(Color::DarkGray)));
             } else if picker.entries.is_empty() {
@@ -2846,10 +2910,17 @@ fn render_draft(f: &mut Frame, draft: &Draft, area: Rect) {
                     "  no recorded conversations here",
                     Style::default().fg(Color::DarkGray),
                 ));
+            } else if shown.is_empty() {
+                // Say the query is what emptied the list, so it does not read
+                // as the project having no history after all.
+                rows.push(Line::styled(
+                    format!("  nothing matches \"{}\"", picker.query.trim()),
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
             let visible = area.height.saturating_sub(4) as usize;
             let first = picker.cursor.saturating_sub(visible.saturating_sub(1));
-            for (i, e) in picker.entries.iter().enumerate().skip(first).take(visible) {
+            for (i, e) in shown.iter().enumerate().skip(first).take(visible) {
                 let selected = i == picker.cursor;
                 let style = if selected {
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -2874,11 +2945,25 @@ fn render_draft(f: &mut Frame, draft: &Draft, area: Rect) {
                 ]));
             }
             rows.push(Line::raw(""));
-            rows.push(Line::styled(
-                "  Enter resumes   n starts a new one   Esc goes back",
-                Style::default().fg(Color::DarkGray),
-            ));
-            (format!(" {} ", picker.label), rows)
+            rows.push(if picker.filtering {
+                Line::styled(
+                    format!("  /{}", picker.query),
+                    Style::default().fg(Color::Cyan),
+                )
+            } else {
+                Line::styled(
+                    "  Enter resumes   f searches   n starts a new one   Esc goes back",
+                    Style::default().fg(Color::DarkGray),
+                )
+            });
+            // The query stays visible in the title once typing ends, so a
+            // short list is never mistaken for the whole history.
+            let title = if picker.query.trim().is_empty() {
+                format!(" {} ", picker.label)
+            } else {
+                format!(" {} /{} ", picker.label, picker.query.trim())
+            };
+            (title, rows)
         }
         Draft::Starting { label } => (
             format!(" {label} "),
@@ -3983,6 +4068,71 @@ mod tests {
         assert_eq!(p.cursor, 1);
         assert_eq!(p.selected().unwrap().id, "b");
         p.move_by(-9);
+        assert_eq!(p.cursor, 0);
+    }
+
+    /// Searching must narrow by what the conversation was *about*, and Enter
+    /// must then resume the row on screen.
+    ///
+    /// The cursor indexes the visible list, so a `selected()` that reads the
+    /// unfiltered one resumes whichever conversation happens to sit at that
+    /// position — the failure that actually costs you something, since the
+    /// wrong resume is indistinguishable from the right one until it opens.
+    #[test]
+    fn searching_narrows_the_conversations_and_enter_takes_the_visible_one() {
+        let mut p = SessionPicker::new("/work/reverse".into(), "reverse".into());
+        p.entries = vec![
+            SessionEntry {
+                agent: "claude".into(),
+                id: "aaa11111".into(),
+                modified: 3.0,
+                summary: Some("Adobe account testing".into()),
+            },
+            SessionEntry {
+                agent: "codex".into(),
+                id: "bbb22222".into(),
+                modified: 2.0,
+                summary: Some("Android recon for xhs".into()),
+            },
+            SessionEntry {
+                agent: "opencode".into(),
+                id: "ccc33333".into(),
+                modified: 1.0,
+                summary: None,
+            },
+        ];
+
+        // By summary.
+        p.query = "android".into();
+        assert_eq!(p.matches().len(), 1);
+        assert_eq!(p.selected().unwrap().id, "bbb22222");
+
+        // By agent, and by id — a short id is how the list is scanned by eye.
+        p.query = "opencode".into();
+        assert_eq!(p.selected().unwrap().id, "ccc33333");
+        p.query = "aaa1".into();
+        assert_eq!(p.selected().unwrap().id, "aaa11111");
+
+        // Narrowing under a cursor parked further down must pull it back onto a
+        // row that exists, not leave it pointing past the end.
+        p.query.clear();
+        p.move_by(2);
+        assert_eq!(p.cursor, 2);
+        p.query = "adobe".into();
+        p.clamp();
+        assert_eq!(p.cursor, 0);
+        assert_eq!(
+            p.selected().unwrap().id,
+            "aaa11111",
+            "Enter would resume a conversation other than the highlighted one"
+        );
+
+        // A query that matches nothing leaves nothing to resume — rather than
+        // silently falling back to the first row.
+        p.query = "zzzz".into();
+        p.clamp();
+        assert!(p.selected().is_none());
+        p.move_by(1);
         assert_eq!(p.cursor, 0);
     }
 
