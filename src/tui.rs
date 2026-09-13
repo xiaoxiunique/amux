@@ -970,7 +970,47 @@ struct LiveTerm {
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     output: Receiver<Vec<u8>>,
+    /// Tail of the last chunk read, so a device query split across a read
+    /// boundary is still recognised whole.
+    carry: Vec<u8>,
 }
+
+/// How many times this chunk asks what terminal it is talking to.
+///
+/// `carry` holds the tail of the previous chunk on the way in and this one's on
+/// the way out: the query is four bytes and a read can land in the middle of
+/// it, which would leave the program waiting on an answer to a question we
+/// never noticed being asked.
+fn count_attribute_queries(carry: &mut Vec<u8>, chunk: &[u8]) -> usize {
+    let mut scan = std::mem::take(carry);
+    scan.extend_from_slice(chunk);
+
+    // Both spellings mean the same question, and neither contains the other.
+    // Counted rather than merely detected, so two asks in one read get two
+    // answers.
+    let asked = scan.windows(4).filter(|w| *w == b"\x1b[0c").count()
+        + scan.windows(3).filter(|w| *w == b"\x1b[c").count();
+
+    // Three bytes: one short of the longest query, so a split one carries over
+    // while a whole one cannot be counted again on the next chunk.
+    let tail = scan.len().saturating_sub(3);
+    *carry = scan[tail..].to_vec();
+    asked
+}
+
+/// What to answer when a program asks what kind of terminal it is talking to.
+///
+/// A pty with nobody answering is not a terminal a program can plan around, so
+/// it waits. yazi asks on startup (DA1, `ESC[0c`), waits, gives up, asks again,
+/// gives up again — measured here at **2065ms** to its first painted frame,
+/// with a red "Terminal response timeout" printed into the column and then
+/// cleared, which is the flicker. One reply brings that to **35ms**.
+///
+/// Only this one is worth answering. yazi also probes XTVERSION, cell size,
+/// the background colour and the kitty keyboard protocol; answering every one
+/// of those but not DA1 still took 2029ms, and answering DA1 alone took 35.
+/// `62;22` is the ordinary claim — a VT220 that knows about colour.
+const DEVICE_ATTRIBUTES: &[u8] = b"\x1b[?62;22c";
 
 impl LiveTerm {
     /// Attach to `session` in a pty of the given size.
@@ -1052,6 +1092,7 @@ impl LiveTerm {
             writer,
             child,
             output,
+            carry: Vec::new(),
         })
     }
 
@@ -1061,6 +1102,7 @@ impl LiveTerm {
         loop {
             match self.output.try_recv() {
                 Ok(chunk) => {
+                    self.answer_queries(&chunk);
                     self.parser.process(&chunk);
                     got = true;
                 }
@@ -1068,6 +1110,17 @@ impl LiveTerm {
             }
         }
         got
+    }
+
+    /// Reply to any device-attributes query in this chunk.
+    ///
+    /// Scanned across the previous chunk's tail: the query is four bytes and a
+    /// read can land in the middle of it, which would leave the program waiting
+    /// on an answer that was never recognised as being asked for.
+    fn answer_queries(&mut self, chunk: &[u8]) {
+        for _ in 0..count_attribute_queries(&mut self.carry, chunk) {
+            self.write(DEVICE_ATTRIBUTES);
+        }
     }
 
     /// Whether the program in the pty has exited.
@@ -3993,6 +4046,46 @@ mod tests {
         assert!(text.contains("opencode"), "agent name truncated or not shown");
         assert!(text.contains("codex"), "child row does not name its agent");
         assert!(text.contains("claude"), "child row does not name its agent");
+    }
+
+    /// The device query must be recognised however the reads happen to land.
+    ///
+    /// It is four bytes off a pty, and a read can end anywhere. Missing a split
+    /// one is not a cosmetic loss: the program waits out its own timeout —
+    /// two seconds of blank column for yazi — and the question never comes
+    /// again, so a single miss costs the whole startup.
+    #[test]
+    fn a_device_query_is_answered_once_however_it_is_split() {
+        let mut carry = Vec::new();
+        assert_eq!(count_attribute_queries(&mut carry, b"\x1b[0c"), 1);
+
+        // Split at every point inside the query. Each pair must still count as
+        // one ask — and, just as importantly, not as two.
+        for at in 1..4 {
+            let mut carry = Vec::new();
+            let whole = b"junk\x1b[0cmore";
+            let (head, tail) = whole.split_at(4 + at);
+            let n = count_attribute_queries(&mut carry, head)
+                + count_attribute_queries(&mut carry, tail);
+            assert_eq!(n, 1, "split after {at} bytes of the query miscounted");
+        }
+
+        // The carried tail must not let a whole query be counted again on the
+        // next chunk — that would answer twice for one question.
+        let mut carry = Vec::new();
+        assert_eq!(count_attribute_queries(&mut carry, b"\x1b[0c"), 1);
+        assert_eq!(count_attribute_queries(&mut carry, b"ordinary output"), 0);
+
+        // The short spelling counts too, and two asks in one read get two
+        // answers rather than one.
+        let mut carry = Vec::new();
+        assert_eq!(count_attribute_queries(&mut carry, b"\x1b[c"), 1);
+        let mut carry = Vec::new();
+        assert_eq!(count_attribute_queries(&mut carry, b"\x1b[0cx\x1b[0c"), 2);
+
+        // Ordinary output must not be mistaken for a query.
+        let mut carry = Vec::new();
+        assert_eq!(count_attribute_queries(&mut carry, b"\x1b[2J\x1b[1;1Hhello"), 0);
     }
 
     /// A path too long for the popup must lose its *front*. The tail is what
