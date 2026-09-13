@@ -27,7 +27,12 @@ pub(crate) mod test_home {
 
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-    /// Hold the returned guard for as long as `HOME` is read or redirected.
+    /// Hold the returned guard for as long as any of `HOME`, `AMUX_DB_PATH` or
+    /// `AMUX_STATE_DIR` is read or redirected.
+    ///
+    /// One lock for all three: they were guarded by two separate mutexes, which
+    /// serialised each group against itself and neither against the other. On
+    /// macOS the race was invisible; on Windows it was not.
     pub(crate) fn lock() -> MutexGuard<'static, ()> {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()

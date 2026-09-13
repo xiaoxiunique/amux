@@ -5552,7 +5552,7 @@ mod tests {
 
     #[test]
     fn hook_status_overrides_terminal_inference() {
-        let _guard = crate::state::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_home::lock();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("AMUX_STATE_DIR", tmp.path());
         crate::state::record_status(

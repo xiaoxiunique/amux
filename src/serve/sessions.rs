@@ -258,14 +258,26 @@ mod label_tests {
 
     /// Isolated: these write to $HOME, so point it somewhere disposable.
     fn with_temp_home(body: impl FnOnce()) {
+        // Takes the lock itself — do not wrap this in another helper that also
+        // takes it, because the mutex is not reentrant and the result is a
+        // hang rather than an error.
         let _home_guard = crate::test_home::lock();
         let tmp = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("HOME");
+        let prev_db = std::env::var_os("AMUX_DB_PATH");
         std::env::set_var("HOME", tmp.path());
+        // Labels live in the store now, and `dirs::home_dir()` does not follow
+        // HOME on Windows — so redirecting HOME alone left this reading the
+        // real database.
+        std::env::set_var("AMUX_DB_PATH", tmp.path().join("amux.db"));
         body();
         match prev {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
+        }
+        match prev_db {
+            Some(v) => std::env::set_var("AMUX_DB_PATH", v),
+            None => std::env::remove_var("AMUX_DB_PATH"),
         }
     }
 

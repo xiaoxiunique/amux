@@ -7,10 +7,6 @@ use std::{
     path::PathBuf,
 };
 
-#[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HookState {
@@ -350,7 +346,7 @@ mod tests {
 
     #[test]
     fn record_and_read_status_by_pane_and_session() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _guard = crate::test_home::lock();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("AMUX_STATE_DIR", tmp.path());
 

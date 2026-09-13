@@ -259,6 +259,13 @@ pub fn sessions_in(dir: &str, agents: &[Agent]) -> Vec<SessionEntry> {
     out
 }
 
+/// Keys the arrangement is stored under.
+mod remembered {
+    pub const PINNED: &str = "tui.pinned";
+    pub const COLLAPSED: &str = "tui.collapsed";
+    pub const CURSOR: &str = "tui.cursor";
+}
+
 /// The stages of choosing a session to open.
 #[derive(Debug, Clone)]
 pub enum Draft {
@@ -345,6 +352,12 @@ pub struct AppState {
     pub cursor_before_draft: Option<usize>,
     /// The settings view, open while `,` has been pressed.
     pub settings: bool,
+    /// Naming the selected session: the text typed so far.
+    ///
+    /// Labels beat summaries in the description line, so this is the most
+    /// useful thing you can do to the tree — and until now the only way to do
+    /// it was the phone app's rename, which writes the same field.
+    pub renaming: Option<String>,
     /// The key list, open while `~` has been pressed.
     ///
     /// The status line cannot hold fourteen bindings; trying to made it a
@@ -413,6 +426,7 @@ impl AppState {
             notice: None,
             settings: false,
             helping: false,
+            renaming: None,
             browsing: false,
             pending_g: false,
             pinned: Vec::new(),
@@ -540,6 +554,63 @@ impl AppState {
             y += height;
         }
         None
+    }
+
+    /// Put back the arrangement the last run left.
+    ///
+    /// Pinning exists to keep a few sessions in view while you work on others;
+    /// an arrangement that has to be rebuilt at every launch is not one. The
+    /// filter is deliberately *not* restored — it hides rows, and a hidden row
+    /// you did not hide yourself reads as a missing session.
+    pub fn restore_arrangement(&mut self) {
+        let live: std::collections::BTreeSet<String> = self
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter().map(|s| s.name.clone()))
+            .collect();
+        // Sessions die between runs; a pin for one that is gone would hold a
+        // pane open on nothing.
+        self.pinned = split_stored(&crate::store::setting(remembered::PINNED))
+            .into_iter()
+            .filter(|name| live.contains(name))
+            .take(Self::MAX_PINNED)
+            .collect();
+        self.collapsed = split_stored(&crate::store::setting(remembered::COLLAPSED))
+            .into_iter()
+            .collect();
+
+        self.cursor = crate::store::setting(remembered::CURSOR)
+            .and_then(|name| {
+                self.rows().iter().position(|row| match row {
+                    Row::Session { project, index } => self
+                        .project_at(*project)
+                        .and_then(|p| p.sessions.get(*index))
+                        .is_some_and(|s| s.name == name),
+                    Row::Project { index, .. } => self
+                        .project_at(*index)
+                        .is_some_and(|p| p.dir == name),
+                    Row::Draft => false,
+                })
+            })
+            .filter(|i| self.selectable(self.rows()[*i]))
+            .unwrap_or_else(|| self.first_selectable());
+    }
+
+    /// Write the arrangement down, so the next run opens where this one left.
+    pub fn save_arrangement(&self) {
+        crate::store::set_setting(remembered::PINNED, &self.pinned.join("\n"));
+        let collapsed: Vec<&str> = self.collapsed.iter().map(String::as_str).collect();
+        crate::store::set_setting(remembered::COLLAPSED, &collapsed.join("\n"));
+        // By name, not by index: rows shift as sessions come and go, and an
+        // index would land the cursor somewhere unrelated.
+        let here = match self.current_row() {
+            Some(Row::Session { .. }) => self.current_name(),
+            Some(Row::Project { index, .. }) => {
+                self.project_at(index).map(|p| p.dir.clone())
+            }
+            _ => None,
+        };
+        crate::store::set_setting(remembered::CURSOR, &here.unwrap_or_default());
     }
 
     /// Which pin holds `name`, 1-based, if any.
@@ -1011,11 +1082,13 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
     let all = tmux::list_session_names()?;
     let sessions = managed_sessions(&all, agents);
     let mut state = AppState::with_agents(group_by_project(sessions), agents.to_vec());
-    // Land on something selectable — the first row is a heading whenever the
-    // first project has several sessions.
-    state.cursor = state.first_selectable();
+    // Pins, folds and the cursor come back from the last run; this also lands
+    // the cursor on something selectable, since the first row is a heading
+    // whenever the first project has several sessions.
+    state.restore_arrangement();
 
     let outcome = event_loop(&mut state)?;
+    state.save_arrangement();
 
     match outcome {
         Outcome::Quit => Ok(()),
@@ -1049,6 +1122,17 @@ fn session_qualifier(name: &str) -> String {
         (false, true) => provider.to_string(),
         (false, false) => format!("{provider} {suffix}"),
     }
+}
+
+/// Split a stored newline-separated list, dropping the empty case.
+fn split_stored(value: &Option<String>) -> Vec<String> {
+    value
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// The agent's own name for a session, rather than the shell alias.
@@ -1448,6 +1532,36 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     dirty = true;
                     continue;
                 }
+                if let Some(text) = state.renaming.as_mut() {
+                    match key.code {
+                        KeyCode::Esc => state.renaming = None,
+                        KeyCode::Backspace => {
+                            text.pop();
+                        }
+                        KeyCode::Enter => {
+                            let label = state.renaming.take().unwrap_or_default();
+                            if let Some(name) = state.current_name() {
+                                // The same field the phone app writes, so the
+                                // two cannot disagree about what a session is
+                                // called.
+                                match crate::serve::sessions::set_label(&name, &label) {
+                                    Ok(()) => {
+                                        if label.trim().is_empty() {
+                                            state.descriptions.remove(&name);
+                                        } else {
+                                            state.descriptions.insert(name, label);
+                                        }
+                                    }
+                                    Err(why) => state.notice = Some(why),
+                                }
+                            }
+                        }
+                        KeyCode::Char(c) => text.push(c),
+                        _ => {}
+                    }
+                    dirty = true;
+                    continue;
+                }
                 if state.helping {
                     state.helping = false;
                     dirty = true;
@@ -1832,6 +1946,14 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     KeyCode::Char('p') => {
                         if let Err(why) = state.toggle_pin() {
                             state.notice = Some(why);
+                        }
+                    }
+                    // Name the selected session. Starts from whatever it is
+                    // called now, so a small correction is a small edit.
+                    KeyCode::Char('r') => {
+                        if let Some(name) = state.current_name() {
+                            state.renaming =
+                                Some(crate::store::labels().get(&name).cloned().unwrap_or_default());
                         }
                     }
                     KeyCode::Char('~') | KeyCode::F(1) => state.helping = true,
@@ -2557,6 +2679,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("d", "kill the selected session"),
         ("/", "filter projects"),
         (",", "settings"),
+        ("r", "name this session"),
         ("~", "this list"),
         ("q", "quit"),
     ];
@@ -2950,8 +3073,40 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
         })
         .collect();
 
+    // Two blank boxes and a hint line is what a first run used to look like,
+    // and the way forward — reaching one of the recorded projects — is the
+    // least guessable key there is. Say it where the sessions would be.
+    let items: Vec<ListItem> = if items.is_empty() {
+        let recorded = crate::store::projects().len();
+        let mut lines = vec![
+            Line::raw(""),
+            Line::styled(
+                "  nothing running",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+        ];
+        if recorded > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("  o ", Style::default().fg(Color::Cyan)),
+                Span::raw(format!("open one of {recorded} projects")),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  a ", Style::default().fg(Color::Cyan)),
+            Span::raw("start an agent here"),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  ~ ", Style::default().fg(Color::Cyan)),
+            Span::raw("every key"),
+        ]));
+        vec![ListItem::new(lines)]
+    } else {
+        items
+    };
+
     let mut list_state = ListState::default();
-    if !items.is_empty() {
+    if !state.rows().is_empty() {
         list_state.select(Some(state.cursor));
     }
 
@@ -3105,6 +3260,26 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
     // Waiting on the second half of a sequence. yazi shows the candidates
     // rather than leaving you wondering whether the key registered; with one
     // pair there is little to list, but the silence is the problem.
+    if let Some(text) = &state.renaming {
+        let line = Line::from(vec![
+            Span::styled(
+                " name ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("  {text}")),
+            Span::styled("_", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "    Enter saves, empty clears, Esc cancels",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
     if state.pending_g {
         let line = Line::from(vec![
             Span::styled(
@@ -4466,6 +4641,74 @@ mod tests {
             assert!(text.contains("hjkl move"), "{focus:?} does not offer navigation");
             assert!(text.contains("JK scroll"), "{focus:?} does not offer scrolling");
         }
+    }
+
+    /// The arrangement outlives the process, and does not carry over things
+    /// that would be wrong on the way back in.
+    #[test]
+    fn the_arrangement_comes_back() {
+        let _db = crate::test_home::scratch_db();
+
+        let mut first = AppState::new(projects());
+        first.cursor = first.first_selectable();
+        first.toggle_pin().unwrap();
+        first.collapsed.insert("/work/beta".into());
+        // A pin for a session that will not exist next time.
+        first.pinned.push("gone_forever_00000000".into());
+        first.save_arrangement();
+
+        let mut second = AppState::new(projects());
+        second.restore_arrangement();
+
+        assert_eq!(
+            second.pinned,
+            vec!["cc_alpha_11111111".to_string()],
+            "a pin for a dead session should not hold a pane open on nothing"
+        );
+        assert!(second.collapsed.contains("/work/beta"), "folds were lost");
+        assert_eq!(second.cursor, first.first_selectable(), "the cursor moved");
+
+        // Nothing stored at all still lands somewhere valid. The guard has to
+        // go first — it holds a mutex, and taking it twice in one test
+        // deadlocks rather than failing.
+        drop(_db);
+        let _fresh_db = crate::test_home::scratch_db();
+        let mut fresh = AppState::new(projects());
+        fresh.restore_arrangement();
+        assert!(fresh.pinned.is_empty());
+        assert!(fresh.selectable(fresh.rows()[fresh.cursor]));
+    }
+
+    /// A first run should say what to do, not show two empty boxes.
+    #[test]
+    fn an_empty_tree_says_how_to_fill_it() {
+        let _db = crate::test_home::scratch_db();
+        let state = AppState::with_agents(Vec::new(), agents());
+        let text = drawn(&state, 140);
+
+        assert!(text.contains("nothing running"), "the empty state is silent");
+        assert!(text.contains("start an agent here"), "no way forward offered");
+        assert!(text.contains("every key"), "the key list is not mentioned");
+    }
+
+    /// Renaming writes the field the phone app writes, so the two cannot
+    /// disagree about what a session is called.
+    #[test]
+    fn renaming_shows_what_is_being_typed() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        assert!(!drawn(&state, 140).contains("Enter saves"));
+
+        state.renaming = Some("adobe-test".into());
+        let text = drawn(&state, 140);
+        assert!(text.contains("adobe-test"), "the text being typed is hidden");
+        assert!(text.contains("Enter saves"), "no way out is offered");
+        assert!(text.contains("empty clears"), "clearing is undiscoverable");
+
+        // The key is in the list, or nobody finds it.
+        state.renaming = None;
+        state.helping = true;
+        assert!(drawn(&state, 140).contains("name this session"));
     }
 
     #[test]
