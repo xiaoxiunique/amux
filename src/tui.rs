@@ -39,6 +39,15 @@ const REDRAW_FLOOR: Duration = Duration::from_millis(16);
 /// this is deliberately slower than the reload that only compares names.
 const STATUS_EVERY: Duration = Duration::from_millis(2000);
 
+/// How often to re-read what each session is about.
+///
+/// A description is a conversation's title: it changes over minutes, and
+/// re-reading it every reload made it the single largest thing amux spent cpu
+/// on while sitting still — a walk of every agent's transcript directory, once
+/// per session, every 1.5 seconds. A new session still gets described the
+/// moment it appears; this is only the refresh of the ones already listed.
+const DESCRIBE_EVERY: Duration = Duration::from_millis(10_000);
+
 /// Which column has the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
@@ -1362,6 +1371,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     let mut last_draw = Instant::now() - REDRAW_FLOOR;
     let mut last_reload = Instant::now();
     let mut known: Vec<String> = managed_names(&state.agents);
+    let mut last_describe = Instant::now();
     let mut usage = crate::usage::Sampler::default();
     let mut last_usage = Instant::now() - USAGE_INTERVAL;
     // What was in use before insert mode switched to ASCII.
@@ -1538,9 +1548,17 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 // list you need after the machine has gone down.
                 crate::commands::sessions::auto_save(&state.agents);
                 dirty = true;
+                // A session that has just appeared has no description yet, and
+                // waiting out the refresh to give it one would leave a new row
+                // blank for as long as it takes to notice.
+                last_describe = Instant::now() - DESCRIBE_EVERY;
             }
-            // Titles are refined as an agent works, so re-read them even when
-            // the set of sessions has not moved.
+        }
+
+        // Titles are refined as an agent works, so re-read them even when the
+        // set of sessions has not moved — just not on every reload.
+        if last_describe.elapsed() >= DESCRIBE_EVERY {
+            last_describe = Instant::now();
             let tx = desc_tx.clone();
             let projects = state.projects.clone();
             let agents = state.agents.clone();
