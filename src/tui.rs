@@ -39,8 +39,7 @@ const REDRAW_FLOOR: Duration = Duration::from_millis(16);
 /// Which column has the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Column {
-    Projects,
-    Sessions,
+    Tree,
     Terminal,
 }
 
@@ -58,8 +57,14 @@ pub struct Project {
 pub struct AppState {
     pub projects: Vec<Project>,
     pub focus: Column,
-    pub project_idx: usize,
-    pub session_idx: usize,
+    /// Cursor over [`AppState::rows`] — one index, not one per column. A tree
+    /// interleaves projects and sessions, so two cursors cannot say where you
+    /// are.
+    pub cursor: usize,
+    /// Directories whose sessions are shown. A project with one session has
+    /// nothing to expand: it *is* that session, and a lone child row under it
+    /// would say nothing.
+    pub expanded: std::collections::BTreeSet<String>,
     /// Filter over project names. Only editable in filter mode.
     pub filter: String,
     /// Explicit mode, because the old TUI routed *every* unmatched key into the
@@ -91,9 +96,9 @@ impl AppState {
     pub fn with_agents(projects: Vec<Project>, agents: Vec<Agent>) -> Self {
         Self {
             projects,
-            focus: Column::Projects,
-            project_idx: 0,
-            session_idx: 0,
+            focus: Column::Tree,
+            cursor: 0,
+            expanded: Default::default(),
             filter: String::new(),
             filtering: false,
             inserting: false,
@@ -104,15 +109,6 @@ impl AppState {
         }
     }
 
-    /// The directory new sessions should be created in.
-    pub fn current_dir(&self) -> Option<String> {
-        self.current_project().map(|p| p.dir.clone())
-    }
-
-    /// Agents that already have a session in the selected project, by alias.
-    pub fn aliases_here(&self) -> Vec<String> {
-        self.current_sessions().iter().map(|s| s.alias.clone()).collect()
-    }
 
     /// Projects matching the filter (case-insensitive, on name or path).
     pub fn visible_projects(&self) -> Vec<&Project> {
@@ -127,115 +123,179 @@ impl AppState {
             .collect()
     }
 
+    fn project_at(&self, index: usize) -> Option<&Project> {
+        self.visible_projects().get(index).copied()
+    }
+
+    /// One visible line of the tree.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for (pi, project) in self.visible_projects().iter().enumerate() {
+            let expandable = project.sessions.len() > 1;
+            rows.push(Row::Project { index: pi, expandable });
+            if expandable && self.expanded.contains(&project.dir) {
+                for si in 0..project.sessions.len() {
+                    rows.push(Row::Session { project: pi, index: si });
+                }
+            }
+        }
+        rows
+    }
+
+    pub fn current_row(&self) -> Option<Row> {
+        self.rows().get(self.cursor).copied()
+    }
+
     pub fn current_project(&self) -> Option<&Project> {
-        self.visible_projects().get(self.project_idx).copied()
+        match self.current_row()? {
+            Row::Project { index, .. } | Row::Session { project: index, .. } => {
+                self.project_at(index)
+            }
+        }
     }
 
     pub fn current_sessions(&self) -> &[ManagedSession] {
         self.current_project().map(|p| p.sessions.as_slice()).unwrap_or(&[])
     }
 
+    /// The session the cursor resolves to.
+    ///
+    /// A collapsed project stands in for its only session — which is why a
+    /// one-session project needs no child row at all.
     pub fn current_session(&self) -> Option<&ManagedSession> {
-        self.current_sessions().get(self.session_idx)
+        match self.current_row()? {
+            Row::Session { project, index } => self.project_at(project)?.sessions.get(index),
+            Row::Project { index, .. } => {
+                let project = self.project_at(index)?;
+                (project.sessions.len() == 1).then(|| &project.sessions[0])
+            }
+        }
     }
 
     pub fn current_name(&self) -> Option<String> {
         self.current_session().map(|s| s.name.clone())
     }
 
-    /// Whether the session column is worth showing.
-    ///
-    /// With a single session the column is a one-row list that can only ever
-    /// have that row selected — it costs a third of the width to say nothing.
-    /// Collapsing it gives the terminal the space instead, and the project row
-    /// already stands in as the selection.
-    pub fn shows_session_column(&self) -> bool {
-        self.current_sessions().len() > 1
+    /// The directory new sessions should be created in.
+    pub fn current_dir(&self) -> Option<String> {
+        self.current_project().map(|p| p.dir.clone())
     }
 
-    /// `j` / `k` — move within the focused column.
+    /// Agents that already have a session in the project under the cursor.
+    pub fn aliases_here(&self) -> Vec<String> {
+        self.current_sessions().iter().map(|s| s.alias.clone()).collect()
+    }
+
     pub fn move_down(&mut self) {
-        match self.focus {
-            Column::Projects => {
-                let n = self.visible_projects().len();
-                if n > 0 {
-                    self.project_idx = (self.project_idx + 1).min(n - 1);
-                    // A different project means a different session list; an
-                    // index carried over from the old one would point at the
-                    // wrong session, or past the end.
-                    self.session_idx = 0;
-                }
-            }
-            Column::Sessions | Column::Terminal => {
-                let n = self.current_sessions().len();
-                if n > 0 {
-                    self.session_idx = (self.session_idx + 1).min(n - 1);
-                }
-            }
+        let n = self.rows().len();
+        if n > 0 {
+            self.cursor = (self.cursor + 1).min(n - 1);
         }
     }
 
     pub fn move_up(&mut self) {
-        match self.focus {
-            Column::Projects => {
-                self.project_idx = self.project_idx.saturating_sub(1);
-                self.session_idx = 0;
-            }
-            Column::Sessions | Column::Terminal => {
-                self.session_idx = self.session_idx.saturating_sub(1);
-            }
-        }
+        self.cursor = self.cursor.saturating_sub(1);
     }
 
-    /// `l` — descend a column, the way yazi enters a directory.
+    /// `l` — open a project, or step into the terminal.
     pub fn focus_right(&mut self) {
-        self.focus = match self.focus {
-            // With the session column collapsed there is nothing to stop at
-            // between the project and its terminal.
-            Column::Projects if self.shows_session_column() => Column::Sessions,
-            Column::Projects if !self.current_sessions().is_empty() => Column::Terminal,
-            Column::Projects => Column::Projects,
-            Column::Sessions => Column::Terminal,
-            Column::Terminal => Column::Terminal,
-        };
-    }
-
-    /// `h` — back out a column.
-    pub fn focus_left(&mut self) {
-        self.focus = match self.focus {
-            Column::Terminal if self.shows_session_column() => Column::Sessions,
-            Column::Terminal => Column::Projects,
-            Column::Sessions => Column::Projects,
-            Column::Projects => Column::Projects,
-        };
-    }
-
-    /// Keep both indices inside their lists after a refresh changed them.
-    pub fn clamp(&mut self) {
-        let projects = self.visible_projects().len();
-        if projects == 0 {
-            self.project_idx = 0;
-        } else if self.project_idx >= projects {
-            self.project_idx = projects - 1;
-        }
-
-        let sessions = self.current_sessions().len();
-        if sessions == 0 {
-            self.session_idx = 0;
-            // Nothing to focus further right.
-            if self.focus != Column::Projects {
-                self.focus = Column::Projects;
+        match self.current_row() {
+            Some(Row::Project { index, expandable: true }) => {
+                let Some(dir) = self.project_at(index).map(|p| p.dir.clone()) else {
+                    return;
+                };
+                // Opening it *is* the action; stepping right again moves on to
+                // the terminal.
+                if self.expanded.insert(dir) {
+                    return;
+                }
+                self.focus = Column::Terminal;
             }
-        } else if self.session_idx >= sessions {
-            self.session_idx = sessions - 1;
-        }
-
-        // A sibling session ended and the column it lived in is gone; leaving
-        // focus there would strand the cursor on something no longer drawn.
-        if self.focus == Column::Sessions && !self.shows_session_column() {
-            self.focus = Column::Terminal;
+            Some(_) => self.focus = Column::Terminal,
+            None => {}
         }
     }
+
+    /// `h` — leave the terminal, walk up to a parent, or close a project.
+    pub fn focus_left(&mut self) {
+        if self.focus == Column::Terminal {
+            self.focus = Column::Tree;
+            return;
+        }
+        match self.current_row() {
+            // Step to the parent first. A second `h` then closes it, the way a
+            // file tree behaves.
+            Some(Row::Session { project, .. }) => {
+                if let Some(row) = self.rows().iter().position(
+                    |r| matches!(r, Row::Project { index, .. } if *index == project),
+                ) {
+                    self.cursor = row;
+                }
+            }
+            Some(Row::Project { index, .. }) => {
+                if let Some(dir) = self.project_at(index).map(|p| p.dir.clone()) {
+                    self.expanded.remove(&dir);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// `Tab` — the next session of the project under the cursor, opening it.
+    pub fn cycle_session(&mut self) {
+        let Some((dir, count, index)) = self.current_row().and_then(|row| {
+            let index = match row {
+                Row::Project { index, .. } | Row::Session { project: index, .. } => index,
+            };
+            let p = self.project_at(index)?;
+            Some((p.dir.clone(), p.sessions.len(), index))
+        }) else {
+            return;
+        };
+        if count < 2 {
+            return;
+        }
+        self.expanded.insert(dir);
+
+        let rows = self.rows();
+        let children: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, Row::Session { project, .. } if *project == index))
+            .map(|(i, _)| i)
+            .collect();
+        if children.is_empty() {
+            return;
+        }
+        self.cursor = match children.iter().position(|i| *i == self.cursor) {
+            Some(pos) => children[(pos + 1) % children.len()],
+            None => children[0],
+        };
+    }
+
+    /// Keep the cursor inside the tree after a refresh changed it.
+    pub fn clamp(&mut self) {
+        let n = self.rows().len();
+        if n == 0 {
+            self.cursor = 0;
+            self.focus = Column::Tree;
+            return;
+        }
+        if self.cursor >= n {
+            self.cursor = n - 1;
+        }
+        // Nothing on the right means nothing to focus there.
+        if self.current_session().is_none() && self.focus == Column::Terminal {
+            self.focus = Column::Tree;
+        }
+    }
+}
+
+/// A line of the tree: a project, or one of its sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    Project { index: usize, expandable: bool },
+    Session { project: usize, index: usize },
 }
 
 /// Interrupting an agent normally means Esc, but Esc is spoken for — it is how
@@ -615,15 +675,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             live = None;
                         }
                     }
-                    KeyCode::Tab => {
-                        // Cycle sessions without moving the cursor between
-                        // columns — the fastest way to glance across a
-                        // directory's agents.
-                        let n = state.current_sessions().len();
-                        if n > 1 {
-                            state.session_idx = (state.session_idx + 1) % n;
-                        }
-                    }
+                    KeyCode::Tab => state.cycle_session(),
                     KeyCode::Char('d') => {
                         state.confirming_kill = state.current_name();
                     }
@@ -771,13 +823,28 @@ fn reload(state: &mut AppState, select: Option<String>) {
     state.projects = group_by_project(managed_sessions(&all, &state.agents));
 
     if let Some(target) = select {
-        for (pi, project) in state.visible_projects().iter().enumerate() {
-            if let Some(si) = project.sessions.iter().position(|s| s.name == target) {
-                state.project_idx = pi;
-                state.session_idx = si;
+        // Open whatever holds it, so there is a row to land on.
+        let home = state
+            .visible_projects()
+            .iter()
+            .find(|p| p.sessions.iter().any(|s| s.name == target))
+            .map(|p| (p.dir.clone(), p.sessions.len()));
+        if let Some((dir, count)) = home {
+            if count > 1 {
+                state.expanded.insert(dir);
+            }
+        }
+
+        // Walk the rows looking for the one that resolves to this session.
+        let total = state.rows().len();
+        let saved = state.cursor;
+        for i in 0..total {
+            state.cursor = i;
+            if state.current_name().as_deref() == Some(target.as_str()) {
                 return;
             }
         }
+        state.cursor = saved;
     }
     state.clamp();
 }
@@ -790,21 +857,19 @@ fn terminal_column(area: Rect, state: &AppState) -> Rect {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area)[0];
 
-    if state.shows_session_column() {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Ratio(2, 11),
-                Constraint::Ratio(3, 11),
-                Constraint::Ratio(6, 11),
-            ])
-            .split(body)[2]
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(2, 11), Constraint::Ratio(9, 11)])
-            .split(body)[1]
-    }
+    columns_of(body)[1]
+}
+
+/// Tree on the left, terminal on the right.
+///
+/// Declared once so [`terminal_column`] and [`render`] cannot disagree about
+/// where the pty's cells are — a mismatch would size the terminal to one rect
+/// and draw it into another.
+fn columns_of(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(3, 11), Constraint::Ratio(8, 11)])
+        .split(area)
 }
 
 /// Encode a mouse event as an SGR report, the way a real terminal would.
@@ -883,32 +948,9 @@ fn render(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(f.area());
 
-    // The terminal always takes the lion's share — an agent's boxed UI wraps
-    // badly below roughly 60 columns. The session column only appears when the
-    // project actually has more than one, and its width comes out of the
-    // terminal's rather than the project list's.
-    if state.shows_session_column() {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Ratio(2, 11),
-                Constraint::Ratio(3, 11),
-                Constraint::Ratio(6, 11),
-            ])
-            .split(outer[0]);
-
-        render_projects(f, state, columns[0]);
-        render_sessions(f, state, columns[1]);
-        render_terminal(f, state, live, columns[2]);
-    } else {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(2, 11), Constraint::Ratio(9, 11)])
-            .split(outer[0]);
-
-        render_projects(f, state, columns[0]);
-        render_terminal(f, state, live, columns[1]);
-    }
+    let columns = columns_of(outer[0]);
+    render_tree(f, state, columns[0]);
+    render_terminal(f, state, live, columns[1]);
 
     if state.picking_agent {
         render_agent_picker(f, state, outer[0]);
@@ -965,54 +1007,61 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
-fn render_projects(f: &mut Frame, state: &AppState, area: Rect) {
+/// The tree: projects, with their sessions nested under the open ones.
+fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
     let projects = state.visible_projects();
-    let items: Vec<ListItem> = projects
+    let rows = state.rows();
+
+    let items: Vec<ListItem> = rows
         .iter()
-        .map(|p| {
-            let count = p.sessions.len();
-            ListItem::new(format!("{:<18} {}", truncate(&p.name, 18), count))
+        .map(|row| match *row {
+            Row::Project { index, expandable } => {
+                let project = &projects[index];
+                // A project that cannot expand shows its agent inline — it is
+                // that session, so naming it saves a row that says nothing.
+                let (marker, trailing) = if !expandable {
+                    (" ", project.sessions.first().map(|s| s.alias.clone()).unwrap_or_default())
+                } else if state.expanded.contains(&project.dir) {
+                    ("▾", format!("{}", project.sessions.len()))
+                } else {
+                    ("▸", format!("{}", project.sessions.len()))
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{marker} ")),
+                    Span::styled(
+                        format!("{:<16}", truncate(&project.name, 16)),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(trailing, Style::default().fg(Color::DarkGray)),
+                ]))
+            }
+            Row::Session { project, index } => {
+                let session = &projects[project].sessions[index];
+                // The suffix is what tells two sessions of one directory apart;
+                // the rest of the name is a hash of the directory.
+                let suffix = session
+                    .name
+                    .rsplit_once('-')
+                    .map(|(_, tail)| tail.to_string())
+                    .unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    Span::raw("   ├ "),
+                    Span::styled(
+                        format!("{:<4}", session.alias),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+                ]))
+            }
         })
         .collect();
 
     let mut list_state = ListState::default();
-    if !projects.is_empty() {
-        list_state.select(Some(state.project_idx));
+    if !items.is_empty() {
+        list_state.select(Some(state.cursor));
     }
 
-    let (border, style) = border_for(state, Column::Projects);
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(border)
-                .border_style(style)
-                .title(" projects "),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▸ ");
-    f.render_stateful_widget(list, area, &mut list_state);
-}
-
-fn render_sessions(f: &mut Frame, state: &AppState, area: Rect) {
-    let sessions = state.current_sessions();
-    let items: Vec<ListItem> = sessions
-        .iter()
-        .map(|s| {
-            // The alias is the agent; the suffix is what distinguishes two
-            // sessions in one directory, so show that rather than the full
-            // name, which is mostly a hash.
-            let suffix = s.name.rsplit_once('-').map(|(_, tail)| tail).unwrap_or("");
-            ListItem::new(format!("{:<4} {}", s.alias, suffix))
-        })
-        .collect();
-
-    let mut list_state = ListState::default();
-    if !sessions.is_empty() {
-        list_state.select(Some(state.session_idx));
-    }
-
-    let (border, style) = border_for(state, Column::Sessions);
+    let (border, style) = border_for(state, Column::Tree);
     let list = List::new(items)
         .block(
             Block::default()
@@ -1021,8 +1070,7 @@ fn render_sessions(f: &mut Frame, state: &AppState, area: Rect) {
                 .border_style(style)
                 .title(" sessions "),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("▸ ");
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, &mut list_state);
 }
 
@@ -1165,251 +1213,6 @@ mod tests {
         assert_eq!(s.visible_projects()[0].name, "alpha");
     }
 
-    #[test]
-    fn hjkl_moves_between_columns() {
-        let mut s = AppState::new(projects());
-        // "beta" has two sessions, so all three columns exist — the collapsed
-        // case is covered by `navigation_skips_the_collapsed_column`.
-        s.project_idx = 1;
-        assert_eq!(s.focus, Column::Projects);
-
-        s.focus_right();
-        assert_eq!(s.focus, Column::Sessions);
-        s.focus_right();
-        assert_eq!(s.focus, Column::Terminal);
-        // Already at the rightmost column.
-        s.focus_right();
-        assert_eq!(s.focus, Column::Terminal);
-
-        s.focus_left();
-        assert_eq!(s.focus, Column::Sessions);
-        s.focus_left();
-        assert_eq!(s.focus, Column::Projects);
-        s.focus_left();
-        assert_eq!(s.focus, Column::Projects);
-    }
-
-    #[test]
-    fn a_project_with_no_sessions_cannot_be_descended_into() {
-        let mut s = AppState::new(projects());
-        s.project_idx = 2; // "empty"
-        s.focus_right();
-        assert_eq!(s.focus, Column::Projects, "descended into an empty project");
-    }
-
-    #[test]
-    fn jk_moves_within_the_focused_column() {
-        let mut s = AppState::new(projects());
-
-        // In the project column, j/k walk projects.
-        s.move_down();
-        assert_eq!(s.project_idx, 1);
-        assert_eq!(s.current_project().unwrap().name, "beta");
-
-        // In the session column, they walk that project's sessions.
-        s.focus_right();
-        s.move_down();
-        assert_eq!(s.session_idx, 1);
-        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222-grok"));
-
-        // And clamp at the end rather than running off it.
-        s.move_down();
-        assert_eq!(s.session_idx, 1);
-    }
-
-    #[test]
-    fn changing_project_resets_the_session_cursor() {
-        // Otherwise an index from a project with two sessions would point past
-        // the end of one with a single session.
-        let mut s = AppState::new(projects());
-        s.project_idx = 1;
-        s.focus_right();
-        s.move_down();
-        assert_eq!(s.session_idx, 1);
-
-        s.focus_left();
-        s.move_up(); // back to "alpha", which has one session
-        assert_eq!(s.session_idx, 0);
-        assert_eq!(s.current_name().as_deref(), Some("cc_alpha_11111111"));
-    }
-
-    #[test]
-    fn clamp_pulls_focus_back_out_of_an_emptied_project() {
-        let mut s = AppState::new(projects());
-        s.project_idx = 1;
-        s.focus_right();
-        assert_eq!(s.focus, Column::Sessions);
-
-        // The project's sessions went away under us (killed elsewhere).
-        s.projects[1].sessions.clear();
-        s.clamp();
-        assert_eq!(s.focus, Column::Projects);
-        assert_eq!(s.session_idx, 0);
-        assert!(s.current_name().is_none());
-    }
-
-    #[test]
-    fn a_lone_session_collapses_the_middle_column() {
-        let mut s = AppState::new(projects());
-
-        s.project_idx = 0; // "alpha" — one session
-        assert!(!s.shows_session_column());
-
-        s.project_idx = 1; // "beta" — two sessions
-        assert!(s.shows_session_column());
-    }
-
-    #[test]
-    fn navigation_skips_the_collapsed_column() {
-        let mut s = AppState::new(projects());
-        s.project_idx = 0; // one session, so no middle column
-
-        // `l` goes straight to the terminal rather than stopping on a column
-        // that isn't drawn.
-        s.focus_right();
-        assert_eq!(s.focus, Column::Terminal);
-        // And `h` comes straight back.
-        s.focus_left();
-        assert_eq!(s.focus, Column::Projects);
-
-        // With two sessions the middle column is real and gets a stop.
-        s.project_idx = 1;
-        s.focus_right();
-        assert_eq!(s.focus, Column::Sessions);
-        s.focus_right();
-        assert_eq!(s.focus, Column::Terminal);
-        s.focus_left();
-        assert_eq!(s.focus, Column::Sessions);
-    }
-
-    #[test]
-    fn focus_leaves_the_session_column_when_it_collapses() {
-        // A sibling session ends while the cursor is sitting in that column.
-        let mut s = AppState::new(projects());
-        s.project_idx = 1;
-        s.focus_right();
-        assert_eq!(s.focus, Column::Sessions);
-
-        s.projects[1].sessions.pop();
-        s.clamp();
-        assert!(!s.shows_session_column());
-        assert_eq!(s.focus, Column::Terminal, "stranded on an undrawn column");
-    }
-
-    #[test]
-    fn two_column_layout_gives_the_terminal_the_extra_width() {
-        use ratatui::backend::TestBackend;
-
-        let render_at = |project_idx: usize| {
-            let mut state = AppState::new(projects());
-            state.project_idx = project_idx;
-            let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
-            terminal.draw(|f| render(f, &state, None)).unwrap();
-            let buffer = terminal.backend().buffer().clone();
-            buffer.content().iter().map(|c| c.symbol()).collect::<String>()
-        };
-
-        // One session: no session column at all.
-        let lone = render_at(0);
-        assert!(lone.contains("projects"));
-        assert!(!lone.contains("sessions"), "middle column drawn for one session");
-
-        // Two sessions: it comes back.
-        let pair = render_at(1);
-        assert!(pair.contains("sessions"), "middle column missing for two sessions");
-    }
-
-    fn enc(code: KeyCode) -> Vec<u8> {
-        encode_key(code, KeyModifiers::NONE)
-    }
-
-    #[test]
-    fn printable_keys_encode_as_themselves() {
-        assert_eq!(enc(KeyCode::Char('a')), b"a");
-        assert_eq!(enc(KeyCode::Char(' ')), b" ");
-        // Multi-byte input has to survive — agents here are driven in Chinese.
-        assert_eq!(enc(KeyCode::Char('你')), "你".as_bytes());
-        // A digit answers an agent's numbered prompt, so it must arrive as
-        // typed input rather than being read as a UI shortcut.
-        assert_eq!(enc(KeyCode::Char('2')), b"2");
-    }
-
-    #[test]
-    fn navigation_keys_encode_as_escape_sequences() {
-        // What a real terminal sends, so the agent needs no special casing.
-        assert_eq!(enc(KeyCode::Up), b"\x1b[A");
-        assert_eq!(enc(KeyCode::Down), b"\x1b[B");
-        assert_eq!(enc(KeyCode::Right), b"\x1b[C");
-        assert_eq!(enc(KeyCode::Left), b"\x1b[D");
-        assert_eq!(enc(KeyCode::Enter), b"\r");
-        assert_eq!(enc(KeyCode::Tab), b"\t");
-        // DEL, not BS — this is what terminals actually send for backspace.
-        assert_eq!(enc(KeyCode::Backspace), vec![0x7f]);
-    }
-
-    #[test]
-    fn control_chords_encode_as_control_codes() {
-        assert_eq!(encode_key(KeyCode::Char('c'), KeyModifiers::CONTROL), vec![0x03]);
-        assert_eq!(encode_key(KeyCode::Char('d'), KeyModifiers::CONTROL), vec![0x04]);
-        // Case doesn't change the control code.
-        assert_eq!(encode_key(KeyCode::Char('C'), KeyModifiers::CONTROL), vec![0x03]);
-    }
-
-    #[test]
-    fn esc_is_never_forwarded() {
-        // Esc leaves insert mode. Forwarding it too would interrupt the agent
-        // every time you left.
-        assert!(enc(KeyCode::Esc).is_empty());
-    }
-
-    #[test]
-    fn i_enters_insert_only_with_a_session_selected() {
-        let mut s = AppState::new(projects());
-        s.project_idx = 2; // "empty"
-        assert!(s.current_name().is_none());
-        // Mirrors the loop's guard: nothing to type into, so nothing happens.
-        assert!(!s.inserting);
-
-        s.project_idx = 0;
-        assert!(s.current_name().is_some());
-    }
-
-    #[test]
-    fn insert_mode_marks_the_terminal_column_differently_from_focus() {
-        let mut s = AppState::new(projects());
-        s.focus = Column::Terminal;
-
-        let (_, focused) = border_for(&s, Column::Terminal);
-        s.inserting = true;
-        let (_, inserting) = border_for(&s, Column::Terminal);
-        assert_ne!(
-            focused.fg, inserting.fg,
-            "insert looks identical to plain focus"
-        );
-    }
-
-    #[test]
-    fn the_status_line_announces_insert_mode() {
-        use ratatui::backend::TestBackend;
-
-        let mut state = AppState::new(projects());
-        state.inserting = true;
-        state.focus = Column::Terminal;
-
-        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
-        terminal.draw(|f| render(f, &state, None)).unwrap();
-        let text: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-
-        assert!(text.contains("INSERT"), "no insert indicator");
-        assert!(text.contains("Esc"), "no way out documented");
-    }
-
     fn agents() -> Vec<Agent> {
         vec![
             Agent { name: "claude".into(), alias: "cc".into(), command: vec!["claude".into()] },
@@ -1419,39 +1222,100 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_within_the_project_and_wraps() {
-        let mut s = AppState::with_agents(projects(), agents());
-        s.project_idx = 1; // two sessions
-
-        // Mirrors the Tab handler.
-        let cycle = |s: &mut AppState| {
-            let n = s.current_sessions().len();
-            if n > 1 {
-                s.session_idx = (s.session_idx + 1) % n;
-            }
-        };
-        cycle(&mut s);
-        assert_eq!(s.session_idx, 1);
-        cycle(&mut s);
-        assert_eq!(s.session_idx, 0, "Tab should wrap, not stop at the end");
-
-        // A lone session has nothing to cycle to.
-        s.project_idx = 0;
-        s.session_idx = 0;
-        cycle(&mut s);
-        assert_eq!(s.session_idx, 0);
+    fn a_lone_session_needs_no_child_row() {
+        // "alpha" has one session, "beta" two. A single child under alpha
+        // would be a row that repeats what its parent already says.
+        let s = AppState::with_agents(projects(), agents());
+        let rows = s.rows();
+        assert_eq!(rows.len(), 3, "collapsed tree should be one row per project");
+        assert!(matches!(rows[0], Row::Project { expandable: false, .. }));
+        assert!(matches!(rows[1], Row::Project { expandable: true, .. }));
     }
 
     #[test]
-    fn the_picker_reports_which_agents_are_already_here() {
-        let mut s = AppState::with_agents(projects(), agents());
-        s.project_idx = 1; // two cx sessions
-        let here = s.aliases_here();
-        assert_eq!(here.iter().filter(|a| *a == "cx").count(), 2);
-        assert!(!here.contains(&"cc".to_string()));
+    fn a_collapsed_project_stands_in_for_its_only_session() {
+        let s = AppState::with_agents(projects(), agents());
+        // Cursor on "alpha", which is not expandable.
+        assert_eq!(s.current_name().as_deref(), Some("cc_alpha_11111111"));
+    }
 
-        s.project_idx = 0; // one cc session
-        assert_eq!(s.aliases_here(), vec!["cc".to_string()]);
+    #[test]
+    fn l_opens_a_project_before_it_reaches_the_terminal() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = 1; // "beta", two sessions
+
+        s.focus_right();
+        assert_eq!(s.focus, Column::Tree, "first l should open, not leave");
+        assert_eq!(s.rows().len(), 5, "beta's two sessions should now be rows");
+
+        s.focus_right();
+        assert_eq!(s.focus, Column::Terminal, "second l should step right");
+    }
+
+    #[test]
+    fn h_walks_to_the_parent_then_closes_it() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = 1;
+        s.focus_right(); // open beta
+        s.cursor = 3; // its second session
+
+        s.focus_left();
+        assert_eq!(s.cursor, 1, "should land on the parent");
+        assert_eq!(s.rows().len(), 5, "parent still open after one h");
+
+        s.focus_left();
+        assert_eq!(s.rows().len(), 3, "second h should close it");
+    }
+
+    #[test]
+    fn jk_walks_the_flattened_tree() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = 1;
+        s.focus_right(); // open beta -> 5 rows
+
+        s.move_down();
+        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222"));
+        s.move_down();
+        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222-grok"));
+        s.move_down();
+        // Past beta's children is the next project, not a wrap.
+        assert!(matches!(s.current_row(), Some(Row::Project { .. })));
+    }
+
+    #[test]
+    fn tab_opens_a_project_and_cycles_its_sessions() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = 1; // beta, collapsed
+
+        s.cycle_session();
+        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222"));
+        s.cycle_session();
+        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222-grok"));
+        s.cycle_session();
+        assert_eq!(
+            s.current_name().as_deref(),
+            Some("cx_beta_22222222"),
+            "Tab should wrap within the project"
+        );
+    }
+
+    #[test]
+    fn an_empty_project_resolves_to_no_session() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = 2; // "empty"
+        assert!(s.current_name().is_none());
+        // And there is nothing to step right into.
+        s.focus_right();
+        s.clamp();
+        assert_eq!(s.focus, Column::Tree);
+    }
+
+    #[test]
+    fn clamp_pulls_the_cursor_back_inside() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = 99;
+        s.clamp();
+        assert_eq!(s.cursor, s.rows().len() - 1);
     }
 
     #[test]
@@ -1486,7 +1350,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut state = AppState::with_agents(projects(), agents());
-        state.project_idx = 1;
+        state.cursor = 1;
         state.picking_agent = true;
 
         let mut terminal = Terminal::new(TestBackend::new(110, 14)).unwrap();
@@ -1580,30 +1444,30 @@ mod tests {
     /// rather than only testing the state behind it. `TestBackend` ships with
     /// ratatui — no new dev-dependency.
     #[test]
-    fn all_three_columns_are_drawn() {
+    fn the_tree_shows_projects_and_their_open_sessions() {
         use ratatui::backend::TestBackend;
 
         let mut state = AppState::new(projects());
-        state.project_idx = 1; // "beta", which has two sessions
+        state.cursor = 1; // "beta"
+        state.focus_right(); // open it
 
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
         terminal.draw(|f| render(f, &state, None)).unwrap();
-
-        let rendered: String = terminal
+        let text: String = terminal
             .backend()
             .buffer()
             .content()
             .iter()
-            .map(|cell| cell.symbol())
+            .map(|c| c.symbol())
             .collect();
 
-        assert!(rendered.contains("projects"), "project column missing");
-        assert!(rendered.contains("sessions"), "session column missing");
-        assert!(rendered.contains("alpha") && rendered.contains("beta"));
-        // With no live terminal attached the column says so.
-        assert!(rendered.contains("no session selected"));
-        // The status line documents the vim keys.
-        assert!(rendered.contains("hjkl"));
+        assert!(text.contains("alpha"), "collapsed project missing");
+        assert!(text.contains("beta"), "open project missing");
+        // Its sessions are nested under it once open.
+        assert!(text.contains("grok"), "child session not drawn");
+        // Two columns now, so there is no separate session pane.
+        assert!(!text.contains("projects"), "old three-column title survived");
+        assert!(text.contains("hjkl"));
     }
 
     #[test]
