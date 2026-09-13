@@ -79,6 +79,12 @@ pub struct AppState {
     /// `i` hands the keyboard to the selected session, vim-style: keys go to
     /// the agent instead of the UI until `Esc`.
     pub inserting: bool,
+    /// Which column had the focus when insert mode began.
+    ///
+    /// `i` moves the focus to the terminal to type there; `Esc` has to give it
+    /// back, or leaving insert from the tree strands the cursor on the right
+    /// and turns `j`/`k` into scrolling.
+    pub focus_before_insert: Option<Column>,
     /// `a` opens a picker over the terminal column; the next key is an agent
     /// alias. Shown rather than prompting on stdout, which would mean leaving
     /// the screen for the one thing that should be fastest.
@@ -107,6 +113,7 @@ impl AppState {
             filter: String::new(),
             filtering: false,
             inserting: false,
+            focus_before_insert: None,
             picking_agent: false,
             confirming_kill: None,
             agents,
@@ -678,6 +685,10 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 if state.inserting {
                     if key.code == KeyCode::Esc {
                         state.inserting = false;
+                        // Hand the focus back to wherever `i` was pressed.
+                        if let Some(previous) = state.focus_before_insert.take() {
+                            state.focus = previous;
+                        }
                         // Back to ASCII so hjkl navigate instead of typing.
                         saved_ime = ime::drop_to_ascii();
                         continue;
@@ -731,6 +742,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     KeyCode::Char('i') => {
                         if state.current_name().is_some() {
                             state.inserting = true;
+                            state.focus_before_insert = Some(state.focus);
                             state.focus = Column::Terminal;
                             // Put back whatever was being typed with before.
                             ime::restore(saved_ime.take());
@@ -1581,6 +1593,38 @@ mod tests {
     /// The layout is the whole point of this screen, so render it for real
     /// rather than only testing the state behind it. `TestBackend` ships with
     /// ratatui — no new dev-dependency.
+    #[test]
+    fn esc_returns_the_focus_that_i_took() {
+        // Leaving insert from the tree used to strand the cursor on the
+        // terminal, where j/k scroll instead of selecting — so getting back to
+        // the list took an extra h nobody asked for.
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = s.first_selectable();
+        assert_eq!(s.focus, Column::Tree);
+
+        // `i`
+        s.inserting = true;
+        s.focus_before_insert = Some(s.focus);
+        s.focus = Column::Terminal;
+
+        // `Esc`
+        s.inserting = false;
+        if let Some(previous) = s.focus_before_insert.take() {
+            s.focus = previous;
+        }
+        assert_eq!(s.focus, Column::Tree, "focus should go back to the tree");
+
+        // Entering from the terminal column leaves you there instead.
+        s.focus = Column::Terminal;
+        s.inserting = true;
+        s.focus_before_insert = Some(s.focus);
+        s.inserting = false;
+        if let Some(previous) = s.focus_before_insert.take() {
+            s.focus = previous;
+        }
+        assert_eq!(s.focus, Column::Terminal);
+    }
+
     #[test]
     fn jk_means_different_things_per_column() {
         // The bug this pins: with the terminal focused, j/k moved the tree
