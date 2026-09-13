@@ -523,27 +523,24 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     continue;
                 }
 
-                // The picker eats exactly one key: an agent alias, or Esc.
+                // The picker takes one digit — the number shown beside each
+                // agent. Not the alias: `cc` and `cx` are two characters and
+                // share a first letter, so a single keypress cannot name one.
                 if state.picking_agent {
                     state.picking_agent = false;
                     if key.code == KeyCode::Esc {
                         continue;
                     }
                     if let KeyCode::Char(c) = key.code {
-                        let typed = c.to_string();
-                        let agent = state
-                            .agents
-                            .iter()
-                            .find(|a| a.alias == typed)
-                            .cloned();
-                        match agent {
+                        match picked_agent(&state.agents, c).cloned() {
                             Some(agent) => {
                                 let created = spawn_agent(state, &agent, false);
                                 reload(state, created);
                                 live = None; // reattach to whatever is selected now
                             }
                             None => {
-                                state.notice = Some(format!("no agent with alias '{typed}'"));
+                                state.notice =
+                                    Some(format!("'{c}' is not one of the listed numbers"));
                             }
                         }
                     }
@@ -698,6 +695,21 @@ mod ime {
             select(&source);
         }
     }
+}
+
+/// Which agent a key in the picker selects, if any.
+///
+/// Keyed on the *number* shown beside each entry rather than the alias:
+/// `cc` and `cx` are two characters and share a first letter, so one keypress
+/// can never name one of them. An earlier version compared a single char
+/// against the alias, which meant only single-character aliases — `p` alone —
+/// could ever be chosen.
+pub fn picked_agent<'a>(agents: &'a [Agent], key: char) -> Option<&'a Agent> {
+    let index = key.to_digit(10)?;
+    if index < 1 {
+        return None;
+    }
+    agents.get(index as usize - 1)
 }
 
 /// Start `agent` in the selected project's directory, without leaving the TUI.
@@ -914,7 +926,8 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
     let rows: Vec<Line> = state
         .agents
         .iter()
-        .map(|a| {
+        .enumerate()
+        .map(|(i, a)| {
             let running = here.iter().filter(|x| *x == &a.alias).count();
             let suffix = match running {
                 0 => String::new(),
@@ -922,10 +935,10 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
             };
             Line::from(vec![
                 Span::styled(
-                    format!("  {}  ", a.alias),
+                    format!("  {}  ", i + 1),
                     Style::default().fg(Color::Black).bg(Color::Cyan),
                 ),
-                Span::raw(format!(" {}{}", a.name, suffix)),
+                Span::raw(format!(" {:<10} {}{}", a.name, a.alias, suffix)),
             ])
         })
         .collect();
@@ -946,7 +959,7 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(" start which agent here? (Esc cancels) "),
+                .title(" start which agent here? press a number, Esc cancels "),
         ),
         popup,
     );
@@ -1439,6 +1452,33 @@ mod tests {
 
         s.project_idx = 0; // one cc session
         assert_eq!(s.aliases_here(), vec!["cc".to_string()]);
+    }
+
+    #[test]
+    fn every_listed_agent_can_actually_be_picked() {
+        // The regression this exists for: the picker compared one keypress
+        // against the alias, so `cc`, `cx` and `oc` — two characters each —
+        // were unreachable, and only `p` worked. Whatever the picker draws
+        // must be selectable.
+        let agents = agents();
+        for (i, agent) in agents.iter().enumerate() {
+            let key = char::from_digit(i as u32 + 1, 10).unwrap();
+            assert_eq!(
+                picked_agent(&agents, key).map(|a| a.name.as_str()),
+                Some(agent.name.as_str()),
+                "agent {} is listed but key '{key}' does not select it",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_and_non_digits_select_nothing() {
+        let agents = agents(); // three of them
+        assert!(picked_agent(&agents, '4').is_none());
+        assert!(picked_agent(&agents, '0').is_none(), "numbering starts at 1");
+        assert!(picked_agent(&agents, 'c').is_none());
+        assert!(picked_agent(&agents, ' ').is_none());
     }
 
     #[test]
