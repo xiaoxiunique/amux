@@ -345,6 +345,29 @@ pub struct AppState {
     pub cursor_before_draft: Option<usize>,
     /// The settings view, open while `,` has been pressed.
     pub settings: bool,
+    /// First item the tree drew, recorded each frame.
+    ///
+    /// A click arrives as a screen position, and turning that back into a row
+    /// needs to know where the list started — rows are not a fixed height, and
+    /// the list scrolls.
+    pub view_offset: std::cell::Cell<usize>,
+    /// Lines the tree had room for, recorded each frame.
+    pub view_height: std::cell::Cell<u16>,
+    /// A `g` is waiting for its pair, vim-style.
+    pub pending_g: bool,
+    /// Sessions held on screen while the cursor moves on, newest last.
+    ///
+    /// The point is asymmetry: a pinned session stays put while the remaining
+    /// space keeps following the tree, so you can watch one agent work and
+    /// browse others at the same time. Capped at three — a fourth would leave
+    /// every pane too narrow to read, and rmux reflows to the pane width.
+    pub pinned: Vec<String>,
+    /// A file browser running in the terminal column.
+    ///
+    /// Kept apart from the session terminal rather than replacing it, so
+    /// closing the browser puts the session straight back rather than having to
+    /// re-attach it.
+    pub browsing: bool,
     /// A session being chosen but not yet started.
     ///
     /// While this is set the tree shows a placeholder row for it and the
@@ -383,6 +406,11 @@ impl AppState {
             agents,
             notice: None,
             settings: false,
+            browsing: false,
+            pending_g: false,
+            pinned: Vec::new(),
+            view_offset: std::cell::Cell::new(0),
+            view_height: std::cell::Cell::new(20),
             draft: None,
             cursor_before_draft: None,
             descriptions: std::collections::BTreeMap::new(),
@@ -469,6 +497,86 @@ impl AppState {
         self.current_project().map(|p| p.dir.clone())
     }
 
+    /// How many lines a row occupies. Must match the renderer, or a click
+    /// lands on the wrong session.
+    pub fn row_height(&self, row: Row) -> u16 {
+        let described = match row {
+            Row::Draft => false,
+            Row::Session { project, index } => self
+                .project_at(project)
+                .and_then(|p| p.sessions.get(index))
+                .is_some_and(|s| self.descriptions.contains_key(&s.name)),
+            Row::Project { index, expandable } => {
+                !expandable
+                    && self
+                        .project_at(index)
+                        .and_then(|p| p.sessions.first())
+                        .is_some_and(|s| self.descriptions.contains_key(&s.name))
+            }
+        };
+        if described {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// The row `line` lines below the top of the drawn list, if any.
+    pub fn row_at_line(&self, line: u16) -> Option<usize> {
+        let rows = self.rows();
+        let mut y = 0u16;
+        for index in self.view_offset.get()..rows.len() {
+            let height = self.row_height(rows[index]);
+            if line < y + height {
+                return Some(index);
+            }
+            y += height;
+        }
+        None
+    }
+
+    /// How many sessions may be held on screen at once.
+    pub const MAX_PINNED: usize = 3;
+
+    /// The sessions the terminal column shows: the pinned ones, then whatever
+    /// the cursor is on.
+    ///
+    /// The browsing pane is dropped when its session is already pinned —
+    /// showing one session twice wastes the space that made pinning worth it.
+    pub fn visible_sessions(&self) -> Vec<String> {
+        let mut out = self.pinned.clone();
+        if let Some(current) = self.current_name() {
+            if !out.contains(&current) {
+                out.push(current);
+            }
+        }
+        out
+    }
+
+    /// Whether the browsing pane is showing something of its own.
+    pub fn has_browse_pane(&self) -> bool {
+        self.visible_sessions().len() > self.pinned.len()
+    }
+
+    /// Hold the session under the cursor, or let go of it.
+    pub fn toggle_pin(&mut self) -> Result<(), String> {
+        let Some(name) = self.current_name() else {
+            return Err("nothing selected".into());
+        };
+        if let Some(at) = self.pinned.iter().position(|p| *p == name) {
+            self.pinned.remove(at);
+            return Ok(());
+        }
+        if self.pinned.len() >= Self::MAX_PINNED {
+            return Err(format!(
+                "already holding {} — unpin one first",
+                Self::MAX_PINNED
+            ));
+        }
+        self.pinned.push(name);
+        Ok(())
+    }
+
     /// Agents that already have a session in the project under the cursor.
     pub fn aliases_here(&self) -> Vec<String> {
         self.current_sessions().iter().map(|s| s.alias.clone()).collect()
@@ -515,11 +623,34 @@ impl AppState {
     }
 
     pub fn move_down(&mut self) {
-        self.cursor = self.step(self.cursor, true);
+        self.move_by(1);
     }
 
     pub fn move_up(&mut self) {
-        self.cursor = self.step(self.cursor, false);
+        self.move_by(-1);
+    }
+
+    /// Move `steps` selectable rows, stopping at whichever end it reaches.
+    ///
+    /// Counted in rows the cursor may rest on rather than lines, so a half page
+    /// moves past the same number of sessions whether or not they carry
+    /// descriptions — yazi's `arrow` works the same way.
+    pub fn move_by(&mut self, steps: isize) {
+        let forward = steps > 0;
+        for _ in 0..steps.unsigned_abs() {
+            let next = self.step(self.cursor, forward);
+            if next == self.cursor {
+                break;
+            }
+            self.cursor = next;
+        }
+    }
+
+    /// Rows the tree can show at once, as of the last frame.
+    ///
+    /// Page motions need it, and only the renderer knows it.
+    pub fn page(&self) -> isize {
+        (self.view_height.get() as isize).max(1)
     }
 
     /// First row the cursor may rest on.
@@ -527,6 +658,14 @@ impl AppState {
         self.rows()
             .iter()
             .position(|r| self.selectable(*r))
+            .unwrap_or(0)
+    }
+
+    /// `G` — the last row the cursor may sit on.
+    pub fn last_selectable(&self) -> usize {
+        self.rows()
+            .iter()
+            .rposition(|r| self.selectable(*r))
             .unwrap_or(0)
     }
 
@@ -718,14 +857,38 @@ struct LiveTerm {
 impl LiveTerm {
     /// Attach to `session` in a pty of the given size.
     fn open(session: &str, cols: u16, rows: u16) -> Option<Self> {
-        let pair = native_pty_system()
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-            .ok()?;
-
         let mut command = CommandBuilder::new(tmux::mux_bin());
         command.arg("attach-session");
         command.arg("-t");
         command.arg(session);
+        Self::spawn(session.to_string(), command, cols, rows)
+    }
+
+    /// Run an arbitrary command in the column instead of a session.
+    ///
+    /// Everything below is command-agnostic — the environment scrubbing, the
+    /// reader thread, the parser — so a file browser gets the same treatment an
+    /// attached session does rather than a second implementation of it.
+    fn run(label: &str, program: &str, args: &[String], cwd: &str, cols: u16, rows: u16) -> Option<Self> {
+        let mut command = CommandBuilder::new(program);
+        for arg in args {
+            command.arg(arg);
+        }
+        command.cwd(cwd);
+        Self::spawn(label.to_string(), command, cols, rows)
+    }
+
+    fn spawn(
+        label: String,
+        mut command: CommandBuilder,
+        cols: u16,
+        rows: u16,
+    ) -> Option<Self> {
+        let pair = native_pty_system()
+            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .ok()?;
+
+        let session = label;
         // amux normally runs *inside* a session, and a surviving marker makes
         // the multiplexer treat this attach as a switch-client — which fails
         // with "requires an unambiguous attached client" and leaves the column
@@ -787,6 +950,14 @@ impl LiveTerm {
             }
         }
         got
+    }
+
+    /// Whether the program in the pty has exited.
+    ///
+    /// A file browser closing itself is how the column gets handed back — the
+    /// user quits yazi its own way rather than having to learn amux's.
+    fn finished(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
@@ -915,6 +1086,49 @@ fn status_marker(status: Option<&crate::serve::server::SessionStatus>) -> (&'sta
     }
 }
 
+/// Which stacked pane the screen row `row` falls in.
+fn pane_at(live: &[LiveTerm], area: Rect, row: u16) -> Option<String> {
+    if live.len() <= 1 {
+        return live.first().map(|t| t.session.clone());
+    }
+    let each = area.height / live.len() as u16;
+    if each == 0 {
+        return None;
+    }
+    let index = ((row.saturating_sub(area.y)) / each) as usize;
+    live.get(index.min(live.len() - 1)).map(|t| t.session.clone())
+}
+
+/// Move the cursor onto `name`, if it is on screen.
+fn select_session(state: &mut AppState, name: &str) {
+    let rows = state.rows();
+    if let Some(index) = rows.iter().position(|row| match row {
+        Row::Session { project, index } => state
+            .project_at(*project)
+            .and_then(|p| p.sessions.get(*index))
+            .is_some_and(|s| s.name == name),
+        Row::Project { index, expandable } => {
+            !expandable
+                && state
+                    .project_at(*index)
+                    .and_then(|p| p.sessions.first())
+                    .is_some_and(|s| s.name == name)
+        }
+        Row::Draft => false,
+    }) {
+        state.cursor = index;
+    }
+}
+
+/// The pane the keyboard belongs to: the one the tree's cursor is on.
+///
+/// With several stacked, "the terminal" is ambiguous — typing has to land in
+/// the session that is selected, not whichever happens to be first.
+fn focused_term<'a>(live: &'a mut [LiveTerm], state: &AppState) -> Option<&'a mut LiveTerm> {
+    let wanted = state.current_name()?;
+    live.iter_mut().find(|t| t.session == wanted)
+}
+
 /// Size of the terminal column, in cells, for the current frame size.
 fn term_size(area: Rect) -> (u16, u16) {
     // Minus the border on each side.
@@ -928,7 +1142,11 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut live: Option<LiveTerm> = None;
+    // Normally one; every session of a project while split.
+    let mut live: Vec<LiveTerm> = Vec::new();
+    // The file browser, when one is up. Separate from `live` so the session
+    // behind it is not torn down and rebuilt each time.
+    let mut tool: Option<LiveTerm> = None;
     let mut last_draw = Instant::now() - REDRAW_FLOOR;
     let mut last_reload = Instant::now();
     let mut known: Vec<String> = managed_names(&state.agents);
@@ -977,28 +1195,50 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     let result = loop {
         state.clamp();
 
-        // Attach to whatever is selected, and drop a terminal whose session is
-        // no longer the one in view.
-        let wanted = state.current_name();
-        if live.as_ref().map(|t| &t.session) != wanted.as_ref() {
-            live = None;
-            if let Some(name) = &wanted {
-                let (cols, rows) = term_size(terminal_column(terminal.get_frame().area()));
-                live = LiveTerm::open(name, cols, rows);
-            }
+        // Attach to whatever is in view, and drop terminals that no longer are.
+        let wanted = state.visible_sessions();
+        let rects = pane_rects(
+            terminal_column(terminal.get_frame().area()),
+            state.pinned.len(),
+            state.has_browse_pane(),
+        );
+        if live.iter().map(|t| &t.session).ne(wanted.iter()) {
+            live = wanted
+                .iter()
+                .enumerate()
+                .filter_map(|(i, name)| {
+                    // Each pane gets the size of the box it will be drawn in;
+                    // they are deliberately unequal.
+                    let (cols, rows) = term_size(rects.get(i).copied().unwrap_or_default());
+                    LiveTerm::open(name, cols, rows)
+                })
+                .collect();
             dirty = true;
         }
 
-        if let Some(term) = live.as_mut() {
-            let (cols, rows) = term_size(terminal_column(terminal.get_frame().area()));
+        for (i, term) in live.iter_mut().enumerate() {
+            let (cols, rows) = term_size(rects.get(i).copied().unwrap_or_default());
             term.resize(cols, rows);
             if term.pump() {
                 dirty = true;
             }
         }
+        if let Some(term) = tool.as_mut() {
+            let (cols, rows) = term_size(terminal_column(terminal.get_frame().area()));
+            term.resize(cols, rows);
+            if term.pump() {
+                dirty = true;
+            }
+            // Quitting the browser its own way hands the column back.
+            if term.finished() {
+                tool = None;
+                state.browsing = false;
+                dirty = true;
+            }
+        }
 
         if dirty && last_draw.elapsed() >= REDRAW_FLOOR {
-            terminal.draw(|f| render(f, state, live.as_ref()))?;
+            terminal.draw(|f| render(f, state, &live, tool.as_ref()))?;
             last_draw = Instant::now();
             dirty = false;
         }
@@ -1013,7 +1253,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     state.draft = None;
                     state.cursor_before_draft = None;
                     reload(state, Some(name));
-                    live = None;
+                    live.clear();
                 }
                 Err(e) => {
                     state.draft = None;
@@ -1085,8 +1325,25 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     && column < area.x + area.width.saturating_sub(1)
                     && row > area.y
                     && row < area.y + area.height.saturating_sub(1);
+                let clicked = matches!(kind, MouseEventKind::Down(MouseButton::Left));
                 if inside {
-                    if let Some(term) = live.as_mut() {
+                    // Clicking a pane makes it the one the keyboard reaches —
+                    // with several stacked, "the terminal" is otherwise
+                    // whichever the tree happens to be on. Then hand the click
+                    // to the agent as well, so selecting text still works.
+                    if clicked {
+                        if let Some(name) = pane_at(&live, area, row) {
+                            select_session(state, &name);
+                        }
+                        state.focus = Column::Terminal;
+                        if !state.inserting {
+                            state.inserting = true;
+                            state.focus_before_insert = Some(Column::Tree);
+                            ime::resume_typing(saved_ime.take());
+                        }
+                        dirty = true;
+                    }
+                    if let Some(term) = focused_term(&mut live, state) {
                         let bytes = encode_mouse(kind, column - area.x - 1, row - area.y - 1);
                         if !bytes.is_empty() {
                             term.write(&bytes);
@@ -1096,6 +1353,27 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     match kind {
                         MouseEventKind::ScrollDown => state.move_down(),
                         MouseEventKind::ScrollUp => state.move_up(),
+                        // A click in the tree selects what was clicked. The
+                        // hand is already on the mouse; making it reach for
+                        // hjkl to do what a click obviously means is the kind
+                        // of thing that makes a TUI feel hostile.
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let tree = tree_column(terminal.get_frame().area());
+                            if row > tree.y && row < tree.y + tree.height.saturating_sub(1) {
+                                if let Some(index) = state.row_at_line(row - tree.y - 1) {
+                                    if state.selectable(state.rows()[index]) {
+                                        state.cursor = index;
+                                        state.focus = Column::Tree;
+                                        // A click is a deliberate move away
+                                        // from typing.
+                                        if state.inserting {
+                                            state.inserting = false;
+                                            saved_ime = ime::drop_to_ascii();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     dirty = true;
@@ -1121,6 +1399,22 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     continue;
                 }
 
+                if state.browsing {
+                    // `Y` closes, everything else goes to the browser — it
+                    // needs Esc and the arrow keys for its own navigation. The
+                    // cost is yazi's unyank, which this keymap does not bind.
+                    if key.code == KeyCode::Char('Y') {
+                        tool = None;
+                        state.browsing = false;
+                    } else if let Some(term) = tool.as_mut() {
+                        let bytes = encode_key(key.code, key.modifiers);
+                        if !bytes.is_empty() {
+                            term.write(&bytes);
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 if state.settings {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char(',') => state.settings = false,
@@ -1237,7 +1531,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                         // Already running: nothing to wait for.
                                         state.draft = None;
                                         reload(state, Some(already));
-                                        live = None;
+                                        live.clear();
                                     }
                                 }
                             }
@@ -1327,6 +1621,48 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 }
 
                 if state.inserting {
+                    // Switch sessions without dropping out of insert mode.
+                    // Leaving, navigating and re-entering is four keys for
+                    // something that should be one, and Alt is free: encode_key
+                    // only ever looked at Ctrl, so these combinations were
+                    // reaching the agent as bare letters anyway.
+                    // Two ways in, because neither covers everyone.
+                    //
+                    // Alt is free — `encode_key` never looked at it, so Alt-j
+                    // was reaching the agent as a bare `j` — but on macOS the
+                    // Option key does not send Alt unless the terminal is told
+                    // to (`macos-option-as-alt`), and that is not the default.
+                    //
+                    // Ctrl arrives everywhere, but only the *arrows* are free:
+                    // `encode_key` drops modifiers on them, so Ctrl-Up was
+                    // already arriving as a plain Up. Ctrl-J and Ctrl-K are
+                    // not free — they are newline and kill-line, and agents use
+                    // both.
+                    let alt = key.modifiers.contains(KeyModifiers::ALT);
+                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    match key.code {
+                        KeyCode::Char('j') if alt => {
+                            state.move_down();
+                            dirty = true;
+                            continue;
+                        }
+                        KeyCode::Char('k') if alt => {
+                            state.move_up();
+                            dirty = true;
+                            continue;
+                        }
+                        KeyCode::Down if alt || ctrl => {
+                            state.move_down();
+                            dirty = true;
+                            continue;
+                        }
+                        KeyCode::Up if alt || ctrl => {
+                            state.move_up();
+                            dirty = true;
+                            continue;
+                        }
+                        _ => {}
+                    }
                     if key.code == KeyCode::Esc {
                         state.inserting = false;
                         // Hand the focus back to wherever `i` was pressed.
@@ -1337,7 +1673,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         saved_ime = ime::drop_to_ascii();
                         continue;
                     }
-                    if let Some(term) = live.as_mut() {
+                    if let Some(term) = focused_term(&mut live, state) {
                         let bytes = encode_key(key.code, key.modifiers);
                         if !bytes.is_empty() {
                             term.write(&bytes);
@@ -1358,6 +1694,11 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     continue;
                 }
 
+                // Any key ends a half-typed `gg`; taking it here means every
+                // arm below starts from a clean slate, and `g j g` cannot
+                // become a jump.
+                let had_g = std::mem::take(&mut state.pending_g);
+
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         break Outcome::Quit
@@ -1369,14 +1710,14 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     // would swap out the very session being read.
                     KeyCode::Char('j') | KeyCode::Down => {
                         if state.focus == Column::Terminal {
-                            scroll_live(live.as_mut(), MouseEventKind::ScrollDown);
+                            scroll_live(focused_term(&mut live, state), MouseEventKind::ScrollDown);
                         } else {
                             state.move_down();
                         }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         if state.focus == Column::Terminal {
-                            scroll_live(live.as_mut(), MouseEventKind::ScrollUp);
+                            scroll_live(focused_term(&mut live, state), MouseEventKind::ScrollUp);
                         } else {
                             state.move_up();
                         }
@@ -1396,6 +1737,63 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     KeyCode::Char('/') => {
                         state.filtering = true;
                         state.filter.clear();
+                    }
+                    // Browse the selected project without leaving for another
+                    // window: the column is free while you are reading, and
+                    // this is what it is for.
+                    KeyCode::Char('Y') => match state.current_dir() {
+                        Some(dir) => {
+                            let (cols, rows) =
+                                term_size(terminal_column(terminal.get_frame().area()));
+                            match LiveTerm::run("files", "yazi", &[dir.clone()], &dir, cols, rows) {
+                                Some(term) => {
+                                    tool = Some(term);
+                                    state.browsing = true;
+                                }
+                                None => {
+                                    state.notice =
+                                        Some("could not start yazi — is it installed?".into())
+                                }
+                            }
+                        }
+                        None => state.notice = Some("nothing selected".into()),
+                    },
+                    // Hold this session on screen, or let go of it. Pinned
+                    // panes stay put while the rest of the column keeps
+                    // following the cursor.
+                    // vim's jumps. `gg` needs the first `g` remembered; any
+                    // other key cancels it rather than being swallowed.
+                    KeyCode::Char('g') => {
+                        if had_g {
+                            state.cursor = state.first_selectable();
+                        } else {
+                            state.pending_g = true;
+                        }
+                    }
+                    KeyCode::Char('G') | KeyCode::End => {
+                        state.cursor = state.last_selectable()
+                    }
+                    KeyCode::Home => state.cursor = state.first_selectable(),
+                    // The page motions vim and yazi both use. Halves for
+                    // reading, wholes for covering ground.
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.move_by(state.page() / 2)
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.move_by(-state.page() / 2)
+                    }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.move_by(state.page())
+                    }
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.move_by(-state.page())
+                    }
+                    KeyCode::PageDown => state.move_by(state.page()),
+                    KeyCode::PageUp => state.move_by(-state.page()),
+                    KeyCode::Char('p') => {
+                        if let Err(why) = state.toggle_pin() {
+                            state.notice = Some(why);
+                        }
                     }
                     KeyCode::Char(',') => state.settings = true,
                     KeyCode::Char('o') => {
@@ -1837,12 +2235,20 @@ fn reload(state: &mut AppState, select: Option<String>) {
 /// Where the terminal column lands for a given frame, so the pty can be sized
 /// to it before the first draw.
 fn terminal_column(area: Rect) -> Rect {
-    let body = Layout::default()
+    columns_of(body_of(area))[1]
+}
+
+/// The frame minus the status line — what the two columns divide.
+fn body_of(area: Rect) -> Rect {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area)[0];
+        .split(area)[0]
+}
 
-    columns_of(body)[1]
+/// Where the tree is drawn, for turning a click back into a row.
+fn tree_column(area: Rect) -> Rect {
+    columns_of(body_of(area))[0]
 }
 
 /// Tree on the left, terminal on the right.
@@ -1920,6 +2326,14 @@ pub fn encode_key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
 }
 
 /// Border style that marks which column owns the keyboard.
+/// Whether this pane is the one the keyboard would reach.
+fn pane_is_focused(state: &AppState, live: Option<&LiveTerm>) -> bool {
+    match live {
+        Some(term) => state.current_name().as_deref() == Some(term.session.as_str()),
+        None => true,
+    }
+}
+
 fn border_for(state: &AppState, column: Column) -> (BorderType, Style) {
     if state.inserting && column == Column::Terminal {
         // Distinct from ordinary focus: in insert mode a keypress goes to the
@@ -1932,7 +2346,7 @@ fn border_for(state: &AppState, column: Column) -> (BorderType, Style) {
     }
 }
 
-fn render(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>) {
+fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&LiveTerm>) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -1940,7 +2354,9 @@ fn render(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>) {
 
     let columns = columns_of(outer[0]);
     render_tree(f, state, columns[0]);
-    if state.settings {
+    if state.browsing {
+        render_tool(f, tool, columns[1]);
+    } else if state.settings {
         render_settings(f, columns[1]);
     } else {
         match &state.draft {
@@ -2062,6 +2478,20 @@ fn render_provider_picker(f: &mut Frame, pick: &ProviderPick, area: Rect) {
         ),
         popup,
     );
+}
+
+/// A tool borrowing the terminal column — the file browser, for now.
+fn render_tool(f: &mut Frame, tool: Option<&LiveTerm>, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(Color::Green))
+        .title(" files — Y closes, q quits yazi ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if let Some(term) = tool {
+        f.render_widget(PseudoTerminal::new(term.parser.screen()), inner);
+    }
 }
 
 /// What the daemon is doing, and how to change it.
@@ -2417,16 +2847,99 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, area, &mut list_state);
+    // Rendering is what decides where the list starts scrolling from, so record
+    // it here — a click has only a screen position to work back from.
+    state.view_offset.set(list_state.offset());
+    state.view_height.set(area.height.saturating_sub(2));
 }
 
-fn render_terminal(
+/// Where each pane goes, for `pinned` held sessions plus a browsing pane.
+///
+/// The shape is deliberately lopsided. Pinned panes take halves and quarters of
+/// the *left*, and what is left over stays with the cursor, so watching an
+/// agent and browsing other projects can happen at once rather than in turns.
+///
+/// ```text
+///  none          one            two            three
+/// ┌───────┐   ┌────┬────┐   ┌────┬────┐   ┌────┬────┐
+/// │browse │   │pin1│brow│   │pin1│    │   │pin1│pin3│
+/// │       │   │    │se  │   ├────┤brow│   ├────┼────┤
+/// │       │   │    │    │   │pin2│se  │   │pin2│brow│
+/// └───────┘   └────┴────┘   └────┴────┘   └────┴────┘
+/// ```
+fn pane_rects(area: Rect, pinned: usize, browse: bool) -> Vec<Rect> {
+    if pinned == 0 {
+        return if browse { vec![area] } else { Vec::new() };
+    }
+
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(area);
+    let (left, right) = (halves[0], halves[1]);
+
+    let split_vertically = |r: Rect| {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+            .split(r)
+            .to_vec()
+    };
+
+    // Pinned first, browsing last — the order `visible_sessions` returns.
+    match pinned {
+        1 if browse => vec![left, right],
+        1 => vec![area],
+        2 if browse => {
+            let l = split_vertically(left);
+            vec![l[0], l[1], right]
+        }
+        2 => {
+            let l = split_vertically(area);
+            vec![l[0], l[1]]
+        }
+        _ => {
+            let l = split_vertically(left);
+            let r = split_vertically(right);
+            if browse {
+                vec![l[0], l[1], r[0], r[1]]
+            } else {
+                vec![l[0], l[1], r[0]]
+            }
+        }
+    }
+}
+
+/// The terminal column: the pinned sessions, and whatever the cursor is on.
+fn render_terminal(f: &mut Frame, state: &AppState, live: &[LiveTerm], area: Rect) {
+    let rects = pane_rects(area, state.pinned.len(), state.has_browse_pane());
+    if rects.len() <= 1 {
+        render_one_terminal(f, state, live.first(), rects.first().copied().unwrap_or(area));
+        return;
+    }
+    for (i, rect) in rects.iter().enumerate() {
+        render_one_terminal(f, state, live.get(i), *rect);
+    }
+}
+
+fn render_one_terminal(
     f: &mut Frame,
     state: &AppState,
     live: Option<&LiveTerm>,
     area: Rect,
 ) {
     let (border, style) = border_for(state, Column::Terminal);
-    let title = match state.current_name() {
+    // Stacked, only one pane can receive the keyboard; the rest must not claim
+    // the border that says they can.
+    let (border, style) = if pane_is_focused(state, live) {
+        (border, style)
+    } else {
+        (BorderType::Plain, Style::default().fg(Color::DarkGray))
+    };
+    // Each pane is titled with the session *it* is showing, not the one the
+    // cursor is on — stacked, they are rarely the same, and three panes under
+    // one name says nothing about which is which.
+    let title = match live.map(|t| t.session.as_str()).or(state.current_name().as_deref()) {
         Some(name) => format!(" {name} "),
         None => " terminal ".to_string(),
     };
@@ -2462,8 +2975,30 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!(
-                "  keys go to {name}   Esc leave   {KEY_TO_INTERRUPT} interrupt"
+                "  keys go to {name}   ^↑↓ switch   Esc leave   \
+                 {KEY_TO_INTERRUPT} interrupt"
             )),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+
+    // Waiting on the second half of a sequence. yazi shows the candidates
+    // rather than leaving you wondering whether the key registered; with one
+    // pair there is little to list, but the silence is the problem.
+    if state.pending_g {
+        let line = Line::from(vec![
+            Span::styled(
+                " g ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  g top    any other key cancels",
+                Style::default().fg(Color::DarkGray),
+            ),
         ]);
         f.render_widget(Paragraph::new(line), area);
         return;
@@ -2507,8 +3042,9 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
                 "{filter}jk scroll  h back  i insert  Enter attach  q quit"
             ),
             Column::Tree => format!(
-                "{filter}hjkl move  Enter/i open  o project  O here  a agent  \
-                 N extra  A fullscreen  d kill  / filter  , settings  q quit"
+                "{filter}hjkl move  gg/G ends  ^u^d page  Enter/i open  p pin  \
+                 o project  O here  a agent  N extra  Y files  A fullscreen  \
+                 d kill  / filter  , settings  q quit"
             ),
         }
     };
@@ -2747,7 +3283,7 @@ mod tests {
         state.picking_agent = true;
 
         let mut terminal = Terminal::new(TestBackend::new(110, 14)).unwrap();
-        terminal.draw(|f| render(f, &state, None)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
         let text: String = terminal
             .backend()
             .buffer()
@@ -2773,7 +3309,7 @@ mod tests {
         state.notice = Some("started cx_beta_22222222-2".into());
 
         let mut terminal = Terminal::new(TestBackend::new(110, 10)).unwrap();
-        terminal.draw(|f| render(f, &state, None)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
         let text: String = terminal
             .backend()
             .buffer()
@@ -2802,7 +3338,7 @@ mod tests {
         state.confirming_kill = Some("cc_alpha_11111111".into());
 
         let mut terminal = Terminal::new(TestBackend::new(110, 10)).unwrap();
-        terminal.draw(|f| render(f, &state, None)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
         let text: String = terminal
             .backend()
             .buffer()
@@ -2895,7 +3431,7 @@ mod tests {
             state.cursor = state.first_selectable();
             state.focus = focus;
             let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
-            terminal.draw(|f| render(f, &state, None)).unwrap();
+            terminal.draw(|f| render(f, &state, &[], None)).unwrap();
             terminal
                 .backend()
                 .buffer()
@@ -2924,7 +3460,7 @@ mod tests {
         let at = |status: PaneStatus, since: Option<i64>| SessionStatus { status, since };
         let draw = |state: &AppState| -> String {
             let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-            terminal.draw(|f| render(f, state, None)).unwrap();
+            terminal.draw(|f| render(f, state, &[], None)).unwrap();
             terminal
                 .backend()
                 .buffer()
@@ -3001,7 +3537,7 @@ mod tests {
         state.cursor = state.first_selectable();
 
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        terminal.draw(|f| render(f, &state, None)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
         let text: String = terminal
             .backend()
             .buffer()
@@ -3050,7 +3586,7 @@ mod tests {
         state.cursor = state.first_selectable();
 
         let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
-        terminal.draw(|f| render(f, &state, None)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
         let text: String = terminal
             .backend()
             .buffer()
@@ -3198,7 +3734,7 @@ mod tests {
         let mut state = AppState::new(projects());
         state.cursor = state.first_selectable();
         let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
-        terminal.draw(|f| render(f, &state, None)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
         let text: String = terminal
             .backend()
             .buffer()
@@ -3408,7 +3944,7 @@ mod tests {
     fn drawn(state: &AppState, width: u16) -> String {
         use ratatui::backend::TestBackend;
         let mut t = Terminal::new(TestBackend::new(width, 14)).unwrap();
-        t.draw(|f| render(f, state, None)).unwrap();
+        t.draw(|f| render(f, state, &[], None)).unwrap();
         t.backend().buffer().content().iter().map(|c| c.symbol()).collect()
     }
 
@@ -3535,6 +4071,184 @@ mod tests {
         );
     }
 
+    /// The browser takes the column, and says how to get out of it — both
+    /// its own quit and the one amux reserves.
+    #[test]
+    fn the_browser_takes_the_column_and_says_how_to_leave() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        assert!(!drawn(&state, 140).contains("files — Y closes"));
+
+        state.browsing = true;
+        let text = drawn(&state, 140);
+        assert!(text.contains("files"), "the browser panel is not titled");
+        assert!(text.contains("Y closes"), "the reserved key is not shown");
+        assert!(text.contains("q quits yazi"), "yazi's own quit is not shown");
+
+        // It replaces the terminal rather than sitting over it, so nothing of
+        // the session's frame is left behind.
+        assert!(!text.contains("no session selected"));
+    }
+
+    /// Insert mode has to advertise the way out *and* the way sideways —
+    /// switching sessions without leaving is the whole point of Alt-jk.
+    #[test]
+    fn insert_mode_lists_the_keys_that_leave_and_switch() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        state.inserting = true;
+
+        let text = drawn(&state, 140);
+        assert!(text.contains("-- INSERT --"));
+        assert!(text.contains("switch"), "the switch keys are unlisted");
+        assert!(text.contains("Esc leave"));
+    }
+
+    /// Pinning holds a session on screen while the cursor moves on, which is
+    /// the whole point — otherwise it is just a second copy of the same pane.
+    #[test]
+    fn pinning_holds_a_session_while_the_cursor_moves() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let first = state.current_name().unwrap();
+
+        // Nothing pinned: the column shows only what is selected.
+        assert_eq!(state.visible_sessions(), vec![first.clone()]);
+
+        state.toggle_pin().unwrap();
+        assert_eq!(state.pinned, vec![first.clone()]);
+        // Pinned *and* selected is one pane, not two of the same session.
+        assert_eq!(state.visible_sessions(), vec![first.clone()]);
+        assert!(!state.has_browse_pane());
+
+        // Move on, and it is still held — with the new selection beside it.
+        state.move_down();
+        let second = state.current_name().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(state.visible_sessions(), vec![first.clone(), second]);
+        assert!(state.has_browse_pane());
+
+        // Pinning the same one again lets go of it.
+        state.cursor = state.first_selectable();
+        state.toggle_pin().unwrap();
+        assert!(state.pinned.is_empty());
+    }
+
+    /// Three is the cap: a fourth would leave every pane too narrow to read.
+    #[test]
+    fn a_fourth_pin_is_refused_rather_than_squeezed_in() {
+        let mut state = AppState::new(projects());
+        for name in ["a", "b", "c"] {
+            state.pinned.push(name.into());
+        }
+        state.cursor = state.first_selectable();
+
+        let refused = state.toggle_pin();
+        assert!(refused.is_err(), "a fourth pin was accepted");
+        assert_eq!(state.pinned.len(), AppState::MAX_PINNED);
+
+        // The message has to say what to do about it.
+        assert!(refused.unwrap_err().contains("unpin"));
+    }
+
+    /// The layout is lopsided on purpose: pinned panes take the left, and
+    /// what is left over keeps following the cursor.
+    #[test]
+    fn pinned_panes_take_the_left_and_browsing_keeps_the_rest() {
+        let area = Rect { x: 0, y: 0, width: 100, height: 40 };
+
+        // Nothing pinned: browsing has it all.
+        let none = pane_rects(area, 0, true);
+        assert_eq!(none, vec![area]);
+
+        // One pinned: halves, browsing on the right.
+        let one = pane_rects(area, 1, true);
+        assert_eq!(one.len(), 2);
+        assert_eq!(one[0].width, 50);
+        assert!(one[1].x >= 50, "browsing must sit to the right of the pin");
+
+        // Two: the left half splits, browsing still owns the right half whole.
+        let two = pane_rects(area, 2, true);
+        assert_eq!(two.len(), 3);
+        assert_eq!(two[0].x, two[1].x, "both pins share the left column");
+        assert!(two[1].y > two[0].y, "the second pin goes below the first");
+        assert_eq!(two[2].height, 40, "browsing keeps the full height");
+
+        // Three: four quadrants, browsing bottom-right.
+        let three = pane_rects(area, 3, true);
+        assert_eq!(three.len(), 4);
+        let browse = three[3];
+        assert!(browse.x >= 50 && browse.y >= 20, "browsing belongs bottom-right");
+
+        // Pinned but nothing extra selected: no empty pane is left over.
+        assert_eq!(pane_rects(area, 1, false).len(), 1);
+        assert_eq!(pane_rects(area, 3, false).len(), 3);
+    }
+
+    /// `gg` and `G` land on rows the cursor may actually sit on — the first
+    /// row is a heading whenever the first project has several sessions.
+    #[test]
+    fn gg_and_g_jump_to_the_ends_of_the_tree() {
+        let state = AppState::new(projects());
+
+        let first = state.first_selectable();
+        let last = state.last_selectable();
+        assert!(first < last, "the fixture needs more than one landing spot");
+        assert!(state.selectable(state.rows()[first]));
+        assert!(state.selectable(state.rows()[last]));
+
+        // `G` goes to the end, not past it.
+        assert!(last < state.rows().len());
+
+        // Nothing below the last selectable row is selectable.
+        assert!(state.rows()[last + 1..]
+            .iter()
+            .all(|r| !state.selectable(*r)));
+    }
+
+    /// A half page moves in *rows*, not lines — a session with a description
+    /// takes two lines but is still one thing to move past.
+    #[test]
+    fn page_motions_count_rows_not_lines() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        state.view_height.set(4);
+        assert_eq!(state.page(), 4);
+
+        // Descriptions double some rows' height without changing the count.
+        state
+            .descriptions
+            .insert("cc_alpha_11111111".into(), "described".into());
+        let before = state.cursor;
+        state.move_by(2);
+        let after = state.cursor;
+
+        let selectable_between = (before + 1..=after)
+            .filter(|i| state.selectable(state.rows()[*i]))
+            .count();
+        assert_eq!(selectable_between, 2, "moved by lines rather than rows");
+
+        // Past either end it stops rather than wrapping or overflowing.
+        state.move_by(1000);
+        assert_eq!(state.cursor, state.last_selectable());
+        state.move_by(-1000);
+        assert_eq!(state.cursor, state.first_selectable());
+    }
+
+    /// A half-typed sequence has to be visible; yazi shows its candidates
+    /// rather than swallowing the key.
+    #[test]
+    fn a_pending_sequence_is_shown() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        assert!(!drawn(&state, 140).contains("any other key cancels"));
+
+        state.pending_g = true;
+        let text = drawn(&state, 140);
+        assert!(text.contains("g top"), "the continuation is not offered");
+        assert!(text.contains("any other key cancels"));
+    }
+
     #[test]
     fn the_tree_shows_projects_and_their_open_sessions() {
         use ratatui::backend::TestBackend;
@@ -3544,7 +4258,7 @@ mod tests {
         state.cursor = state.first_selectable();
 
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        terminal.draw(|f| render(f, &state, None)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
         let text: String = terminal
             .backend()
             .buffer()
