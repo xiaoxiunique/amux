@@ -98,6 +98,46 @@ pub fn is_known_provider(name: &str, app_type: &str) -> bool {
     count > 0
 }
 
+/// One provider a session could be launched against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderChoice {
+    pub name: String,
+    /// The one CC Switch has active, i.e. what a session gets by default.
+    pub is_current: bool,
+}
+
+/// Providers configured for `app_type`, current one first.
+///
+/// Empty when CC Switch is not installed, so a caller can simply skip offering
+/// the choice rather than having to ask whether it exists.
+pub fn list(app_type: &str) -> Vec<ProviderChoice> {
+    let Some(conn) = open_db() else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT name, is_current FROM providers WHERE app_type=?1 ORDER BY is_current DESC, name",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([app_type], |r| {
+        Ok(ProviderChoice {
+            name: r.get(0)?,
+            is_current: r.get::<_, i64>(1).unwrap_or(0) != 0,
+        })
+    });
+    rows.map(|rs| rs.flatten().collect()).unwrap_or_default()
+}
+
+/// Whether picking a provider means anything for this agent.
+///
+/// [`resolve_settings`] only knows how to configure Claude and Codex; every
+/// other agent falls through to the Claude branch and would be handed a
+/// `--settings` it does not understand. The database does carry `pi` providers,
+/// but nothing here can apply them yet.
+pub fn selectable(agent_name: &str) -> bool {
+    matches!(agent_name, "claude" | "cc" | "codex" | "cx")
+}
+
 /// Map an agent name to the CC Switch app_type.
 pub fn agent_app_type(agent_name: &str) -> &'static str {
     match agent_name {
@@ -155,8 +195,6 @@ pub fn resolve_settings(name: &str, app_type: &str) -> Result<ProviderSettings> 
     if settings_config.is_empty() {
         bail!("provider {provider_name} has empty settings_config");
     }
-
-    eprintln!("Using provider: {provider_name}");
 
     match app_type {
         "codex" => resolve_codex_settings(&provider_name, &settings_config),

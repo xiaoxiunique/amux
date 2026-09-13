@@ -23,6 +23,9 @@ pub fn run(agent: &Agent, extra: &[String], provider_name: Option<&str>, agents:
     if let Some(p) = provider_name {
         let app_type = provider::agent_app_type(&agent.name);
         let settings = provider::resolve_settings(p, app_type)?;
+        // `resolve_settings` used to announce this itself, but the TUI calls it
+        // too and draws on the terminal it printed to.
+        eprintln!("Using provider: {p}");
         provider_argv = settings.extra_argv;
         env_vars = settings.env_vars;
     }
