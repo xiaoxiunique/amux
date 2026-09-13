@@ -611,28 +611,62 @@ fn session_summary_uncached(path: &Path, agent: &str) -> Option<String> {
 /// The most recent `ai-title` in a Claude transcript.
 ///
 /// Titles are appended throughout the session and refined as it goes, so the
-/// last one is the one Claude Code itself displays. This has to scan the whole
-/// file, which is why only the title line is parsed — a substring test first
-/// keeps the 90MB transcripts cheap.
+/// last one is what Claude Code itself displays — which means reading from the
+/// end rather than scanning to it. The difference is not small: these
+/// transcripts reach hundreds of megabytes, and a *live* session's grows
+/// constantly, so its mtime always differs and the summary cache never spares
+/// it. Measured on a 31MB transcript, 0.020s scanning against 0.0002s reading
+/// backwards — and the latter does not grow with the file.
 fn last_ai_title(path: &Path) -> Option<String> {
-    use std::io::{BufRead, BufReader};
+    use std::io::{Read, Seek, SeekFrom};
 
-    let file = std::fs::File::open(path).ok()?;
-    let mut title = None;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if !line.contains("\"ai-title\"") {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            if let Some(t) = v.get("aiTitle").and_then(|t| t.as_str()) {
-                let cleaned = clean_prompt(t);
-                if !cleaned.is_empty() {
-                    title = Some(cleaned);
+    /// Big enough that a title lands in the first read on any real transcript,
+    /// small enough that reading one is nothing.
+    const CHUNK: usize = 64 * 1024;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut pos = file.seek(SeekFrom::End(0)).ok()?;
+    // The partial line left dangling at the front of the chunk just read; it
+    // belongs to the end of the chunk before it.
+    let mut carry: Vec<u8> = Vec::new();
+
+    while pos > 0 {
+        let take = CHUNK.min(pos as usize);
+        pos -= take as u64;
+        file.seek(SeekFrom::Start(pos)).ok()?;
+        let mut buf = vec![0u8; take];
+        file.read_exact(&mut buf).ok()?;
+        buf.extend_from_slice(&carry);
+
+        let mut lines: Vec<&[u8]> = buf.split(|b| *b == b'\n').collect();
+        // The first piece may be half a line whose start is further back, so
+        // hold it over rather than parsing a fragment.
+        carry = if pos > 0 {
+            lines.remove(0).to_vec()
+        } else {
+            Vec::new()
+        };
+
+        for line in lines.iter().rev() {
+            if !line.windows(10).any(|w| w == b"\"ai-title\"") {
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(t) = v.get("aiTitle").and_then(|t| t.as_str()) {
+                    let cleaned = clean_prompt(t);
+                    // A title that cleans away is no title; keep looking
+                    // further back, as the forward scan used to.
+                    if !cleaned.is_empty() {
+                        return Some(cleaned);
+                    }
                 }
             }
         }
     }
-    title
+    None
 }
 
 /// First real user prompt in a session file — what it was actually about.
@@ -925,6 +959,55 @@ mod tests {
         assert!(!looks_like_session_id("deadbeef"));
         // Too short to be an id prefix worth resolving.
         assert!(!looks_like_session_id("019f"));
+    }
+
+    /// Reading backwards has to behave exactly like the forward scan it
+    /// replaced: the *last* usable title wins, a title that cleans away is
+    /// skipped, and a line straddling a chunk boundary is still parsed whole.
+    #[test]
+    fn the_last_title_is_found_from_the_end_of_a_large_file() {
+        let _db = crate::test_home::scratch_db();
+        let dir = tempfile::tempdir().unwrap();
+
+        let title = |t: &str| format!(r#"{{"type":"ai-title","aiTitle":"{t}"}}"#);
+        let filler = r#"{"type":"assistant","content":"padding padding padding"}"#;
+
+        // Comfortably past the 64KB read chunk, with the good title at the very
+        // end and a stale one at the very start.
+        let f = dir.path().join("big.jsonl");
+        let mut text = String::new();
+        text.push_str(&title("stale-first-title"));
+        text.push('\n');
+        for _ in 0..4000 {
+            text.push_str(filler);
+            text.push('\n');
+        }
+        text.push_str(&title("the-newest-title"));
+        text.push('\n');
+        std::fs::write(&f, &text).unwrap();
+        assert!(text.len() > 64 * 1024, "fixture must span more than one chunk");
+        assert_eq!(last_ai_title(&f).as_deref(), Some("the-newest-title"));
+
+        // A trailing title that cleans to nothing must not mask the real one.
+        let g = dir.path().join("blank-last.jsonl");
+        std::fs::write(
+            &g,
+            format!("{}\n{}\n{}\n", title("a-real-title"), filler, title("   ")),
+        )
+        .unwrap();
+        assert_eq!(last_ai_title(&g).as_deref(), Some("a-real-title"));
+
+        // Put the only title across the boundary between two reads. Chunks are
+        // counted from the *end*, so what has to be sized is the tail after the
+        // title, not the head before it — with the head measured instead the
+        // title lands well inside the first read and the case is never
+        // exercised.
+        let h = dir.path().join("straddle.jsonl");
+        let line = title("straddling-title");
+        let tail = "y".repeat(64 * 1024 - line.len() / 2);
+        let text = format!("{}\n{}\n{}\n", "x".repeat(4096), line, tail);
+        std::fs::write(&h, &text).unwrap();
+        assert_eq!(last_ai_title(&h).as_deref(), Some("straddling-title"));
     }
 
     #[test]
