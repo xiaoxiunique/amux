@@ -167,6 +167,23 @@ pub(crate) enum PaneStatus {
     Done,
 }
 
+impl PaneStatus {
+    /// How much this state wants the user's attention, highest first.
+    ///
+    /// Used wherever several statuses collapse into one marker — panes within a
+    /// session, sessions within a folded project. `Waiting` outranks everything
+    /// because it is the only state that is *blocked* on a person.
+    pub(crate) fn urgency(&self) -> u8 {
+        match self {
+            Self::Waiting => 4,
+            Self::Running => 3,
+            Self::Failed => 2,
+            Self::Done => 1,
+            Self::Idle => 0,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Pane {
@@ -1070,6 +1087,76 @@ pub(crate) fn agent_launch_command_for(agent: &str) -> Result<String, String> {
     agent_launch_command(agent)
 }
 
+/// Current status of every managed session, keyed by session name.
+///
+/// The one entry point the TUI uses: status inference reads panes, terminal
+/// tails, agent session files and hook events, and none of that is the TUI's
+/// business. Exposing the pieces individually would make the daemon's
+/// internals part of its contract.
+///
+/// Costs one `list-panes` plus a capture per pane, so callers should run it off
+/// the render path.
+/// A session's status, with the moment it entered that state when that is
+/// actually known.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionStatus {
+    pub(crate) status: PaneStatus,
+    /// Unix seconds, from the hook that reported the state.
+    ///
+    /// `None` for an inferred status, and deliberately so: reading a terminal
+    /// tells you what is on screen, never since when. Stamping "now" on first
+    /// sight would show `0m` for an agent that has been blocked for an hour —
+    /// a confident wrong answer of exactly the kind this whole area suffered
+    /// from.
+    pub(crate) since: Option<i64>,
+}
+
+pub(crate) fn session_statuses() -> std::collections::BTreeMap<String, SessionStatus> {
+    let mut out: std::collections::BTreeMap<String, SessionStatus> =
+        std::collections::BTreeMap::new();
+    let Ok(panes) = list_panes() else {
+        return out;
+    };
+
+    for pane in panes {
+        let tail = capture_pane(&pane.id);
+        let changed = track_pane_activity(&pane.id, &tail);
+        let file_age = agent_kind_for_pane(&pane, &tail)
+            .and_then(|agent| session_activity_age(agent, &pane.path));
+        let (inferred, _) = infer_status(&pane, &tail, changed, file_age);
+
+        // An explicit hook beats inference, the same way it does in the
+        // snapshot the phone app reads — and only the hook knows *when*.
+        let started = session_started_at(&pane.session);
+        let hooked = crate::state::current_status_since(&pane.id, &pane.session, started);
+        let entry = match hooked {
+            Some(event) => SessionStatus {
+                status: match event.state {
+                    crate::state::HookState::Running => PaneStatus::Running,
+                    crate::state::HookState::Waiting => PaneStatus::Waiting,
+                    crate::state::HookState::Idle => PaneStatus::Idle,
+                    crate::state::HookState::Failed => PaneStatus::Failed,
+                    crate::state::HookState::Done => PaneStatus::Done,
+                },
+                since: chrono::DateTime::parse_from_rfc3339(&event.created_at)
+                    .ok()
+                    .map(|t| t.timestamp()),
+            },
+            None => SessionStatus { status: inferred, since: None },
+        };
+
+        // Several panes can share a session; the busiest one describes it.
+        out.entry(pane.session)
+            .and_modify(|existing| {
+                if entry.status.urgency() > existing.status.urgency() {
+                    *existing = entry.clone();
+                }
+            })
+            .or_insert(entry);
+    }
+    out
+}
+
 /// True when the multiplexer already has a session by this exact name.
 pub(crate) fn mux_has_session(name: &str) -> bool {
     // Exact match — a suffixed session must not shadow the primary name.
@@ -1128,8 +1215,36 @@ fn is_codex_pane(pane: &BasePane, tail: &str) -> bool {
     pane.command == "codex" || haystack.contains("codex") || haystack.contains("gpt-")
 }
 
+/// Session creation times, refreshed at most once every couple of seconds.
+///
+/// `hook_status_for_pane` runs per pane per poll; without this the date check
+/// would spawn a `list-sessions` for every one of them.
+static SESSION_START_CACHE: LazyLock<Mutex<(HashMap<String, u64>, Option<Instant>)>> =
+    LazyLock::new(|| Mutex::new((HashMap::new(), None)));
+
+const SESSION_START_TTL: Duration = Duration::from_secs(2);
+
+fn session_started_at(session: &str) -> u64 {
+    let mut guard = match SESSION_START_CACHE.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let stale = guard
+        .1
+        .map(|at| at.elapsed() >= SESSION_START_TTL)
+        .unwrap_or(true);
+    if stale {
+        guard.0 = crate::tmux::session_start_times();
+        guard.1 = Some(Instant::now());
+    }
+    // Unknown session — nothing to date against, so don't hold the event to a
+    // bound we cannot justify.
+    guard.0.get(session).copied().unwrap_or(0)
+}
+
 fn hook_status_for_pane(pane: &BasePane) -> Option<(PaneStatus, String)> {
-    let event = crate::state::current_status(&pane.id, &pane.session)?;
+    let started = session_started_at(&pane.session);
+    let event = crate::state::current_status_since(&pane.id, &pane.session, started)?;
     let status = match event.state {
         crate::state::HookState::Running => PaneStatus::Running,
         crate::state::HookState::Waiting => PaneStatus::Waiting,
@@ -1221,6 +1336,16 @@ fn agent_actively_working(tail: &str) -> bool {
     if contains_any(&recent, &["esc to interrupt", "/stop to close"])
         && contains_any(&recent, &["working (", "thinking (", "running ("])
     {
+        return true;
+    }
+    // opencode's footer, which reads "⬝⬝⬝⬝  esc interrupt" while a turn is in
+    // flight and shows the working directory otherwise. Note the missing "to":
+    // it is a different string from codex's and Claude's, which is why an
+    // opencode session that was busy for ten minutes kept reporting idle and
+    // flipping back to running whenever the screen happened to redraw.
+    // Sampled 8x while working (present every time) and 6x while idle (absent
+    // every time), against the composer's "ask anything" placeholder.
+    if recent.contains("esc interrupt") {
         return true;
     }
     // Claude Code streaming spinner, e.g. "✽ Baking… (3m 13s · ↓ 10.9k tokens)".
@@ -5485,6 +5610,19 @@ mod tests {
         // mentioning the words without the live spinner pairing is not "working"
         assert!(!agent_actively_working(
             "I was working on the parser earlier. Done now.\n❯"
+        ));
+
+        // opencode's footer while a turn is in flight. Note "esc interrupt",
+        // without the "to" that codex and Claude use — matching only their
+        // wording left every opencode session looking idle, and flipping to
+        // running only when the screen happened to redraw.
+        assert!(agent_actively_working(
+            "  ▣  Build · DeepSeek V4.1 Flash · 10m 14s\n   ┃\n ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                    477.8K (48%) · $4.61  ctrl+p commands"
+        ));
+        // ...and the same footer once it is done, which shows the working
+        // directory in place of the interrupt hint.
+        assert!(!agent_actively_working(
+            "▀▀▀▀\nAsk anything... \"Fix a TODO in the codebase\"\n /Users/not/projects/x       477.8K (48%) · $4.61  ctrl+p commands"
         ));
     }
 

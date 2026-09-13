@@ -184,9 +184,15 @@ pub fn render_hook_script(amux_bin: &Path) -> String {
         "#!/bin/sh\n\
          set -eu\n\
          event=\"${{1:-generic}}\"\n\
-         cat >/dev/null || true\n\
+         payload=\"$(cat 2>/dev/null || true)\"\n\
          case \"$event\" in\n\
-           *notification*|*Notification*) state=\"waiting\" ;;\n\
+           *notification*|*Notification*)\n\
+             case \"$payload\" in\n\
+               *permission*|*Permission*) state=\"waiting\" ;;\n\
+               *) state=\"idle\" ;;\n\
+             esac\n\
+             ;;\n\
+           *prompt*|*Prompt*) state=\"running\" ;;\n\
            *fail*|*failed*|*error*) state=\"failed\" ;;\n\
            *start*|*started*|*running*) state=\"running\" ;;\n\
            *) state=\"done\" ;;\n\
@@ -210,11 +216,14 @@ pub fn render_hook_script(amux_bin: &Path) -> String {
          if [ ! -x \"$amux_bin\" ] && command -v amux >/dev/null 2>&1; then\n\
            amux_bin=\"$(command -v amux)\"\n\
          fi\n\
-         args=\"$state --source $event --message $event\"\n\
+         set -- \"$state\" --source \"$event\" --message \"$event\"\n\
          if [ -n \"$pane\" ]; then\n\
-           exec \"$amux_bin\" hook $args --pane \"$pane\"\n\
+           set -- \"$@\" --pane \"$pane\"\n\
          fi\n\
-         exec \"$amux_bin\" hook $args --session \"$session\"\n"
+         if [ -n \"$session\" ]; then\n\
+           set -- \"$@\" --session \"$session\"\n\
+         fi\n\
+         exec \"$amux_bin\" hook \"$@\"\n"
     )
 }
 
@@ -301,6 +310,10 @@ pub fn install_claude_hooks(path: &Path, command: &Path) -> Result<()> {
         *hooks = serde_json::json!({});
     }
     let hooks = hooks.as_object_mut().expect("hooks is object");
+    // Without this, "is it working right now?" has no authoritative answer and
+    // falls back to guessing from terminal output. Stop and Notification only
+    // ever say the agent has *paused*.
+    upsert_claude_event_hook(hooks, "UserPromptSubmit", command, "claude-prompt");
     upsert_claude_event_hook(hooks, "Stop", command, "claude-stop");
     upsert_claude_event_hook(hooks, "Notification", command, "claude-notification");
     let text = serde_json::to_string_pretty(&root)?;
@@ -773,8 +786,18 @@ mod tests {
         assert!(script.contains("amux_bin=\"${AMUX_BIN:-}\""));
         assert!(script.contains("amux_bin=\"/tmp/amux\""));
         assert!(script.contains("[ ! -x \"$amux_bin\" ] && command -v amux"));
-        assert!(script.contains("hook $args --pane"));
+        // Both identifiers must reach `amux hook`: the pane is what the serve
+        // daemon matches on, the session name is all the TUI has.
+        assert!(script.contains("set -- \"$@\" --pane \"$pane\""));
+        assert!(script.contains("set -- \"$@\" --session \"$session\""));
+        assert!(script.contains("exec \"$amux_bin\" hook \"$@\""));
         assert!(script.contains("codex-notify") == false);
+        // Claude fires Notification both when it needs permission and when the
+        // prompt has simply been idle for a minute. Treating both as "waiting"
+        // made a session you were merely not looking at claim it was blocked on
+        // you, so the payload has to be read rather than discarded.
+        assert!(script.contains("payload=\"$(cat 2>/dev/null || true)\""));
+        assert!(script.contains("*permission*|*Permission*) state=\"waiting\""));
     }
 
     #[test]

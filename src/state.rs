@@ -184,8 +184,53 @@ pub fn record_status(
 
     let mut snapshot = read_snapshot_unlocked();
     snapshot.apply(event.clone());
+    prune(&mut snapshot);
     write_snapshot_unlocked(&snapshot)?;
     Ok(event)
+}
+
+/// How long a status entry may sit in the snapshot.
+///
+/// Long enough that a session which has been quietly running for days keeps its
+/// last reported state, short enough that dead sessions do not pile up: nothing
+/// pruned this file before, so it had collected 27 pane entries three weeks
+/// old. The freshness bound in [`current_status_since`] already stops those
+/// being *believed*; this stops them being *kept*.
+const RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
+
+fn prune(snapshot: &mut StatusSnapshot) {
+    let cutoff = chrono::Utc::now().timestamp() - RETENTION_SECS;
+    // An unparseable timestamp is dropped rather than kept forever — it can
+    // never satisfy a freshness check either, so it is dead weight.
+    let fresh = |event: &HookStatusEvent| {
+        chrono::DateTime::parse_from_rfc3339(&event.created_at)
+            .map(|at| at.timestamp() >= cutoff)
+            .unwrap_or(false)
+    };
+    snapshot.by_pane_id.retain(|_, event| fresh(event));
+    snapshot.by_session.retain(|_, event| fresh(event));
+}
+
+/// Like [`current_status`], but rejects an event older than `started_at`
+/// (seconds since the Unix epoch — typically the session's creation time).
+///
+/// Without this bound a dead session's final event answers for its successor
+/// forever. Pane ids are recycled, and amux derives session names from the
+/// directory, so killing a session and starting another in the same place
+/// reproduces the name exactly. Callers treat an explicit hook as authoritative
+/// and let it override live inference, so a stale entry is not merely ignored —
+/// it silently suppresses the correct answer. The snapshot on this machine held
+/// 27 such entries, three weeks old.
+pub fn current_status_since(
+    pane_id: &str,
+    session: &str,
+    started_at: u64,
+) -> Option<HookStatusEvent> {
+    let event = current_status(pane_id, session)?;
+    let created = chrono::DateTime::parse_from_rfc3339(&event.created_at).ok()?;
+    // An unparseable timestamp is treated as stale rather than trusted: the
+    // whole point here is to stop guesses from masquerading as facts.
+    (created.timestamp().max(0) as u64 >= started_at).then_some(event)
 }
 
 pub fn current_status(pane_id: &str, session: &str) -> Option<HookStatusEvent> {
@@ -206,6 +251,95 @@ pub fn current_status(pane_id: &str, session: &str) -> Option<HookStatusEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writing must also take out the trash: nothing pruned this file before,
+    /// so it accumulated entries indefinitely.
+    #[test]
+    fn writing_drops_entries_past_the_retention_window() {
+        let _home_guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("AMUX_STATE_DIR");
+        std::env::set_var("AMUX_STATE_DIR", tmp.path());
+
+        // Hand-write a snapshot holding one ancient entry and one recent one.
+        let old = HookStatusEvent {
+            pane_id: Some("%0".into()),
+            session: Some("dead".into()),
+            state: HookState::Waiting,
+            source: "claude-notification".into(),
+            task_id: None,
+            message: None,
+            created_at: (chrono::Utc::now() - chrono::Duration::days(30))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        let mut seed = StatusSnapshot::default();
+        seed.apply(old);
+        write_snapshot_unlocked(&seed).unwrap();
+        assert_eq!(read_snapshot_unlocked().by_pane_id.len(), 1);
+
+        // Any write prunes.
+        record_status(
+            Some("%9".into()),
+            Some("live".into()),
+            HookState::Running,
+            Some("claude-prompt".into()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let after = read_snapshot_unlocked();
+        assert!(after.by_pane_id.contains_key("%9"), "fresh entry lost");
+        assert!(!after.by_pane_id.contains_key("%0"), "30-day-old entry kept");
+        assert!(!after.by_session.contains_key("dead"), "30-day-old session kept");
+
+        match prev {
+            Some(v) => std::env::set_var("AMUX_STATE_DIR", v),
+            None => std::env::remove_var("AMUX_STATE_DIR"),
+        }
+    }
+
+    /// A dead session's last event must not answer for its successor.
+    ///
+    /// This is the failure the whole bound exists for: callers let an explicit
+    /// hook override live inference, so a stale entry does not merely go
+    /// unnoticed — it suppresses the correct status indefinitely.
+    #[test]
+    fn an_event_older_than_the_session_is_rejected() {
+        let _home_guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("AMUX_STATE_DIR");
+        std::env::set_var("AMUX_STATE_DIR", tmp.path());
+
+        record_status(
+            Some("%0".into()),
+            Some("cc_proj_1a2b3c4d".into()),
+            HookState::Waiting,
+            Some("claude-notification".into()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        // A session that already existed when the event landed still owns it.
+        assert!(current_status_since("%0", "cc_proj_1a2b3c4d", now - 60).is_some());
+
+        // One created afterwards is a different session reusing the id — the
+        // pane number is recycled, and amux rebuilds the same name for the same
+        // directory, so both keys collide.
+        assert!(current_status_since("%0", "cc_proj_1a2b3c4d", now + 60).is_none());
+
+        // Unbounded lookup keeps the old behaviour, which is what made three
+        // week old entries look current.
+        assert!(current_status("%0", "cc_proj_1a2b3c4d").is_some());
+
+        match prev {
+            Some(v) => std::env::set_var("AMUX_STATE_DIR", v),
+            None => std::env::remove_var("AMUX_STATE_DIR"),
+        }
+    }
 
     #[test]
     fn parse_accepts_common_state_names() {

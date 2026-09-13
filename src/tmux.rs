@@ -156,6 +156,32 @@ pub fn session_cwd(name: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// When each live session was created, as seconds since the Unix epoch.
+///
+/// Used to date-check hook events: both pane ids and session names get reused
+/// (amux derives a session name from the directory, so killing one and starting
+/// another in the same place reproduces it exactly), and an event that predates
+/// the session it names belongs to a dead predecessor.
+///
+/// One subprocess for every session, so callers on a poll loop should cache it.
+pub fn session_start_times() -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(res) = Command::new(mux_bin())
+        .args(["list-sessions", "-F", "#{session_name} #{session_created}"])
+        .output()
+    else {
+        return out;
+    };
+    for line in String::from_utf8_lossy(&res.stdout).lines() {
+        if let Some((name, created)) = line.trim().rsplit_once(' ') {
+            if let Ok(secs) = created.trim().parse::<u64>() {
+                out.insert(name.trim().to_string(), secs);
+            }
+        }
+    }
+    out
+}
+
 pub fn kill_session(name: &str) -> Result<()> {
     let status = Command::new(mux_bin())
         .args(["kill-session", "-t", name])
