@@ -61,10 +61,15 @@ pub struct AppState {
     /// interleaves projects and sessions, so two cursors cannot say where you
     /// are.
     pub cursor: usize,
-    /// Directories whose sessions are shown. A project with one session has
-    /// nothing to expand: it *is* that session, and a lone child row under it
-    /// would say nothing.
-    pub expanded: std::collections::BTreeSet<String>,
+    /// Directories whose sessions are *hidden*.
+    ///
+    /// Tracks the exception rather than the rule: everything is open by
+    /// default, because the point of the tree is seeing what is running
+    /// without first opening three projects to find out.
+    ///
+    /// A project with one session has nothing to hide either way — it *is*
+    /// that session, and a lone child row under it would only repeat it.
+    pub collapsed: std::collections::BTreeSet<String>,
     /// Filter over project names. Only editable in filter mode.
     pub filter: String,
     /// Explicit mode, because the old TUI routed *every* unmatched key into the
@@ -98,7 +103,7 @@ impl AppState {
             projects,
             focus: Column::Tree,
             cursor: 0,
-            expanded: Default::default(),
+            collapsed: Default::default(),
             filter: String::new(),
             filtering: false,
             inserting: false,
@@ -133,7 +138,7 @@ impl AppState {
         for (pi, project) in self.visible_projects().iter().enumerate() {
             let expandable = project.sessions.len() > 1;
             rows.push(Row::Project { index: pi, expandable });
-            if expandable && self.expanded.contains(&project.dir) {
+            if expandable && !self.collapsed.contains(&project.dir) {
                 for si in 0..project.sessions.len() {
                     rows.push(Row::Session { project: pi, index: si });
                 }
@@ -186,15 +191,60 @@ impl AppState {
         self.current_sessions().iter().map(|s| s.alias.clone()).collect()
     }
 
-    pub fn move_down(&mut self) {
-        let n = self.rows().len();
-        if n > 0 {
-            self.cursor = (self.cursor + 1).min(n - 1);
+    /// Whether the cursor may rest on a row.
+    ///
+    /// An open project with several sessions is a heading: every one of its
+    /// sessions is already a row of its own, so stopping on the parent would
+    /// be a step that selects nothing. Closed, it is the only row that project
+    /// has, so it stands for the group and is selectable again.
+    pub fn selectable(&self, row: Row) -> bool {
+        match row {
+            Row::Session { .. } => true,
+            Row::Project { index, expandable } => {
+                !expandable
+                    || self
+                        .project_at(index)
+                        .is_some_and(|p| self.collapsed.contains(&p.dir))
+            }
         }
     }
 
+    fn step(&self, from: usize, forward: bool) -> usize {
+        let rows = self.rows();
+        let mut i = from;
+        loop {
+            let next = if forward {
+                if i + 1 >= rows.len() {
+                    break from;
+                }
+                i + 1
+            } else {
+                if i == 0 {
+                    break from;
+                }
+                i - 1
+            };
+            i = next;
+            if rows.get(i).is_some_and(|r| self.selectable(*r)) {
+                break i;
+            }
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        self.cursor = self.step(self.cursor, true);
+    }
+
     pub fn move_up(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.cursor = self.step(self.cursor, false);
+    }
+
+    /// First row the cursor may rest on.
+    pub fn first_selectable(&self) -> usize {
+        self.rows()
+            .iter()
+            .position(|r| self.selectable(*r))
+            .unwrap_or(0)
     }
 
     /// `l` — open a project, or step into the terminal.
@@ -204,9 +254,11 @@ impl AppState {
                 let Some(dir) = self.project_at(index).map(|p| p.dir.clone()) else {
                     return;
                 };
-                // Opening it *is* the action; stepping right again moves on to
-                // the terminal.
-                if self.expanded.insert(dir) {
+                // Re-opening a closed project *is* the action; the cursor
+                // follows into its first session, because the heading it was
+                // sitting on is no longer somewhere it can rest.
+                if self.collapsed.remove(&dir) {
+                    self.cursor = self.step(self.cursor, true);
                     return;
                 }
                 self.focus = Column::Terminal;
@@ -223,9 +275,13 @@ impl AppState {
             return;
         }
         match self.current_row() {
-            // Step to the parent first. A second `h` then closes it, the way a
-            // file tree behaves.
+            // Close the parent and land on it. There is no "step up to the
+            // heading" stop, because an open heading is not a row the cursor
+            // can sit on.
             Some(Row::Session { project, .. }) => {
+                if let Some(dir) = self.project_at(project).map(|p| p.dir.clone()) {
+                    self.collapsed.insert(dir);
+                }
                 if let Some(row) = self.rows().iter().position(
                     |r| matches!(r, Row::Project { index, .. } if *index == project),
                 ) {
@@ -234,7 +290,7 @@ impl AppState {
             }
             Some(Row::Project { index, .. }) => {
                 if let Some(dir) = self.project_at(index).map(|p| p.dir.clone()) {
-                    self.expanded.remove(&dir);
+                    self.collapsed.insert(dir);
                 }
             }
             None => {}
@@ -255,7 +311,7 @@ impl AppState {
         if count < 2 {
             return;
         }
-        self.expanded.insert(dir);
+        self.collapsed.remove(&dir);
 
         let rows = self.rows();
         let children: Vec<usize> = rows
@@ -283,6 +339,15 @@ impl AppState {
         }
         if self.cursor >= n {
             self.cursor = n - 1;
+        }
+        // A refresh can turn the row under the cursor into a heading.
+        if !self.current_row().is_some_and(|r| self.selectable(r)) {
+            let forward = self.step(self.cursor, true);
+            self.cursor = if forward == self.cursor {
+                self.step(self.cursor, false)
+            } else {
+                forward
+            };
         }
         // Nothing on the right means nothing to focus there.
         if self.current_session().is_none() && self.focus == Column::Terminal {
@@ -455,6 +520,9 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
     let all = tmux::list_session_names()?;
     let sessions = managed_sessions(&all, agents);
     let mut state = AppState::with_agents(group_by_project(sessions), agents.to_vec());
+    // Land on something selectable — the first row is a heading whenever the
+    // first project has several sessions.
+    state.cursor = state.first_selectable();
 
     let outcome = event_loop(&mut state)?;
 
@@ -831,7 +899,7 @@ fn reload(state: &mut AppState, select: Option<String>) {
             .map(|p| (p.dir.clone(), p.sessions.len()));
         if let Some((dir, count)) = home {
             if count > 1 {
-                state.expanded.insert(dir);
+                state.collapsed.remove(&dir);
             }
         }
 
@@ -1021,10 +1089,10 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                 // that session, so naming it saves a row that says nothing.
                 let (marker, trailing) = if !expandable {
                     (" ", project.sessions.first().map(|s| s.alias.clone()).unwrap_or_default())
-                } else if state.expanded.contains(&project.dir) {
-                    ("▾", format!("{}", project.sessions.len()))
-                } else {
+                } else if state.collapsed.contains(&project.dir) {
                     ("▸", format!("{}", project.sessions.len()))
+                } else {
+                    ("▾", format!("{}", project.sessions.len()))
                 };
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{marker} ")),
@@ -1222,14 +1290,66 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_session_needs_no_child_row() {
-        // "alpha" has one session, "beta" two. A single child under alpha
-        // would be a row that repeats what its parent already says.
+    fn projects_start_open() {
+        // Opening three projects to find out what is running defeats the point
+        // of a tree.
         let s = AppState::with_agents(projects(), agents());
         let rows = s.rows();
-        assert_eq!(rows.len(), 3, "collapsed tree should be one row per project");
-        assert!(matches!(rows[0], Row::Project { expandable: false, .. }));
-        assert!(matches!(rows[1], Row::Project { expandable: true, .. }));
+        // alpha(1) + beta + its 2 + empty = 5
+        assert_eq!(rows.len(), 5, "sessions should be visible without pressing l");
+        assert!(matches!(rows[2], Row::Session { .. }));
+    }
+
+    #[test]
+    fn an_open_heading_cannot_be_selected() {
+        let s = AppState::with_agents(projects(), agents());
+        let rows = s.rows();
+
+        // alpha has one session: the project row *is* that session.
+        assert!(s.selectable(rows[0]));
+        // beta is open with two, so its row is only a heading.
+        assert!(!s.selectable(rows[1]), "open heading should be skipped");
+        assert!(s.selectable(rows[2]));
+        assert!(s.selectable(rows[3]));
+    }
+
+    #[test]
+    fn the_cursor_starts_on_something_selectable() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = s.first_selectable();
+        assert!(s.current_row().is_some_and(|r| s.selectable(r)));
+        assert!(s.current_name().is_some());
+    }
+
+    #[test]
+    fn jk_skips_over_headings() {
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = 0; // alpha
+
+        // Straight past beta's heading to its first session.
+        s.move_down();
+        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222"));
+        s.move_down();
+        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222-grok"));
+
+        // And back up the same way.
+        s.move_up();
+        s.move_up();
+        assert_eq!(s.current_name().as_deref(), Some("cc_alpha_11111111"));
+    }
+
+    #[test]
+    fn a_closed_project_becomes_selectable_again() {
+        // Otherwise closing one would leave it with no row the cursor can
+        // reach, and no way to reopen it.
+        let mut s = AppState::with_agents(projects(), agents());
+        s.cursor = 2; // beta's first session
+        s.focus_left(); // closes beta
+
+        let rows = s.rows();
+        assert_eq!(rows.len(), 3, "beta's children should be hidden");
+        assert!(s.selectable(rows[1]));
+        assert_eq!(s.cursor, 1, "cursor should land on the closed project");
     }
 
     #[test]
@@ -1240,46 +1360,22 @@ mod tests {
     }
 
     #[test]
-    fn l_opens_a_project_before_it_reaches_the_terminal() {
+    fn l_reopens_a_closed_project_and_enters_it() {
         let mut s = AppState::with_agents(projects(), agents());
-        s.cursor = 1; // "beta", two sessions
+        s.cursor = 2;
+        s.focus_left(); // close beta, cursor on its row
 
         s.focus_right();
-        assert_eq!(s.focus, Column::Tree, "first l should open, not leave");
-        assert_eq!(s.rows().len(), 5, "beta's two sessions should now be rows");
+        assert_eq!(s.focus, Column::Tree, "first l should reopen, not leave");
+        assert_eq!(s.rows().len(), 5);
+        assert_eq!(
+            s.current_name().as_deref(),
+            Some("cx_beta_22222222"),
+            "cursor should follow into the first session"
+        );
 
         s.focus_right();
-        assert_eq!(s.focus, Column::Terminal, "second l should step right");
-    }
-
-    #[test]
-    fn h_walks_to_the_parent_then_closes_it() {
-        let mut s = AppState::with_agents(projects(), agents());
-        s.cursor = 1;
-        s.focus_right(); // open beta
-        s.cursor = 3; // its second session
-
-        s.focus_left();
-        assert_eq!(s.cursor, 1, "should land on the parent");
-        assert_eq!(s.rows().len(), 5, "parent still open after one h");
-
-        s.focus_left();
-        assert_eq!(s.rows().len(), 3, "second h should close it");
-    }
-
-    #[test]
-    fn jk_walks_the_flattened_tree() {
-        let mut s = AppState::with_agents(projects(), agents());
-        s.cursor = 1;
-        s.focus_right(); // open beta -> 5 rows
-
-        s.move_down();
-        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222"));
-        s.move_down();
-        assert_eq!(s.current_name().as_deref(), Some("cx_beta_22222222-grok"));
-        s.move_down();
-        // Past beta's children is the next project, not a wrap.
-        assert!(matches!(s.current_row(), Some(Row::Project { .. })));
+        assert_eq!(s.focus, Column::Terminal);
     }
 
     #[test]
@@ -1302,7 +1398,13 @@ mod tests {
     #[test]
     fn an_empty_project_resolves_to_no_session() {
         let mut s = AppState::with_agents(projects(), agents());
-        s.cursor = 2; // "empty"
+        // Locate "empty" by name — row numbers shift as projects open.
+        s.cursor = s
+            .rows()
+            .iter()
+            .position(|r| matches!(r, Row::Project { index, .. }
+                if s.visible_projects()[*index].name == "empty"))
+            .expect("empty project should have a row");
         assert!(s.current_name().is_none());
         // And there is nothing to step right into.
         s.focus_right();
