@@ -120,6 +120,33 @@ fn pi_session_dir(root: &Path, cwd: &Path) -> PathBuf {
     root.join(format!("--{escaped}--"))
 }
 
+/// What conversation `id` in `cwd` was about, for showing beside a session.
+///
+/// Takes the id rather than just the directory on purpose: two sessions can
+/// share a directory — `cx_reverse_…` and `cx_reverse_…-grok` — and resolving
+/// by directory alone would describe both with whichever conversation happens
+/// to be newest.
+pub fn summary_for(agent_name: &str, cwd: &Path, id: &str) -> Option<String> {
+    if agent_name == "opencode" {
+        // No files; its titles live in the same SQLite the listing reads.
+        return opencode_sessions(cwd, 200)
+            .into_iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.summary);
+    }
+    let root = agent_session_root(agent_name)?;
+    let path = match agent_name {
+        "claude" => {
+            let p = claude_project_dir(&root, cwd).join(format!("{id}.jsonl"));
+            p.exists().then_some(p)
+        }
+        "codex" => codex_rollout_with_id(&root, id),
+        "pi" => pi_session_with_id(&root, cwd, id),
+        _ => None,
+    }?;
+    session_summary(&path, agent_name)
+}
+
 /// Whether the recorded session `id` still has a backing file (so resuming it
 /// won't error). Best-effort; returns true when we can't tell.
 pub fn session_file_exists(agent_name: &str, cwd: &Path, id: &str) -> bool {

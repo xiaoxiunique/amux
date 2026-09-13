@@ -193,6 +193,47 @@ impl SessionPicker {
     }
 }
 
+/// A short description for each live session: what it is actually about.
+///
+/// The label wins when there is one — it is the user's own words, and it is the
+/// only thing that can tell apart several codex sessions whose opening
+/// instruction is the same generated boilerplate. Otherwise the conversation's
+/// own summary stands in.
+///
+/// Resolved through the id recorded *for this session*, not the directory's
+/// newest conversation: siblings like `cx_reverse_…` and `cx_reverse_…-grok`
+/// share a directory and would otherwise be described identically.
+pub fn describe_sessions(
+    projects: &[Project],
+    agents: &[Agent],
+) -> std::collections::BTreeMap<String, String> {
+    let labels = crate::store::labels();
+    let mut out = std::collections::BTreeMap::new();
+
+    for project in projects {
+        let cwd = std::path::Path::new(&project.dir);
+        for session in &project.sessions {
+            if let Some(label) = labels.get(&session.name) {
+                out.insert(session.name.clone(), label.clone());
+                continue;
+            }
+            let Some(agent) = agents.iter().find(|a| a.alias == session.alias) else {
+                continue;
+            };
+            // Fall back to the directory's newest only when this session has
+            // nothing recorded — the same order `amux run` resolves in.
+            let id = crate::commands::session_ids::load_id(&session.name)
+                .or_else(|| crate::commands::session_ids::current_id(&agent.name, cwd));
+            if let Some(summary) =
+                id.and_then(|id| crate::commands::session_ids::summary_for(&agent.name, cwd, &id))
+            {
+                out.insert(session.name.clone(), summary);
+            }
+        }
+    }
+    out
+}
+
 /// Every past conversation in `dir`, newest first across all agents.
 pub fn sessions_in(dir: &str, agents: &[Agent]) -> Vec<SessionEntry> {
     let cwd = std::path::Path::new(dir);
@@ -240,6 +281,15 @@ impl Draft {
     }
 }
 
+/// The agent chosen, waiting on which provider to run it against.
+#[derive(Debug, Clone)]
+pub struct ProviderPick {
+    pub agent: Agent,
+    pub choices: Vec<crate::provider::ProviderChoice>,
+    /// Start an extra session alongside the existing ones, as `N` does.
+    pub force_extra: bool,
+}
+
 /// Pure UI state, independent of rendering and of the multiplexer.
 pub struct AppState {
     pub projects: Vec<Project>,
@@ -276,6 +326,11 @@ pub struct AppState {
     /// alias. Shown rather than prompting on stdout, which would mean leaving
     /// the screen for the one thing that should be fastest.
     pub picking_agent: bool,
+    /// Which provider to launch the just-chosen agent against.
+    ///
+    /// A second step rather than a longer first one: the common case is the
+    /// provider CC Switch already has active, so that stays one keypress.
+    pub picking_provider: Option<ProviderPick>,
     /// Configured agents, so the picker can list them and map alias -> agent.
     pub agents: Vec<Agent>,
     /// Session awaiting a kill confirmation. `d` is one key away from ending a
@@ -288,12 +343,17 @@ pub struct AppState {
     /// cancelling puts you back where you were rather than at the end of the
     /// list.
     pub cursor_before_draft: Option<usize>,
+    /// The settings view, open while `,` has been pressed.
+    pub settings: bool,
     /// A session being chosen but not yet started.
     ///
     /// While this is set the tree shows a placeholder row for it and the
     /// terminal column shows the choice being made, so the decision happens in
     /// the slot the session will occupy rather than in a window over the top.
     pub draft: Option<Draft>,
+    /// What each session is about, by session name. Empty until the first
+    /// sweep; a session missing from it simply draws no description line.
+    pub descriptions: std::collections::BTreeMap<String, String>,
     /// Latest known status per session name, refreshed off-thread.
     ///
     /// Empty until the first sweep lands, and a session missing from the map
@@ -318,11 +378,14 @@ impl AppState {
             inserting: false,
             focus_before_insert: None,
             picking_agent: false,
+            picking_provider: None,
             confirming_kill: None,
             agents,
             notice: None,
+            settings: false,
             draft: None,
             cursor_before_draft: None,
+            descriptions: std::collections::BTreeMap::new(),
             statuses: std::collections::BTreeMap::new(),
         }
     }
@@ -779,6 +842,28 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
 }
 
 
+/// What tells two sessions of one directory apart: the provider it runs
+/// against, the suffix `amux new` gave it, or both.
+///
+/// Parsed around the trailing hash rather than by splitting on the last `-`,
+/// which put a provider's own hyphen in the way and rendered
+/// `cc-glm_amux_4d8e0883` as "glm_amux…".
+fn session_qualifier(name: &str) -> String {
+    let tail = name.rsplit_once('_').map(|(_, t)| t).unwrap_or("");
+    let suffix = tail.split_once('-').map(|(_, s)| s).unwrap_or("");
+    let provider = name
+        .split_once('_')
+        .map(|(head, _)| head)
+        .and_then(|head| head.split_once('-'))
+        .map(|(_, p)| p)
+        .unwrap_or("");
+    match (provider.is_empty(), suffix.is_empty()) {
+        (true, _) => suffix.to_string(),
+        (false, true) => provider.to_string(),
+        (false, false) => format!("{provider} {suffix}"),
+    }
+}
+
 /// The agent's own name for a session, rather than the shell alias.
 ///
 /// Sessions are named with the short alias (`cx`, `oc`) because that is what
@@ -865,6 +950,18 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     // Enter is pressed — synchronously it would freeze the frame.
     let (sessions_tx, sessions_rx) = mpsc::channel::<(String, Vec<SessionEntry>)>();
 
+    // Descriptions are resolved off-thread too: each one may read an agent's
+    // transcript, and there is one per live session.
+    let (desc_tx, desc_rx) = mpsc::channel::<std::collections::BTreeMap<String, String>>();
+    {
+        let tx = desc_tx.clone();
+        let projects = state.projects.clone();
+        let agents = state.agents.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(describe_sessions(&projects, &agents));
+        });
+    }
+
     // Status is computed on its own thread: a sweep captures the terminal of
     // every pane (~18ms each), which across a dozen sessions would stall the
     // very loop it is meant to annotate.
@@ -934,6 +1031,13 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             }
         }
 
+        while let Ok(map) = desc_rx.try_recv() {
+            if map != state.descriptions {
+                state.descriptions = map;
+                dirty = true;
+            }
+        }
+
         // Keep only the newest sweep; anything behind it is already superseded.
         let mut newest = None;
         while let Ok(map) = status_rx.try_recv() {
@@ -958,6 +1062,14 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 reload(state, keep);
                 dirty = true;
             }
+            // Titles are refined as an agent works, so re-read them even when
+            // the set of sessions has not moved.
+            let tx = desc_tx.clone();
+            let projects = state.projects.clone();
+            let agents = state.agents.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(describe_sessions(&projects, &agents));
+            });
         }
 
         // A short poll rather than a blocking read: output arrives on its own
@@ -1009,6 +1121,26 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     continue;
                 }
 
+                if state.settings {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char(',') => state.settings = false,
+                        KeyCode::Char('s') => match crate::serve::start_quiet() {
+                            Ok(pid) => {
+                                state.notice = Some(format!("monitor started (pid {pid})"))
+                            }
+                            Err(e) => state.notice = Some(format!("could not start: {e}")),
+                        },
+                        KeyCode::Char('S') => match crate::serve::stop_quiet() {
+                            Some(pid) => {
+                                state.notice = Some(format!("monitor stopped (pid {pid})"))
+                            }
+                            None => state.notice = Some("monitor was not running".into()),
+                        },
+                        _ => {}
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // While a session is being chosen every key belongs to that
                 // choice, including the letters that normally navigate.
                 if state.draft.is_some() {
@@ -1127,6 +1259,36 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     dirty = true;
                     continue;
                 }
+                // Second step of the agent picker: which provider.
+                if let Some(pick) = state.picking_provider.take() {
+                    match key.code {
+                        KeyCode::Esc => {}
+                        // Enter is the fast path: whatever CC Switch has
+                        // active, which is what every session used to get.
+                        KeyCode::Enter => {
+                            spawn_agent(state, &spawn_tx, &pick.agent, None, pick.force_extra)
+                        }
+                        KeyCode::Char(c) => match picked_index(c, pick.choices.len()) {
+                            Some(i) => {
+                                let name = pick.choices[i].name.clone();
+                                spawn_agent(
+                                    state,
+                                    &spawn_tx,
+                                    &pick.agent,
+                                    Some(&name),
+                                    pick.force_extra,
+                                );
+                            }
+                            None => {
+                                state.notice =
+                                    Some(format!("'{c}' is not one of the listed numbers"));
+                            }
+                        },
+                        _ => {}
+                    }
+                    dirty = true;
+                    continue;
+                }
                 if state.picking_agent {
                     state.picking_agent = false;
                     if key.code == KeyCode::Esc {
@@ -1135,7 +1297,24 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     if let KeyCode::Char(c) = key.code {
                         match picked_agent(&state.agents, c).cloned() {
                             Some(agent) => {
-                                spawn_agent(state, &spawn_tx, &agent, false); // reattach to whatever is selected now
+                                // Offer the provider step only where it means
+                                // something; the others go straight to launch.
+                                let choices = if crate::provider::selectable(&agent.name) {
+                                    crate::provider::list(crate::provider::agent_app_type(
+                                        &agent.name,
+                                    ))
+                                } else {
+                                    Vec::new()
+                                };
+                                if choices.len() > 1 {
+                                    state.picking_provider = Some(ProviderPick {
+                                        agent,
+                                        choices,
+                                        force_extra: false,
+                                    });
+                                } else {
+                                    spawn_agent(state, &spawn_tx, &agent, None, false);
+                                }
                             }
                             None => {
                                 state.notice =
@@ -1143,6 +1322,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             }
                         }
                     }
+                    dirty = true;
                     continue;
                 }
 
@@ -1217,6 +1397,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         state.filtering = true;
                         state.filter.clear();
                     }
+                    KeyCode::Char(',') => state.settings = true,
                     KeyCode::Char('o') => {
                         state.draft =
                             Some(Draft::Project(ProjectPicker::new(crate::store::projects())));
@@ -1265,7 +1446,11 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                 state.agents.iter().find(|a| a.alias == s.alias).cloned()
                             });
                         if let Some(agent) = agent {
-                            spawn_agent(state, &spawn_tx, &agent, true);
+                            // No provider: `ManagedSession` records the plain
+                            // alias, so the one a `cc-glm` session runs on is
+                            // not available here. Same as before this step
+                            // existed.
+                            spawn_agent(state, &spawn_tx, &agent, None, true);
                         }
                     }
                     KeyCode::Tab => state.cycle_session(),
@@ -1436,11 +1621,15 @@ fn scroll_live(live: Option<&mut LiveTerm>, direction: MouseEventKind) {
 /// against the alias, which meant only single-character aliases — `p` alone —
 /// could ever be chosen.
 pub fn picked_agent<'a>(agents: &'a [Agent], key: char) -> Option<&'a Agent> {
-    let index = key.to_digit(10)?;
-    if index < 1 {
-        return None;
-    }
-    agents.get(index as usize - 1)
+    picked_index(key, agents.len()).map(|i| &agents[i])
+}
+
+/// The 1-based number shown beside a list entry, as an index into it.
+pub fn picked_index(key: char, len: usize) -> Option<usize> {
+    let index = key.to_digit(10)? as usize;
+    // `then`, not `then_some`: the latter evaluates its argument eagerly, and
+    // `0 - 1` on a usize is an overflow rather than a skipped branch.
+    (index >= 1 && index <= len).then(|| index - 1)
 }
 
 /// Start `agent` in the selected project's directory, without leaving the TUI.
@@ -1454,13 +1643,22 @@ fn spawn_agent(
     state: &mut AppState,
     tx: &mpsc::Sender<Result<String, String>>,
     agent: &Agent,
+    provider: Option<&str>,
     force_extra: bool,
 ) {
     let Some(dir) = state.current_dir() else {
         return;
     };
     let cwd = std::path::PathBuf::from(&dir);
-    let base = crate::session::session_name(&agent.alias, &cwd);
+
+    // The provider is part of the session's identity, exactly as it is for
+    // `amux run --provider`: two providers of one agent in one directory are
+    // separate sessions, not one that silently changed endpoint.
+    let alias = match provider {
+        Some(p) => format!("{}-{}", agent.alias, p),
+        None => agent.alias.clone(),
+    };
+    let base = crate::session::session_name(&alias, &cwd);
 
     let name = if force_extra || tmux::has_session(&base) {
         format!("{base}-{}", crate::commands::new::next_free_suffix(&base))
@@ -1468,10 +1666,25 @@ fn spawn_agent(
         base
     };
 
+    let mut env_vars: Vec<(String, String)> = Vec::new();
+    let mut argv = agent.command.clone();
+    if let Some(p) = provider {
+        let app_type = crate::provider::agent_app_type(&agent.name);
+        match crate::provider::resolve_settings(p, app_type) {
+            Ok(settings) => {
+                argv.extend(settings.extra_argv);
+                env_vars = settings.env_vars;
+            }
+            Err(e) => {
+                state.notice = Some(format!("provider {p}: {e}"));
+                return;
+            }
+        }
+    }
+
     // A fresh session picks up the conversation this directory was last on for
     // that agent, the same way `amux run` does — an extra session deliberately
     // does not, since it is a second workspace rather than a continuation.
-    let mut argv = agent.command.clone();
     if !name.contains('-') || !force_extra {
         if let Some(id) = crate::commands::session_ids::load_id(&name)
             .filter(|id| crate::commands::session_ids::session_file_exists(&agent.name, &cwd, id))
@@ -1481,7 +1694,7 @@ fn spawn_agent(
     }
 
     state.notice = Some(format!("starting {name}…"));
-    launch_off_thread(tx.clone(), agent.clone(), cwd, name, argv);
+    launch_off_thread(tx.clone(), agent.clone(), cwd, name, argv, env_vars);
 }
 
 /// Fill the session picker with a listing, if it is still the right one.
@@ -1523,7 +1736,7 @@ fn spawn_agent_in(
         base
     };
     state.notice = Some(format!("starting {name}…"));
-    launch_off_thread(tx.clone(), agent.clone(), cwd, name, agent.command.clone());
+    launch_off_thread(tx.clone(), agent.clone(), cwd, name, agent.command.clone(), Vec::new());
 }
 
 /// Create a session on its own thread, reporting the name back when it is up.
@@ -1538,9 +1751,10 @@ fn launch_off_thread(
     cwd: std::path::PathBuf,
     name: String,
     argv: Vec<String>,
+    env_vars: Vec<(String, String)>,
 ) {
     std::thread::spawn(move || {
-        let result = crate::commands::run::create_detached(&agent, &cwd, &name, &argv, &[])
+        let result = crate::commands::run::create_detached(&agent, &cwd, &name, &argv, &env_vars)
             .map(|()| name)
             .map_err(|e| format!("could not start {}: {e}", agent.name));
         let _ = tx.send(result);
@@ -1573,7 +1787,7 @@ fn resume_session(
         "resuming {}…",
         crate::commands::list::short_id(&entry.id)
     ));
-    launch_off_thread(tx.clone(), agent, cwd, name, argv);
+    launch_off_thread(tx.clone(), agent, cwd, name, argv, Vec::new());
     None
 }
 
@@ -1639,10 +1853,12 @@ fn terminal_column(area: Rect) -> Rect {
 fn columns_of(area: Rect) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Horizontal)
-        // Four elevenths, not three: the status is spelled out, and
-        // "running" plus an agent name and a duration does not fit in a
-        // thirty-cell column. The terminal still gets the majority.
-        .constraints([Constraint::Ratio(4, 11), Constraint::Ratio(7, 11)])
+        // Four elevenths on a normal terminal — the status is spelled out, and
+        // "running" plus an agent name and a duration does not fit in thirty
+        // cells — but capped, because the content stops growing at about
+        // thirty-five and a proportional column on a very wide terminal is
+        // mostly empty space taken from the terminal view.
+        .constraints([Constraint::Length(tree_width(area.width)), Constraint::Min(1)])
         .split(area)
 }
 
@@ -1724,11 +1940,18 @@ fn render(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>) {
 
     let columns = columns_of(outer[0]);
     render_tree(f, state, columns[0]);
-    match &state.draft {
-        Some(draft) => render_draft(f, draft, columns[1]),
-        None => render_terminal(f, state, live, columns[1]),
+    if state.settings {
+        render_settings(f, columns[1]);
+    } else {
+        match &state.draft {
+            Some(draft) => render_draft(f, draft, columns[1]),
+            None => render_terminal(f, state, live, columns[1]),
+        }
     }
 
+    if let Some(pick) = &state.picking_provider {
+        render_provider_picker(f, pick, outer[0]);
+    }
     if state.picking_agent {
         render_agent_picker(f, state, outer[0]);
     }
@@ -1794,6 +2017,108 @@ fn elide_front(path: &str, max: usize) -> String {
     }
     let tail: String = path.chars().skip(count - max.saturating_sub(1)).collect();
     format!("…{tail}")
+}
+
+/// Which provider to launch the just-chosen agent against.
+fn render_provider_picker(f: &mut Frame, pick: &ProviderPick, area: Rect) {
+    let mut rows: Vec<Line> = vec![
+        Line::styled(
+            "  Enter — whichever CC Switch has active",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+    ];
+    for (i, choice) in pick.choices.iter().enumerate() {
+        rows.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", i + 1),
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ),
+            Span::raw(format!(" {:<18}", truncate(&choice.name, 17))),
+            Span::styled(
+                if choice.is_current { "● active" } else { "" },
+                Style::default().fg(Color::Green),
+            ),
+        ]));
+    }
+
+    let height = (rows.len() as u16 + 2).min(area.height);
+    let width = 48.min(area.width);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(format!(" {} — which provider? ", pick.agent.name)),
+        ),
+        popup,
+    );
+}
+
+/// What the daemon is doing, and how to change it.
+///
+/// The monitor is what the phone app talks to, so whether it is up matters —
+/// and finding out meant leaving for a shell to run `amux serve` or `amux
+/// stop`.
+fn render_settings(f: &mut Frame, area: Rect) {
+    let pid = crate::serve::daemon_pid();
+    let mut rows: Vec<Line> = vec![Line::raw("")];
+
+    match pid {
+        Some(pid) => {
+            let port = crate::serve::daemon_port();
+            rows.push(Line::from(vec![
+                Span::raw("  monitor    "),
+                Span::styled("running", Style::default().fg(Color::Green)),
+                Span::styled(format!("   :{port}"), Style::default().fg(Color::DarkGray)),
+            ]));
+            rows.push(Line::styled(
+                format!("             pid {pid}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        None => rows.push(Line::from(vec![
+            Span::raw("  monitor    "),
+            Span::styled("stopped", Style::default().fg(Color::DarkGray)),
+        ])),
+    }
+
+    if let Some(log) = crate::serve::daemon_log() {
+        rows.push(Line::raw(""));
+        rows.push(Line::styled(
+            format!("  log        {}", shorten_home(&log.to_string_lossy())),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    rows.push(Line::raw(""));
+    rows.push(Line::styled(
+        match pid {
+            Some(_) => "  S stops it   Esc closes",
+            None => "  s starts it   Esc closes",
+        },
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" settings "),
+        ),
+        area,
+    );
 }
 
 /// The choice in progress, drawn in the terminal column.
@@ -1919,8 +2244,23 @@ fn shorten_home(path: &str) -> String {
     }
 }
 
+/// How wide the tree column should be for a terminal of `total` columns.
+///
+/// Proportional until it has all it can use. A session row needs 35 cells and
+/// the description under it a little more; past [`TREE_MAX`] the extra would
+/// only pad the right-hand side of the tree while the terminal view — which can
+/// always use more — goes without.
+fn tree_width(total: u16) -> u16 {
+    (total * 4 / 11).min(TREE_MAX).max(20)
+}
+
+/// Wide enough for a full session row plus an indented description.
+const TREE_MAX: u16 = 52;
+
 /// The tree: projects, with their sessions nested under the open ones.
 fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
+    // Inside the border, which is what a description line has to fit within.
+    let width = area.width.saturating_sub(2) as usize;
     let projects = state.visible_projects();
     let rows = state.rows();
 
@@ -1966,10 +2306,16 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                 };
                 let (word, colour) = status_marker(status);
                 let age = status_age(status);
+                // A project that cannot expand *is* its one session, so its
+                // description belongs here — there is no child row to carry it.
+                let about = (!expandable)
+                    .then(|| project.sessions.first())
+                    .flatten()
+                    .and_then(|s| state.descriptions.get(&s.name));
                 // Same column order as the session rows below — what it is,
                 // then how it is doing — so the two line up when a project's
                 // children are open.
-                ListItem::new(Line::from(vec![
+                let mut lines = vec![Line::from(vec![
                     Span::raw(format!("{marker} ")),
                     Span::styled(
                         // Twelve keeps the duration on screen at 100 columns:
@@ -1984,7 +2330,14 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                     Span::styled(format!("{trailing:<9}"), Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{word:<8}"), Style::default().fg(colour)),
                     Span::styled(age, Style::default().fg(colour)),
-                ]))
+                ])];
+                if let Some(about) = about {
+                    lines.push(Line::styled(
+                        format!("    {}", truncate(about, width.saturating_sub(6))),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                ListItem::new(lines)
             }
             // The session being chosen, standing in the slot it will occupy.
             Row::Draft => {
@@ -2005,18 +2358,23 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
             }
             Row::Session { project, index } => {
                 let session = &projects[project].sessions[index];
-                // The suffix is what tells two sessions of one directory apart;
-                // the rest of the name is a hash of the directory.
-                let suffix = session
-                    .name
-                    .rsplit_once('-')
-                    .map(|(_, tail)| tail.to_string())
-                    .unwrap_or_default();
+                // What tells two sessions of one directory apart: the provider
+                // it runs against, or the suffix `amux new` gave it.
+                //
+                // Both live around the trailing hash, so parse from there —
+                // splitting on the last `-` puts a provider's own hyphen in the
+                // way and renders `cc-glm_amux_4d8e0883` as "glm_amux…".
+                let suffix = session_qualifier(&session.name);
                 let (word, colour) = status_marker(state.statuses.get(&session.name));
                 // Widths chosen so the status column lands at the same offset
                 // as on a project row (2+12+9 there, 4+9+10 here) — a status
                 // that shifts left when you open a project is hard to scan.
-                ListItem::new(Line::from(vec![
+                //
+                // The description goes on a second line rather than a sixth
+                // column: what a session is about does not fit beside four
+                // other fields, and the tree is capped precisely so it cannot
+                // try.
+                let mut lines = vec![Line::from(vec![
                     Span::raw("  ├ "),
                     Span::styled(
                         format!("{:<9}", agent_name(&state.agents, &session.alias)),
@@ -2031,7 +2389,14 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                         status_age(state.statuses.get(&session.name)),
                         Style::default().fg(colour),
                     ),
-                ]))
+                ])];
+                if let Some(about) = state.descriptions.get(&session.name) {
+                    lines.push(Line::styled(
+                        format!("      {}", truncate(about, width.saturating_sub(8))),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                ListItem::new(lines)
             }
         })
         .collect();
@@ -2143,7 +2508,7 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
             ),
             Column::Tree => format!(
                 "{filter}hjkl move  Enter/i open  o project  O here  a agent  \
-                 N extra  A fullscreen  d kill  / filter  q quit"
+                 N extra  A fullscreen  d kill  / filter  , settings  q quit"
             ),
         }
     };
@@ -3038,6 +3403,136 @@ mod tests {
 
         p.move_by(-5);
         assert_eq!(p.cursor, 0, "moving up past the top must stop at the top");
+    }
+
+    fn drawn(state: &AppState, width: u16) -> String {
+        use ratatui::backend::TestBackend;
+        let mut t = Terminal::new(TestBackend::new(width, 14)).unwrap();
+        t.draw(|f| render(f, state, None)).unwrap();
+        t.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
+
+    /// A session says what it is about, on its own line — and says nothing
+    /// when there is nothing to say, rather than leaving a blank row.
+    #[test]
+    fn a_session_shows_its_description_under_it() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        assert!(!drawn(&state, 140).contains("adobe-account-test"));
+
+        // A child row carries its own. Deliberately ASCII: a wide character
+        // occupies two cells in the buffer, so reading it back as a flat string
+        // of symbols would not match the text that went in.
+        state
+            .descriptions
+            .insert("cx_beta_22222222".into(), "adobe-account-test".into());
+        assert!(drawn(&state, 140).contains("adobe-account-test"));
+
+        // A project with one session *is* that session, so its description
+        // belongs on the project row — there is no child row to put it on.
+        state
+            .descriptions
+            .insert("cc_alpha_11111111".into(), "session-descriptions".into());
+        assert!(
+            drawn(&state, 140).contains("session-descriptions"),
+            "a single-session project dropped its description"
+        );
+    }
+
+    /// The column grows with the terminal only until it has what it can use.
+    #[test]
+    fn the_tree_column_stops_widening() {
+        // Proportional while there is less than it wants.
+        assert_eq!(tree_width(100), 36);
+        assert_eq!(tree_width(140), 50);
+
+        // Capped past that, rather than taking half a wide terminal from the
+        // view that can always use more.
+        assert_eq!(tree_width(200), TREE_MAX);
+        assert_eq!(tree_width(400), TREE_MAX);
+        assert!(TREE_MAX < 400 * 4 / 11);
+
+        // Still usable on something narrow.
+        assert_eq!(tree_width(40), 20);
+    }
+
+    /// The provider becomes part of the session's identity, so two providers
+    /// of one agent in one directory are separate sessions rather than one
+    /// that silently changed endpoint.
+    #[test]
+    fn a_provider_gets_its_own_session_name() {
+        let cwd = std::path::Path::new("/work/reverse");
+        let plain = crate::session::session_name("cc", cwd);
+        let with_provider = crate::session::session_name("cc-glm", cwd);
+
+        assert_ne!(plain, with_provider);
+        assert!(with_provider.starts_with("cc-glm_"));
+
+        // Both still parse as managed sessions, or `amux ls` and the monitor
+        // would lose track of the second one.
+        let agents = crate::config::builtin_agents();
+        let managed = crate::commands::sessions::managed_sessions(
+            &[plain.clone(), with_provider.clone()],
+            &agents,
+        );
+        assert_eq!(managed.len(), 2);
+    }
+
+    /// The numbers beside a list are 1-based, and anything else selects
+    /// nothing — including 0, which must not underflow into the last entry.
+    #[test]
+    fn list_numbers_are_one_based_and_bounded() {
+        assert_eq!(picked_index('1', 3), Some(0));
+        assert_eq!(picked_index('3', 3), Some(2));
+        assert_eq!(picked_index('4', 3), None);
+        assert_eq!(picked_index('0', 3), None);
+        assert_eq!(picked_index('x', 3), None);
+        assert_eq!(picked_index('1', 0), None);
+    }
+
+    /// The suffix column has to survive a provider's hyphen.
+    ///
+    /// Splitting on the last `-` rendered `cc-glm_amux_4d8e0883` as
+    /// "glm_amux…", because that hyphen belongs to the provider rather than to
+    /// the suffix `amux new` adds. Both sit around the trailing hash.
+    #[test]
+    fn the_suffix_column_reads_provider_and_suffix_apart() {
+        assert_eq!(session_qualifier("cc_amux_4d8e0883"), "");
+        assert_eq!(session_qualifier("cc-glm_amux_4d8e0883"), "glm");
+        assert_eq!(session_qualifier("cx_reverse_bb8c2d50-grok"), "grok");
+        assert_eq!(
+            session_qualifier("cc-glm_reverse_bb8c2d50-debug"),
+            "glm debug"
+        );
+    }
+
+    /// Settings takes over the column the terminal uses, and says what the
+    /// key does *now* — offering "start" while it is running would be a lie.
+    #[test]
+    fn settings_reports_the_daemon_and_its_one_action() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+
+        assert!(!drawn(&state, 140).contains("monitor"));
+
+        state.settings = true;
+        let text = drawn(&state, 140);
+        assert!(text.contains("settings"), "the panel is not titled");
+        assert!(text.contains("monitor"), "the daemon is not reported");
+
+        // Exactly one of the two actions is offered, matching the state the
+        // daemon is actually in.
+        let running = text.contains("running");
+        assert_eq!(
+            running,
+            text.contains("S stops it"),
+            "a running daemon must offer stop"
+        );
+        assert_eq!(
+            !running,
+            text.contains("s starts it"),
+            "a stopped daemon must offer start"
+        );
     }
 
     #[test]

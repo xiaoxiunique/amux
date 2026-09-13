@@ -46,6 +46,51 @@ fn log_file() -> Result<PathBuf> {
     Ok(state_dir()?.join("serve.log"))
 }
 
+/// The running daemon's pid, if there is one.
+///
+/// Stale pid files are ignored — the process is checked, not just the file.
+pub(crate) fn daemon_pid() -> Option<u32> {
+    read_pid()
+}
+
+/// The port the daemon was last started on.
+///
+/// Recorded when it starts, because the pid file carries only the pid and a
+/// daemon told to use a different port would otherwise be reported wrongly.
+/// Falls back to the default for a daemon started before this was recorded.
+pub(crate) fn daemon_port() -> u16 {
+    crate::store::setting("serve.port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
+
+pub(crate) fn daemon_log() -> Option<PathBuf> {
+    log_file().ok()
+}
+
+/// Stop the daemon without printing. Returns the pid it stopped, if any.
+pub(crate) fn stop_quiet() -> Option<u32> {
+    let pf = pid_file().ok()?;
+    let pid = read_pid()?;
+
+    signal_terminate(pid);
+    for _ in 0..50 {
+        if !is_running(pid) {
+            let _ = fs::remove_file(&pf);
+            return Some(pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    signal_kill(pid);
+    let _ = fs::remove_file(&pf);
+    Some(pid)
+}
+
+/// Start the daemon without printing. Returns its pid.
+pub(crate) fn start_quiet() -> Result<u32> {
+    spawn_daemon(DEFAULT_PORT, DEFAULT_HOST, "", false, None)
+}
+
 /// Check if a process with the given PID is alive.
 #[cfg(unix)]
 fn is_running(pid: u32) -> bool {
@@ -138,12 +183,32 @@ pub fn serve(
         return Ok(());
     }
 
-    // Check if already running
+    let pid = spawn_daemon(port, host, token, with_herdr, dsh_port)?;
+
+    println!("Agent monitor started on http://{}:{} (pid: {})", host, port, pid);
+    println!("Web UI:  http://localhost:{port}");
+    println!("Logs: {}", log_file()?.display());
+    if open {
+        open_browser(port);
+    }
+    Ok(())
+}
+
+/// Re-exec this binary with `--foreground`, detached, and record its pid.
+///
+/// Split out of [`serve`] so the TUI can start the daemon without the three
+/// lines it prints landing on the screen it is drawing.
+fn spawn_daemon(
+    port: u16,
+    host: &str,
+    token: &str,
+    with_herdr: bool,
+    dsh_port: Option<u16>,
+) -> Result<u32> {
     if let Some(pid) = read_pid() {
         bail!("Agent monitor is already running (pid: {pid}). Use `amux stop` first.");
     }
 
-    // Daemonize: re-exec ourselves with --foreground
     let exe = std::env::current_exe().context("cannot determine current executable")?;
     let log = log_file()?;
     let log_out = fs::File::create(&log).with_context(|| format!("creating {}", log.display()))?;
@@ -182,14 +247,10 @@ pub fn serve(
     // Write PID file
     let pf = pid_file()?;
     fs::write(&pf, pid.to_string()).with_context(|| format!("writing {}", pf.display()))?;
-
-    println!("Agent monitor started on http://{}:{} (pid: {})", host, port, pid);
-    println!("Web UI:  http://localhost:{port}");
-    println!("Logs: {}", log.display());
-    if open {
-        open_browser(port);
-    }
-    Ok(())
+    // The pid file records only the pid, so remember the port too — otherwise
+    // anything reporting on the daemon has to guess it.
+    crate::store::set_setting("serve.port", &port.to_string());
+    Ok(pid)
 }
 
 /// Open the web UI in the user's default browser (best-effort).
