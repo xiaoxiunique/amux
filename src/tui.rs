@@ -35,6 +35,9 @@ const RELOAD_EVERY: Duration = Duration::from_millis(1500);
 
 /// Floor between redraws, so a burst of output can't spin the renderer.
 const REDRAW_FLOOR: Duration = Duration::from_millis(16);
+/// How often to re-derive session statuses. A sweep captures every pane, so
+/// this is deliberately slower than the reload that only compares names.
+const STATUS_EVERY: Duration = Duration::from_millis(2000);
 
 /// Which column has the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +51,193 @@ pub enum Column {
 pub struct Project {
     /// Absolute path — the identity.
     pub dir: String,
-    /// Last path component, for display.
+    /// Last path component.
     pub name: String,
+    /// What the user called this directory, if anything. Shown in place of
+    /// `name`, because a folder called `reverse` says less than "逆向分析".
+    pub alias: Option<String>,
     pub sessions: Vec<ManagedSession>,
+}
+
+impl Project {
+    /// The name to show: the user's if they set one, else the folder's.
+    pub fn display_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// One directory the user has worked in before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectEntry {
+    pub path: String,
+    /// What to show: the name the user gave it, else the folder name.
+    pub label: String,
+}
+
+/// Incremental search over the directories in project history.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectPicker {
+    pub query: String,
+    pub cursor: usize,
+    entries: Vec<ProjectEntry>,
+}
+
+impl ProjectPicker {
+    /// Build from history, dropping directories that are no longer there.
+    ///
+    /// Seventeen of the sixty-two recorded paths no longer exist; offering them
+    /// would only produce the "directory no longer exists" error that
+    /// `resume_by_id` already raises. Checked once here rather than per
+    /// keystroke, since it is a stat per entry.
+    pub fn new(rows: Vec<crate::store::ProjectRow>) -> Self {
+        let entries = rows
+            .into_iter()
+            .filter(|row| std::path::Path::new(&row.path).is_dir())
+            .map(|row| ProjectEntry {
+                label: row.alias.unwrap_or(row.name),
+                path: row.path,
+            })
+            .collect();
+        Self { query: String::new(), cursor: 0, entries }
+    }
+
+    /// Entries matching the query, by case-insensitive substring over the name
+    /// and the full path — the same rule the tree filter uses, so typing
+    /// `sitin` finds `/Users/not/projects/devs/sitin` by its path alone.
+    pub fn matches(&self) -> Vec<&ProjectEntry> {
+        let q = self.query.trim().to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| {
+                q.is_empty()
+                    || e.label.to_lowercase().contains(&q)
+                    || e.path.to_lowercase().contains(&q)
+            })
+            .collect()
+    }
+
+    pub fn selected(&self) -> Option<&ProjectEntry> {
+        self.matches().get(self.cursor).copied()
+    }
+
+    /// Keep the cursor on a row that exists; typing narrows the list under it.
+    pub fn clamp(&mut self) {
+        let len = self.matches().len();
+        self.cursor = if len == 0 { 0 } else { self.cursor.min(len - 1) };
+    }
+
+    pub fn move_by(&mut self, delta: isize) {
+        let len = self.matches().len();
+        if len == 0 {
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
+    }
+}
+
+/// One past conversation, with the two things `PastSession` does not carry.
+///
+/// `PastSession` is a per-directory listing shape — no agent, no cwd — so
+/// resuming from it needs both attached here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionEntry {
+    pub agent: String,
+    pub id: String,
+    pub modified: f64,
+    pub summary: Option<String>,
+}
+
+/// The conversations recorded for one directory, and the cursor over them.
+#[derive(Debug, Clone)]
+pub struct SessionPicker {
+    pub dir: String,
+    pub label: String,
+    /// Whether a project list preceded this one, and so whether Esc has
+    /// somewhere to step back to.
+    pub from_project_list: bool,
+    pub entries: Vec<SessionEntry>,
+    pub cursor: usize,
+    /// True until the background listing lands. Drawn as "loading…" rather than
+    /// as an empty list, which would read as "this project has no history".
+    pub loading: bool,
+}
+
+impl SessionPicker {
+    pub fn new(dir: String, label: String) -> Self {
+        Self {
+            dir,
+            label,
+            from_project_list: false,
+            entries: Vec::new(),
+            cursor: 0,
+            loading: true,
+        }
+    }
+
+    /// Reached by picking from the project list, so Esc can go back to it.
+    pub fn from_projects(dir: String, label: String) -> Self {
+        Self { from_project_list: true, ..Self::new(dir, label) }
+    }
+
+    pub fn selected(&self) -> Option<&SessionEntry> {
+        self.entries.get(self.cursor)
+    }
+
+    pub fn move_by(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, self.entries.len() as isize - 1) as usize;
+    }
+}
+
+/// Every past conversation in `dir`, newest first across all agents.
+pub fn sessions_in(dir: &str, agents: &[Agent]) -> Vec<SessionEntry> {
+    let cwd = std::path::Path::new(dir);
+    let mut out: Vec<SessionEntry> = agents
+        .iter()
+        .filter(|a| crate::commands::session_ids::supports_sessions(&a.name))
+        .flat_map(|a| {
+            crate::commands::session_ids::recent_sessions(&a.name, cwd, 10)
+                .into_iter()
+                .map(move |p| SessionEntry {
+                    agent: a.name.clone(),
+                    id: p.id,
+                    modified: p.modified,
+                    summary: p.summary,
+                })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.modified
+            .partial_cmp(&a.modified)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+/// The stages of choosing a session to open.
+#[derive(Debug, Clone)]
+pub enum Draft {
+    /// Which directory.
+    Project(ProjectPicker),
+    /// Directory settled; which conversation, or a fresh one.
+    Session(SessionPicker),
+    /// Settled; the session is being created on a background thread.
+    Starting { label: String },
+}
+
+impl Draft {
+    /// What the placeholder row reads as at this stage.
+    pub fn label(&self) -> String {
+        match self {
+            Draft::Project(_) => "new session…".to_string(),
+            Draft::Session(p) => format!("{}…", p.label),
+            Draft::Starting { label } => format!("{label} — starting…"),
+        }
+    }
 }
 
 /// Pure UI state, independent of rendering and of the multiplexer.
@@ -97,6 +284,22 @@ pub struct AppState {
     /// Transient message for the status line (what was just created, or why
     /// nothing was).
     pub notice: Option<String>,
+    /// Where the cursor was before the draft moved it to the placeholder, so
+    /// cancelling puts you back where you were rather than at the end of the
+    /// list.
+    pub cursor_before_draft: Option<usize>,
+    /// A session being chosen but not yet started.
+    ///
+    /// While this is set the tree shows a placeholder row for it and the
+    /// terminal column shows the choice being made, so the decision happens in
+    /// the slot the session will occupy rather than in a window over the top.
+    pub draft: Option<Draft>,
+    /// Latest known status per session name, refreshed off-thread.
+    ///
+    /// Empty until the first sweep lands, and a session missing from the map
+    /// simply draws no marker — the tree must not wait on status to be useful,
+    /// and a sweep costs one terminal capture per pane.
+    pub statuses: std::collections::BTreeMap<String, crate::serve::server::SessionStatus>,
 }
 
 impl AppState {
@@ -118,6 +321,9 @@ impl AppState {
             confirming_kill: None,
             agents,
             notice: None,
+            draft: None,
+            cursor_before_draft: None,
+            statuses: std::collections::BTreeMap::new(),
         }
     }
 
@@ -151,6 +357,10 @@ impl AppState {
                 }
             }
         }
+        // Last, so it does not shuffle the rows above it while you type.
+        if self.draft.is_some() {
+            rows.push(Row::Draft);
+        }
         rows
     }
 
@@ -163,6 +373,8 @@ impl AppState {
             Row::Project { index, .. } | Row::Session { project: index, .. } => {
                 self.project_at(index)
             }
+            // Not a project yet — that is the point of it.
+            Row::Draft => None,
         }
     }
 
@@ -176,6 +388,7 @@ impl AppState {
     /// one-session project needs no child row at all.
     pub fn current_session(&self) -> Option<&ManagedSession> {
         match self.current_row()? {
+            Row::Draft => None,
             Row::Session { project, index } => self.project_at(project)?.sessions.get(index),
             Row::Project { index, .. } => {
                 let project = self.project_at(index)?;
@@ -206,7 +419,7 @@ impl AppState {
     /// has, so it stands for the group and is selectable again.
     pub fn selectable(&self, row: Row) -> bool {
         match row {
-            Row::Session { .. } => true,
+            Row::Session { .. } | Row::Draft => true,
             Row::Project { index, expandable } => {
                 !expandable
                     || self
@@ -282,6 +495,8 @@ impl AppState {
             return;
         }
         match self.current_row() {
+            // Nothing to collapse: the draft has no project yet.
+            Some(Row::Draft) | None => {}
             // Close the parent and land on it. There is no "step up to the
             // heading" stop, because an open heading is not a row the cursor
             // can sit on.
@@ -309,6 +524,7 @@ impl AppState {
         let Some((dir, count, index)) = self.current_row().and_then(|row| {
             let index = match row {
                 Row::Project { index, .. } | Row::Session { project: index, .. } => index,
+                Row::Draft => return None,
             };
             let p = self.project_at(index)?;
             Some((p.dir.clone(), p.sessions.len(), index))
@@ -368,6 +584,9 @@ impl AppState {
 pub enum Row {
     Project { index: usize, expandable: bool },
     Session { project: usize, index: usize },
+    /// The session being chosen. Carries nothing: there is exactly one, and
+    /// everything about it lives in [`AppState::draft`].
+    Draft,
 }
 
 /// Interrupting an agent normally means Esc, but Esc is spoken for — it is how
@@ -384,6 +603,12 @@ pub const KEY_TO_INTERRUPT: &str = "Ctrl-C";
 pub fn group_by_project(sessions: Vec<ManagedSession>) -> Vec<Project> {
     let mut projects: Vec<Project> = Vec::new();
 
+    // One query for every directory, rather than one per project row.
+    let aliases: std::collections::BTreeMap<String, String> = crate::store::projects()
+        .into_iter()
+        .filter_map(|p| p.alias.map(|a| (p.path, a)))
+        .collect();
+
     for session in sessions {
         let dir = tmux::session_cwd(&session.name).unwrap_or_else(|_| session.name.clone());
         let name = dir
@@ -394,11 +619,20 @@ pub fn group_by_project(sessions: Vec<ManagedSession>) -> Vec<Project> {
 
         match projects.iter_mut().find(|p| p.dir == dir) {
             Some(project) => project.sessions.push(session),
-            None => projects.push(Project { dir, name, sessions: vec![session] }),
+            None => {
+                let alias = aliases.get(&dir).cloned();
+                projects.push(Project { dir, name, alias, sessions: vec![session] });
+            }
         }
     }
 
-    projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // Sort on what is actually shown, or a named project lands under a letter
+    // that appears nowhere on screen.
+    projects.sort_by(|a, b| {
+        a.display_name()
+            .to_lowercase()
+            .cmp(&b.display_name().to_lowercase())
+    });
     projects
 }
 
@@ -545,6 +779,57 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
 }
 
 
+/// The agent's own name for a session, rather than the shell alias.
+///
+/// Sessions are named with the short alias (`cx`, `oc`) because that is what
+/// gets typed, but the tree is for reading: "codex" and "opencode" say what is
+/// running without the reader having to know the abbreviations.
+fn agent_name<'a>(agents: &'a [Agent], alias: &'a str) -> &'a str {
+    agents
+        .iter()
+        .find(|a| a.alias == alias)
+        .map(|a| a.name.as_str())
+        .unwrap_or(alias)
+}
+
+/// How long the state has held, short enough to sit beside the marker.
+///
+/// Blank when the status was inferred rather than reported: a terminal tail
+/// says what is on screen, not since when, and `0m` beside an agent that has
+/// been blocked for an hour is worse than nothing.
+fn status_age(status: Option<&crate::serve::server::SessionStatus>) -> String {
+    let Some(since) = status.and_then(|s| s.since) else {
+        return String::new();
+    };
+    let secs = (chrono::Utc::now().timestamp() - since).max(0);
+    // Under a minute reads as "just now" — the exact second is noise.
+    match secs {
+        s if s < 60 => String::new(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// The word and colour for a session's status.
+///
+/// Spelled out rather than symbolised: a glyph needs a legend, and `.` was
+/// doing double duty for both `done` and `idle`, told apart only by colour. An
+/// unknown status (no sweep yet, or a session the daemon cannot see) draws
+/// blank rather than guessing — claiming "idle" for something merely unmeasured
+/// is exactly the kind of confident wrong answer this is meant to stop.
+fn status_marker(status: Option<&crate::serve::server::SessionStatus>) -> (&'static str, Color) {
+    use crate::serve::server::PaneStatus;
+    match status.map(|s| &s.status) {
+        Some(PaneStatus::Waiting) => ("waiting", Color::Magenta),
+        Some(PaneStatus::Running) => ("running", Color::Yellow),
+        Some(PaneStatus::Failed) => ("failed", Color::Red),
+        Some(PaneStatus::Done) => ("done", Color::Green),
+        Some(PaneStatus::Idle) => ("idle", Color::DarkGray),
+        None => ("", Color::DarkGray),
+    }
+}
+
 /// Size of the terminal column, in cells, for the current frame size.
 fn term_size(area: Rect) -> (u16, u16) {
     // Minus the border on each side.
@@ -564,7 +849,33 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     let mut known: Vec<String> = managed_names(&state.agents);
     // What was in use before insert mode switched to ASCII.
     let mut saved_ime: Option<String> = None;
+    ime::learn_current();
     let mut dirty = true;
+
+    // Creating a session is done off-thread as well. `create_detached` blocks
+    // for as long as codex takes to answer its launch prompts — up to eight
+    // seconds — and doing that inline froze the whole UI. Worse, the keys
+    // pressed during the freeze were delivered afterwards, against a screen
+    // that had since changed: an Enter meant for the picker landed on the tree
+    // and attached, replacing the TUI with a full-screen agent.
+    let (spawn_tx, spawn_rx) = mpsc::channel::<Result<String, String>>();
+
+    // Past conversations are listed off-thread too: even after the codex
+    // header fix this is ~200ms for a busy directory, and it runs the moment
+    // Enter is pressed — synchronously it would freeze the frame.
+    let (sessions_tx, sessions_rx) = mpsc::channel::<(String, Vec<SessionEntry>)>();
+
+    // Status is computed on its own thread: a sweep captures the terminal of
+    // every pane (~18ms each), which across a dozen sessions would stall the
+    // very loop it is meant to annotate.
+    let (status_tx, status_rx) = mpsc::channel();
+    std::thread::spawn(move || loop {
+        // `send` failing means the TUI has exited and dropped the receiver.
+        if status_tx.send(crate::serve::server::session_statuses()).is_err() {
+            return;
+        }
+        std::thread::sleep(STATUS_EVERY);
+    });
 
     let result = loop {
         state.clamp();
@@ -575,14 +886,14 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
         if live.as_ref().map(|t| &t.session) != wanted.as_ref() {
             live = None;
             if let Some(name) = &wanted {
-                let (cols, rows) = term_size(terminal_column(terminal.get_frame().area(), state));
+                let (cols, rows) = term_size(terminal_column(terminal.get_frame().area()));
                 live = LiveTerm::open(name, cols, rows);
             }
             dirty = true;
         }
 
         if let Some(term) = live.as_mut() {
-            let (cols, rows) = term_size(terminal_column(terminal.get_frame().area(), state));
+            let (cols, rows) = term_size(terminal_column(terminal.get_frame().area()));
             term.resize(cols, rows);
             if term.pump() {
                 dirty = true;
@@ -593,6 +904,46 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             terminal.draw(|f| render(f, state, live.as_ref()))?;
             last_draw = Instant::now();
             dirty = false;
+        }
+
+        while let Ok(result) = spawn_rx.try_recv() {
+            match result {
+                Ok(name) => {
+                    state.notice = Some(format!("started {name}"));
+                    // The placeholder has become a real row; `reload` puts the
+                    // cursor on it, and the column it was drawn in turns into
+                    // that session's terminal.
+                    state.draft = None;
+                    state.cursor_before_draft = None;
+                    reload(state, Some(name));
+                    live = None;
+                }
+                Err(e) => {
+                    state.draft = None;
+                    state.notice = Some(e);
+                }
+            }
+            dirty = true;
+        }
+
+        // A listing is only useful for the project still on screen — moving on
+        // before it lands must not repopulate the picker with the old one.
+        while let Ok((dir, entries)) = sessions_rx.try_recv() {
+            if apply_listing(state, &dir, entries) {
+                dirty = true;
+            }
+        }
+
+        // Keep only the newest sweep; anything behind it is already superseded.
+        let mut newest = None;
+        while let Ok(map) = status_rx.try_recv() {
+            newest = Some(map);
+        }
+        if let Some(map) = newest {
+            if map != state.statuses {
+                state.statuses = map;
+                dirty = true;
+            }
         }
 
         // Sessions appear and disappear outside this screen. Compare names
@@ -617,7 +968,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             if let Event::Mouse(MouseEvent { kind, column, row, .. }) = ev {
                 // Only the terminal column forwards — a wheel over the lists
                 // should move the selection, not scroll someone's agent.
-                let area = terminal_column(terminal.get_frame().area(), state);
+                let area = terminal_column(terminal.get_frame().area());
                 let inside = column > area.x
                     && column < area.x + area.width.saturating_sub(1)
                     && row > area.y
@@ -658,9 +1009,124 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     continue;
                 }
 
-                // The picker takes one digit — the number shown beside each
-                // agent. Not the alias: `cc` and `cx` are two characters and
-                // share a first letter, so a single keypress cannot name one.
+                // While a session is being chosen every key belongs to that
+                // choice, including the letters that normally navigate.
+                if state.draft.is_some() {
+                    match state.draft.as_mut() {
+                        Some(Draft::Project(picker)) => match key.code {
+                            KeyCode::Esc => {
+                                state.draft = None;
+                                if let Some(previous) = state.cursor_before_draft.take() {
+                                    state.cursor = previous;
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                picker.query.pop();
+                                picker.clamp();
+                            }
+                            KeyCode::Down => picker.move_by(1),
+                            KeyCode::Up => picker.move_by(-1),
+                            KeyCode::Char('n')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                picker.move_by(1)
+                            }
+                            KeyCode::Char('p')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                picker.move_by(-1)
+                            }
+                            KeyCode::Enter => {
+                                if let Some(entry) = picker.selected().cloned() {
+                                    state.draft = Some(Draft::Session(
+                                        SessionPicker::from_projects(
+                                            entry.path.clone(),
+                                            entry.label,
+                                        ),
+                                    ));
+                                    let tx = sessions_tx.clone();
+                                    let agents = state.agents.clone();
+                                    let dir = entry.path;
+                                    std::thread::spawn(move || {
+                                        let found = sessions_in(&dir, &agents);
+                                        let _ = tx.send((dir, found));
+                                    });
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                picker.query.push(c);
+                                picker.clamp();
+                            }
+                            _ => {}
+                        },
+                        Some(Draft::Session(picker)) => match key.code {
+                            // Back to the directory list rather than out
+                            // altogether: picking the wrong project is the
+                            // likelier mistake, and starting over costs the
+                            // query you just typed. Unless there was no
+                            // directory list — `O` starts here — in which case
+                            // going "back" to one would be inventing a step the
+                            // user never took.
+                            KeyCode::Esc => {
+                                if picker.from_project_list {
+                                    state.draft = Some(Draft::Project(ProjectPicker::new(
+                                        crate::store::projects(),
+                                    )));
+                                } else {
+                                    state.draft = None;
+                                    if let Some(previous) = state.cursor_before_draft.take() {
+                                        state.cursor = previous;
+                                    }
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => picker.move_by(1),
+                            KeyCode::Up | KeyCode::Char('k') => picker.move_by(-1),
+                            KeyCode::Char('n') => {
+                                // A fresh conversation rather than a recorded
+                                // one. Not `force_extra`: a project reached this
+                                // way usually has no live session at all, and
+                                // forcing the suffix named the first one `…-2`.
+                                let dir = picker.dir.clone();
+                                let label = picker.label.clone();
+                                state.draft = Some(Draft::Starting { label });
+                                if let Some(agent) = state.agents.first().cloned() {
+                                    spawn_agent_in(state, &spawn_tx, &agent, &dir, false);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let chosen = picker.selected().cloned();
+                                let dir = picker.dir.clone();
+                                let label = picker.label.clone();
+                                if let Some(entry) = chosen {
+                                    state.draft = Some(Draft::Starting { label });
+                                    if let Some(already) =
+                                        resume_session(state, &spawn_tx, &entry, &dir)
+                                    {
+                                        // Already running: nothing to wait for.
+                                        state.draft = None;
+                                        reload(state, Some(already));
+                                        live = None;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        // Waiting on the launch. Esc gives up on watching for
+                        // it; the session still finishes coming up and appears
+                        // on the next refresh.
+                        Some(Draft::Starting { .. }) => {
+                            if key.code == KeyCode::Esc {
+                                state.draft = None;
+                                if let Some(previous) = state.cursor_before_draft.take() {
+                                    state.cursor = previous;
+                                }
+                            }
+                        }
+                        None => {}
+                    }
+                    dirty = true;
+                    continue;
+                }
                 if state.picking_agent {
                     state.picking_agent = false;
                     if key.code == KeyCode::Esc {
@@ -669,9 +1135,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     if let KeyCode::Char(c) = key.code {
                         match picked_agent(&state.agents, c).cloned() {
                             Some(agent) => {
-                                let created = spawn_agent(state, &agent, false);
-                                reload(state, created);
-                                live = None; // reattach to whatever is selected now
+                                spawn_agent(state, &spawn_tx, &agent, false); // reattach to whatever is selected now
                             }
                             None => {
                                 state.notice =
@@ -744,13 +1208,49 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             state.inserting = true;
                             state.focus_before_insert = Some(state.focus);
                             state.focus = Column::Terminal;
-                            // Put back whatever was being typed with before.
-                            ime::restore(saved_ime.take());
+                            // Back to the method you type with — the one this
+                            // session left, or the one remembered from before.
+                            ime::resume_typing(saved_ime.take());
                         }
                     }
                     KeyCode::Char('/') => {
                         state.filtering = true;
                         state.filter.clear();
+                    }
+                    KeyCode::Char('o') => {
+                        state.draft =
+                            Some(Draft::Project(ProjectPicker::new(crate::store::projects())));
+                        // Land on the placeholder: the right column is showing
+                        // the choice for it, so highlighting anything else
+                        // would point at the wrong row.
+                        state.cursor_before_draft = Some(state.cursor);
+                        state.cursor = state.rows().len().saturating_sub(1);
+                    }
+                    // Same flow, but for the project already under the cursor:
+                    // skip choosing a directory and go straight to its
+                    // conversations. `o` is for somewhere else, `O` is for here.
+                    KeyCode::Char('O') => {
+                        let here = state
+                            .current_project()
+                            .map(|p| (p.dir.clone(), p.display_name().to_string()));
+                        match here {
+                            Some((dir, label)) => {
+                                state.draft =
+                                    Some(Draft::Session(SessionPicker::new(dir.clone(), label)));
+                                state.cursor_before_draft = Some(state.cursor);
+                                state.cursor = state.rows().len().saturating_sub(1);
+                                let tx = sessions_tx.clone();
+                                let agents = state.agents.clone();
+                                std::thread::spawn(move || {
+                                    let found = sessions_in(&dir, &agents);
+                                    let _ = tx.send((dir, found));
+                                });
+                            }
+                            None => {
+                                state.notice =
+                                    Some("nothing selected — press o to pick a project".into())
+                            }
+                        }
                     }
                     KeyCode::Char('a') => {
                         if state.current_dir().is_some() {
@@ -765,16 +1265,30 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                 state.agents.iter().find(|a| a.alias == s.alias).cloned()
                             });
                         if let Some(agent) = agent {
-                            let created = spawn_agent(state, &agent, true);
-                            reload(state, created);
-                            live = None;
+                            spawn_agent(state, &spawn_tx, &agent, true);
                         }
                     }
                     KeyCode::Tab => state.cycle_session(),
                     KeyCode::Char('d') => {
                         state.confirming_kill = state.current_name();
                     }
+                    // Enter opens the session *here*, in the terminal column —
+                    // the same thing `i` does. It used to exec into a
+                    // full-screen client, which meant a second Enter after
+                    // picking a project replaced the whole layout with the
+                    // agent you had just opened.
                     KeyCode::Enter => {
+                        if state.current_name().is_some() {
+                            state.inserting = true;
+                            state.focus_before_insert = Some(state.focus);
+                            state.focus = Column::Terminal;
+                            ime::resume_typing(saved_ime.take());
+                        }
+                    }
+                    // Handing the terminal over is still available, but it now
+                    // takes a deliberate key rather than the one you press to
+                    // look at something.
+                    KeyCode::Char('A') => {
                         if let Some(name) = state.current_name() {
                             break Outcome::Attach(name);
                         }
@@ -809,6 +1323,7 @@ mod ime {
     use std::process::Command;
 
     const ASCII: &str = "com.apple.keylayout.ABC";
+    const PREFERRED: &str = "ime.typing";
 
     fn current() -> Option<String> {
         let out = Command::new("im-select").output().ok()?;
@@ -827,19 +1342,74 @@ mod ime {
             .status();
     }
 
+    /// Remember `source` as the method to type with, unless it is ASCII.
+    ///
+    /// Storing ASCII would be self-defeating: it is what the tree switches *to*
+    /// so that `hjkl` navigate, so recording it would make `i` a no-op forever.
+    fn remember(source: &str) {
+        if source != ASCII {
+            crate::store::set_setting(PREFERRED, source);
+        }
+    }
+
+    /// Note whatever is in use right now as the preferred typing method.
+    ///
+    /// Called once as the TUI opens: launching amux while typing Chinese is a
+    /// clear statement of which method `i` should return you to, and it means
+    /// the very first `i` works rather than only those after an `Esc`.
+    pub(super) fn learn_current() {
+        if let Some(source) = current() {
+            remember(&source);
+        }
+    }
+
     /// Switch to ASCII, returning what was in use so it can be put back.
     pub(super) fn drop_to_ascii() -> Option<String> {
         let previous = current()?;
         if previous == ASCII {
             return None;
         }
+        remember(&previous);
         select(ASCII);
         Some(previous)
+    }
+
+    /// Switch to the method to type with: the one just left, else the
+    /// remembered one. The fallback is what makes this survive a restart.
+    pub(super) fn resume_typing(previous: Option<String>) {
+        if let Some(source) = previous.or_else(|| crate::store::setting(PREFERRED)) {
+            select(&source);
+        }
     }
 
     pub(super) fn restore(previous: Option<String>) {
         if let Some(source) = previous {
             select(&source);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Recording ASCII would be self-defeating: the tree switches to it on
+        /// every `Esc`, so storing it would make `i` stop switching at all.
+        #[test]
+        fn ascii_is_never_remembered_as_the_typing_method() {
+            let _db = crate::test_home::scratch_db();
+
+            remember("com.tencent.inputmethod.wetype.pinyin");
+            assert_eq!(
+                crate::store::setting(PREFERRED).as_deref(),
+                Some("com.tencent.inputmethod.wetype.pinyin")
+            );
+
+            remember(ASCII);
+            assert_eq!(
+                crate::store::setting(PREFERRED).as_deref(),
+                Some("com.tencent.inputmethod.wetype.pinyin"),
+                "dropping to ASCII overwrote the method to come back to"
+            );
         }
     }
 }
@@ -880,8 +1450,15 @@ pub fn picked_agent<'a>(agents: &'a [Agent], key: char) -> Option<&'a Agent> {
 ///   - an extra one, auto-suffixed `-2`, `-3`, … when it already does
 ///
 /// Returns the new session's name so the caller can select it.
-fn spawn_agent(state: &mut AppState, agent: &Agent, force_extra: bool) -> Option<String> {
-    let dir = state.current_dir()?;
+fn spawn_agent(
+    state: &mut AppState,
+    tx: &mpsc::Sender<Result<String, String>>,
+    agent: &Agent,
+    force_extra: bool,
+) {
+    let Some(dir) = state.current_dir() else {
+        return;
+    };
     let cwd = std::path::PathBuf::from(&dir);
     let base = crate::session::session_name(&agent.alias, &cwd);
 
@@ -903,16 +1480,101 @@ fn spawn_agent(state: &mut AppState, agent: &Agent, force_extra: bool) -> Option
         }
     }
 
-    match crate::commands::run::create_detached(agent, &cwd, &name, &argv, &[]) {
-        Ok(()) => {
-            state.notice = Some(format!("started {name}"));
-            Some(name)
-        }
-        Err(e) => {
-            state.notice = Some(format!("could not start {}: {e}", agent.name));
-            None
-        }
+    state.notice = Some(format!("starting {name}…"));
+    launch_off_thread(tx.clone(), agent.clone(), cwd, name, argv);
+}
+
+/// Fill the session picker with a listing, if it is still the right one.
+///
+/// Listings arrive from a background thread, so by the time one lands the user
+/// may have cancelled or moved to another project. Applying it regardless would
+/// repopulate a closed picker, or show one directory's conversations under
+/// another's name. Returns whether anything changed.
+fn apply_listing(state: &mut AppState, dir: &str, entries: Vec<SessionEntry>) -> bool {
+    let Some(Draft::Session(picker)) = state.draft.as_mut() else {
+        return false;
+    };
+    if picker.dir != dir {
+        return false;
     }
+    picker.entries = entries;
+    picker.loading = false;
+    picker.cursor = 0;
+    true
+}
+
+/// Start `agent` in `dir`, detached, and report the session it created.
+///
+/// The directory is explicit rather than taken from the cursor: the project
+/// picker opens directories that have no session in the tree at all, so there
+/// is nothing selected to read it from.
+fn spawn_agent_in(
+    state: &mut AppState,
+    tx: &mpsc::Sender<Result<String, String>>,
+    agent: &Agent,
+    dir: &str,
+    force_extra: bool,
+) {
+    let cwd = std::path::PathBuf::from(dir);
+    let base = crate::session::session_name(&agent.alias, &cwd);
+    let name = if force_extra || tmux::has_session(&base) {
+        format!("{base}-{}", crate::commands::new::next_free_suffix(&base))
+    } else {
+        base
+    };
+    state.notice = Some(format!("starting {name}…"));
+    launch_off_thread(tx.clone(), agent.clone(), cwd, name, agent.command.clone());
+}
+
+/// Create a session on its own thread, reporting the name back when it is up.
+///
+/// The wait is not incidental: for codex `create_detached` polls the pane for
+/// its launch prompts, which takes seconds. Holding the event loop for that
+/// long both freezes the display and queues up keystrokes that are then
+/// replayed against a screen that has moved on.
+fn launch_off_thread(
+    tx: mpsc::Sender<Result<String, String>>,
+    agent: Agent,
+    cwd: std::path::PathBuf,
+    name: String,
+    argv: Vec<String>,
+) {
+    std::thread::spawn(move || {
+        let result = crate::commands::run::create_detached(&agent, &cwd, &name, &argv, &[])
+            .map(|()| name)
+            .map_err(|e| format!("could not start {}: {e}", agent.name));
+        let _ = tx.send(result);
+    });
+}
+
+/// Reopen one recorded conversation, detached.
+fn resume_session(
+    state: &mut AppState,
+    tx: &mpsc::Sender<Result<String, String>>,
+    entry: &SessionEntry,
+    dir: &str,
+) -> Option<String> {
+    let Some(agent) = crate::config::find(&state.agents, &entry.agent).cloned() else {
+        state.notice = Some(format!("agent '{}' is not configured", entry.agent));
+        return None;
+    };
+    let cwd = std::path::PathBuf::from(dir);
+
+    // `announce: false` — `resume_plan` would otherwise print to the terminal
+    // the TUI is drawing on.
+    let (name, argv, exists) =
+        crate::commands::run::resume_plan(&agent, &cwd, &entry.id, true, false);
+    if exists {
+        state.notice = Some(format!("{name} is already open"));
+        return Some(name);
+    }
+
+    state.notice = Some(format!(
+        "resuming {}…",
+        crate::commands::list::short_id(&entry.id)
+    ));
+    launch_off_thread(tx.clone(), agent, cwd, name, argv);
+    None
 }
 
 /// Every managed session name currently on the server, sorted.
@@ -960,7 +1622,7 @@ fn reload(state: &mut AppState, select: Option<String>) {
 
 /// Where the terminal column lands for a given frame, so the pty can be sized
 /// to it before the first draw.
-fn terminal_column(area: Rect, state: &AppState) -> Rect {
+fn terminal_column(area: Rect) -> Rect {
     let body = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(1)])
@@ -977,7 +1639,10 @@ fn terminal_column(area: Rect, state: &AppState) -> Rect {
 fn columns_of(area: Rect) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(3, 11), Constraint::Ratio(8, 11)])
+        // Four elevenths, not three: the status is spelled out, and
+        // "running" plus an agent name and a duration does not fit in a
+        // thirty-cell column. The terminal still gets the majority.
+        .constraints([Constraint::Ratio(4, 11), Constraint::Ratio(7, 11)])
         .split(area)
 }
 
@@ -1059,7 +1724,10 @@ fn render(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>) {
 
     let columns = columns_of(outer[0]);
     render_tree(f, state, columns[0]);
-    render_terminal(f, state, live, columns[1]);
+    match &state.draft {
+        Some(draft) => render_draft(f, draft, columns[1]),
+        None => render_terminal(f, state, live, columns[1]),
+    }
 
     if state.picking_agent {
         render_agent_picker(f, state, outer[0]);
@@ -1116,6 +1784,141 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
     );
 }
 
+
+
+/// Keep the last `max` characters, marking the cut with a leading ellipsis.
+fn elide_front(path: &str, max: usize) -> String {
+    let count = path.chars().count();
+    if count <= max || max == 0 {
+        return path.to_string();
+    }
+    let tail: String = path.chars().skip(count - max.saturating_sub(1)).collect();
+    format!("…{tail}")
+}
+
+/// The choice in progress, drawn in the terminal column.
+///
+/// Deliberately not a popup: the column is where the session will appear once
+/// it exists, so choosing it there means the decision and its result occupy the
+/// same place. It is also the one part of the layout that has nothing to show
+/// while a draft is open — the tree's cursor is on the placeholder, so there is
+/// no session to attach.
+fn render_draft(f: &mut Frame, draft: &Draft, area: Rect) {
+    let width = area.width;
+    let (title, rows): (String, Vec<Line>) = match draft {
+        Draft::Project(picker) => {
+            let matches = picker.matches();
+            let mut rows = vec![
+                Line::from(vec![
+                    Span::styled("> ", Style::default().fg(Color::Cyan)),
+                    Span::raw(picker.query.clone()),
+                    Span::styled("_", Style::default().fg(Color::DarkGray)),
+                ]),
+                Line::raw(""),
+            ];
+            if matches.is_empty() {
+                rows.push(Line::styled(
+                    "  nothing matches",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            let visible = area.height.saturating_sub(4) as usize;
+            let first = picker.cursor.saturating_sub(visible.saturating_sub(1));
+            for (i, entry) in matches.iter().enumerate().skip(first).take(visible) {
+                let selected = i == picker.cursor;
+                let style = if selected {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                rows.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}{:<16}", if selected { "> " } else { "  " }, truncate(&entry.label, 15)),
+                        style,
+                    ),
+                    Span::styled(
+                        elide_front(&shorten_home(&entry.path), width.saturating_sub(22) as usize),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+            (
+                " open project — type to filter, Enter picks, Esc cancels ".to_string(),
+                rows,
+            )
+        }
+        Draft::Session(picker) => {
+            let mut rows: Vec<Line> = Vec::new();
+            if picker.loading {
+                rows.push(Line::styled("  loading…", Style::default().fg(Color::DarkGray)));
+            } else if picker.entries.is_empty() {
+                rows.push(Line::styled(
+                    "  no recorded conversations here",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            let visible = area.height.saturating_sub(4) as usize;
+            let first = picker.cursor.saturating_sub(visible.saturating_sub(1));
+            for (i, e) in picker.entries.iter().enumerate().skip(first).take(visible) {
+                let selected = i == picker.cursor;
+                let style = if selected {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                rows.push(Line::from(vec![
+                    Span::styled(if selected { "> " } else { "  " }, style),
+                    Span::styled(format!("{:<9}", e.agent), style),
+                    Span::styled(
+                        format!("{:<10}", crate::commands::list::short_id(&e.id)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{:<9}", crate::commands::list::relative_time(e.modified)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(truncate(
+                        e.summary.as_deref().unwrap_or(""),
+                        width.saturating_sub(35) as usize,
+                    )),
+                ]));
+            }
+            rows.push(Line::raw(""));
+            rows.push(Line::styled(
+                "  Enter resumes   n starts a new one   Esc goes back",
+                Style::default().fg(Color::DarkGray),
+            ));
+            (format!(" {} ", picker.label), rows)
+        }
+        Draft::Starting { label } => (
+            format!(" {label} "),
+            vec![Line::styled(
+                "  starting…",
+                Style::default().fg(Color::DarkGray),
+            )],
+        ),
+    };
+
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        ),
+        area,
+    );
+}
+
+/// `/Users/you/projects/x` as `~/projects/x`, to leave room for the name.
+fn shorten_home(path: &str) -> String {
+    match dirs::home_dir().and_then(|h| path.strip_prefix(h.to_str()?).map(str::to_string)) {
+        Some(rest) => format!("~{rest}"),
+        None => path.to_string(),
+    }
+}
+
 /// The tree: projects, with their sessions nested under the open ones.
 fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
     let projects = state.visible_projects();
@@ -1129,19 +1932,75 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                 // A project that cannot expand shows its agent inline — it is
                 // that session, so naming it saves a row that says nothing.
                 let (marker, trailing) = if !expandable {
-                    (" ", project.sessions.first().map(|s| s.alias.clone()).unwrap_or_default())
+                    (
+                        " ",
+                        project
+                            .sessions
+                            .first()
+                            .map(|s| agent_name(&state.agents, &s.alias).to_string())
+                            .unwrap_or_default(),
+                    )
                 } else if state.collapsed.contains(&project.dir) {
                     ("▸", format!("{}", project.sessions.len()))
                 } else {
                     ("▾", format!("{}", project.sessions.len()))
                 };
+                // Folding a project is how you stop looking at it, so the row
+                // has to keep showing an agent that is blocked on you —
+                // otherwise collapsing the tree hides the one thing worth
+                // interrupting for. An expanded project stays quiet; its
+                // children speak for themselves.
+                let status = if !expandable {
+                    project
+                        .sessions
+                        .first()
+                        .and_then(|s| state.statuses.get(&s.name))
+                } else if state.collapsed.contains(&project.dir) {
+                    project
+                        .sessions
+                        .iter()
+                        .filter_map(|s| state.statuses.get(&s.name))
+                        .max_by_key(|s| s.status.urgency())
+                } else {
+                    None
+                };
+                let (word, colour) = status_marker(status);
+                let age = status_age(status);
+                // Same column order as the session rows below — what it is,
+                // then how it is doing — so the two line up when a project's
+                // children are open.
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{marker} ")),
                     Span::styled(
-                        format!("{:<16}", truncate(&project.name, 16)),
+                        // Twelve keeps the duration on screen at 100 columns:
+                        // the status word alone is eight cells, and anything
+                        // wider here pushes "5m" past the border.
+                        // Truncate one short of the field so a maximum-length
+                        // name still has a space after it — otherwise it runs
+                        // straight into the agent.
+                        format!("{:<12}", truncate(project.display_name(), 11)),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(trailing, Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{trailing:<9}"), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{word:<8}"), Style::default().fg(colour)),
+                    Span::styled(age, Style::default().fg(colour)),
+                ]))
+            }
+            // The session being chosen, standing in the slot it will occupy.
+            Row::Draft => {
+                let label = state
+                    .draft
+                    .as_ref()
+                    .map(Draft::label)
+                    .unwrap_or_default();
+                ListItem::new(Line::from(vec![
+                    Span::styled("+ ", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        truncate(&label, 34),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]))
             }
             Row::Session { project, index } => {
@@ -1153,13 +2012,25 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                     .rsplit_once('-')
                     .map(|(_, tail)| tail.to_string())
                     .unwrap_or_default();
+                let (word, colour) = status_marker(state.statuses.get(&session.name));
+                // Widths chosen so the status column lands at the same offset
+                // as on a project row (2+12+9 there, 4+9+10 here) — a status
+                // that shifts left when you open a project is hard to scan.
                 ListItem::new(Line::from(vec![
-                    Span::raw("   ├ "),
+                    Span::raw("  ├ "),
                     Span::styled(
-                        format!("{:<4}", session.alias),
+                        format!("{:<9}", agent_name(&state.agents, &session.alias)),
                         Style::default().fg(Color::Cyan),
                     ),
-                    Span::styled(suffix, Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{:<10}", truncate(&suffix, 9)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(format!("{word:<8}"), Style::default().fg(colour)),
+                    Span::styled(
+                        status_age(state.statuses.get(&session.name)),
+                        Style::default().fg(colour),
+                    ),
                 ]))
             }
         })
@@ -1271,8 +2142,8 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
                 "{filter}jk scroll  h back  i insert  Enter attach  q quit"
             ),
             Column::Tree => format!(
-                "{filter}hjkl move  Tab cycle  i insert  a add agent  N extra  \
-                 Enter attach  d kill  / filter  q quit"
+                "{filter}hjkl move  Enter/i open  o project  O here  a agent  \
+                 N extra  A fullscreen  d kill  / filter  q quit"
             ),
         }
     };
@@ -1303,17 +2174,24 @@ mod tests {
             Project {
                 dir: "/work/alpha".into(),
                 name: "alpha".into(),
+                alias: None,
                 sessions: vec![session("cc_alpha_11111111", "cc")],
             },
             Project {
                 dir: "/work/beta".into(),
                 name: "beta".into(),
+                alias: None,
                 sessions: vec![
                     session("cx_beta_22222222", "cx"),
                     session("cx_beta_22222222-grok", "cx"),
                 ],
             },
-            Project { dir: "/work/empty".into(), name: "empty".into(), sessions: vec![] },
+            Project {
+                dir: "/work/empty".into(),
+                name: "empty".into(),
+                alias: None,
+                sessions: vec![],
+            },
         ]
     }
 
@@ -1666,6 +2544,500 @@ mod tests {
         let term = render_with(Column::Terminal);
         assert!(term.contains("jk scroll"), "scrolling not advertised");
         assert!(!term.contains("hjkl move"), "stale hint for the other column");
+    }
+
+    /// Folding a project must not hide an agent that is blocked on you.
+    ///
+    /// Collapsing is how you stop looking at a project, so the parent row has
+    /// to keep carrying the one status that needs a person — otherwise the
+    /// tree quietly buries the thing it exists to surface.
+    #[test]
+    fn a_folded_project_still_shows_a_waiting_child() {
+        use crate::serve::server::{PaneStatus, SessionStatus};
+        use ratatui::backend::TestBackend;
+
+        let at = |status: PaneStatus, since: Option<i64>| SessionStatus { status, since };
+        let draw = |state: &AppState| -> String {
+            let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+            terminal.draw(|f| render(f, state, None)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        // beta has two sessions; only the second is blocked.
+        let now = chrono::Utc::now().timestamp();
+        state
+            .statuses
+            .insert("cx_beta_22222222".into(), at(PaneStatus::Idle, None));
+        state.statuses.insert(
+            "cx_beta_22222222-grok".into(),
+            // Blocked for five minutes — long enough that the wait matters.
+            at(PaneStatus::Waiting, Some(now - 300)),
+        );
+
+        let waitings = |state: &AppState| draw(state).matches("waiting").count();
+
+        // Nothing known yet must stay blank rather than claim idle.
+        assert_eq!(waitings(&AppState::new(projects())), 0, "status drawn without data");
+
+        // Open, the child carries it.
+        assert_eq!(waitings(&state), 1, "waiting child drew no status");
+
+        // How long it has been blocked is what makes the marker actionable.
+        assert!(draw(&state).contains("5m"), "waiting duration not shown");
+
+        // Folded, the parent must inherit the most urgent of the two.
+        state.collapsed.insert("/work/beta".into());
+        state.cursor = state.first_selectable();
+        assert_eq!(
+            waitings(&state),
+            1,
+            "folding beta hid a session that is waiting on the user"
+        );
+        assert!(draw(&state).contains("5m"), "folding dropped the duration");
+
+        // An inferred status has no start time, and must not invent one —
+        // `0m` beside an agent blocked for an hour is worse than blank.
+        let mut guessed = AppState::new(projects());
+        guessed
+            .statuses
+            .insert("cx_beta_22222222".into(), at(PaneStatus::Waiting, None));
+        let text = draw(&guessed);
+        assert!(text.contains("waiting"), "inferred status not drawn");
+        assert!(!text.contains("0m"), "invented a duration for an inferred status");
+    }
+
+    /// A named directory must show its name — and sort by it.
+    ///
+    /// Sorting on the folder name while displaying the alias would file a
+    /// project under a letter that appears nowhere on screen.
+    #[test]
+    fn a_named_project_is_shown_and_sorted_by_its_name() {
+        use ratatui::backend::TestBackend;
+
+        let mut projects = projects();
+        projects[0].alias = Some("zzz-last".into()); // "alpha" -> sorts last
+        // group_by_project sorts on the display name; mirror that here, since
+        // the fixture bypasses it.
+        projects.sort_by(|a, b| {
+            a.display_name()
+                .to_lowercase()
+                .cmp(&b.display_name().to_lowercase())
+        });
+
+        let mut state = AppState::new(projects);
+        state.cursor = state.first_selectable();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|f| render(f, &state, None)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(text.contains("zzz-last"), "alias not drawn");
+        assert!(!text.contains("alpha"), "folder name drawn instead of the alias");
+        // beta now precedes it.
+        assert!(
+            text.find("beta") < text.find("zzz-last"),
+            "rows not ordered by the name actually shown"
+        );
+    }
+
+    /// The tree names the agent, not the shell shortcut.
+    ///
+    /// `cx` and `oc` are what you type; they are not what you want to read off
+    /// a list of what is running.
+    #[test]
+    fn rows_name_the_agent_rather_than_its_alias() {
+        use ratatui::backend::TestBackend;
+
+        let projects = vec![
+            // Single session: the agent is shown inline on the project row.
+            Project {
+                dir: "/work/solo".into(),
+                name: "solo".into(),
+                alias: None,
+                sessions: vec![session("oc_solo_11111111", "oc")],
+            },
+            // Several: each child row names its own.
+            Project {
+                dir: "/work/many".into(),
+                name: "many".into(),
+                alias: None,
+                sessions: vec![
+                    session("cx_many_22222222", "cx"),
+                    session("cc_many_22222222-b", "cc"),
+                ],
+            },
+        ];
+        let mut state = AppState::with_agents(projects, crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 10)).unwrap();
+        terminal.draw(|f| render(f, &state, None)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        // The longest name has to survive the column, not lose its tail to the
+        // border — that is the whole reason the project column is 14 wide.
+        assert!(text.contains("opencode"), "agent name truncated or not shown");
+        assert!(text.contains("codex"), "child row does not name its agent");
+        assert!(text.contains("claude"), "child row does not name its agent");
+    }
+
+    /// A path too long for the popup must lose its *front*. The tail is what
+    /// tells two projects apart; cutting there leaves a column of identical
+    /// "/Users/not/projects/devs/…".
+    #[test]
+    fn a_long_path_keeps_its_tail() {
+        let long = "/Users/not/projects/devs/opensource/deeply/nested/sitin";
+        let out = elide_front(long, 20);
+        assert!(out.chars().count() <= 20, "elided text is still too wide");
+        assert!(out.ends_with("sitin"), "the identifying end was cut: {out}");
+        assert!(out.starts_with('…'));
+
+        // Short enough to fit is returned untouched.
+        assert_eq!(elide_front("~/x", 20), "~/x");
+    }
+
+    fn entry(agent: &str, id: &str, modified: f64) -> SessionEntry {
+        SessionEntry {
+            agent: agent.into(),
+            id: id.into(),
+            modified,
+            summary: Some(format!("summary for {id}")),
+        }
+    }
+
+    /// A listing that arrives after the user has moved on must be discarded.
+    ///
+    /// It comes off a background thread, so nothing stops it landing seconds
+    /// late — into a closed picker, or one now showing a different project.
+    #[test]
+    fn a_stale_listing_is_not_applied() {
+        let mut state = AppState::new(projects());
+
+        // Nothing open: a listing has nowhere to go.
+        assert!(!apply_listing(&mut state, "/work/alpha", vec![entry("claude", "a1", 2.0)]));
+
+        state.draft = Some(Draft::Session(SessionPicker::new(
+            "/work/alpha".into(),
+            "alpha".into(),
+        )));
+        assert!(matches!(&state.draft, Some(Draft::Session(p)) if p.loading));
+
+        // A listing for a *different* project must not fill this one.
+        assert!(!apply_listing(&mut state, "/work/beta", vec![entry("codex", "b1", 1.0)]));
+        let Some(Draft::Session(p)) = state.draft.as_ref() else { panic!("draft lost") };
+        assert!(p.entries.is_empty(), "another project's sessions were shown");
+        assert!(p.loading, "loading was cleared by the wrong listing");
+
+        // The matching one fills it.
+        assert!(apply_listing(
+            &mut state,
+            "/work/alpha",
+            vec![entry("claude", "a1", 2.0), entry("codex", "a2", 1.0)]
+        ));
+        let Some(Draft::Session(p)) = state.draft.as_ref() else { panic!("draft lost") };
+        assert_eq!(p.entries.len(), 2);
+        assert!(!p.loading);
+        assert_eq!(p.cursor, 0);
+        assert_eq!(p.selected().unwrap().id, "a1");
+    }
+
+    /// The cursor must stay on a real row however far it is pushed.
+    #[test]
+    fn the_session_cursor_stays_in_range() {
+        let mut p = SessionPicker::new("/work/alpha".into(), "alpha".into());
+        p.move_by(3);
+        assert_eq!(p.cursor, 0, "an empty list must not move the cursor");
+        assert!(p.selected().is_none());
+
+        p.entries = vec![entry("claude", "a", 2.0), entry("codex", "b", 1.0)];
+        p.move_by(9);
+        assert_eq!(p.cursor, 1);
+        assert_eq!(p.selected().unwrap().id, "b");
+        p.move_by(-9);
+        assert_eq!(p.cursor, 0);
+    }
+
+    /// A project opened from history usually has nothing running in it, so the
+    /// first session there must get the plain name — not the `-2` that marks a
+    /// second workspace alongside an existing one.
+    ///
+    /// Drives the real code path, because the bug was in the argument `n`
+    /// passes, not in the naming helper: a name-only assertion would have gone
+    /// on passing.
+    #[test]
+    fn the_first_session_in_a_project_is_not_named_as_an_extra() {
+        if !tmux::is_available() {
+            eprintln!("skipping: no multiplexer installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let agents = crate::config::builtin_agents();
+        // `true` here so nothing real is launched in the session.
+        let agent = Agent {
+            name: "probe".into(),
+            alias: format!("zz{}", std::process::id()),
+            command: vec!["true".into()],
+        };
+        let mut state = AppState::with_agents(Vec::new(), agents);
+
+        let (tx, rx) = mpsc::channel();
+        spawn_agent_in(&mut state, &tx, &agent, &dir, false);
+        // Creation runs on its own thread now, so the name comes back over the
+        // channel rather than from the call.
+        let created = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("no result from the spawn thread")
+            .expect("session should be created");
+        let _ = tmux::kill_session(&created);
+
+        let base = crate::session::session_name(&agent.alias, std::path::Path::new(&dir));
+        assert_eq!(
+            created, base,
+            "the first session in an empty project was named as an extra"
+        );
+    }
+
+    /// The key hints must name the keys that exist.
+    ///
+    /// `Enter` stopped handing over the terminal — a second one after opening a
+    /// project used to replace the layout with the agent just opened — and the
+    /// full-screen attach moved to `A`.
+    #[test]
+    fn the_hints_name_enter_and_the_fullscreen_key() {
+        use ratatui::backend::TestBackend;
+
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|f| render(f, &state, None)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(text.contains("Enter/i open"), "Enter is not described as opening");
+        assert!(text.contains("A fullscreen"), "the fullscreen key is unlisted");
+        assert!(
+            !text.contains("Enter attach"),
+            "the hints still promise the old take-over-the-terminal behaviour"
+        );
+    }
+
+    /// The placeholder must be a real, selectable row — and only exist while a
+    /// draft does.
+    #[test]
+    fn the_draft_adds_one_selectable_row_at_the_end() {
+        let mut state = AppState::new(projects());
+        let before = state.rows().len();
+        assert!(
+            !state.rows().iter().any(|r| matches!(r, Row::Draft)),
+            "a placeholder appeared with no draft open"
+        );
+
+        state.draft = Some(Draft::Project(ProjectPicker::default()));
+        let rows = state.rows();
+        assert_eq!(rows.len(), before + 1);
+        assert!(matches!(rows.last(), Some(Row::Draft)));
+
+        // Selectable, or the cursor could never sit on it.
+        state.cursor = rows.len() - 1;
+        assert!(state.selectable(Row::Draft));
+
+        // And it resolves to no session — which is what makes the event loop
+        // drop the live terminal instead of leaving the previous one on screen
+        // behind the picker.
+        assert!(state.current_name().is_none());
+        assert!(state.current_project().is_none());
+    }
+
+    /// Esc steps back from the session list to the project list rather than
+    /// throwing the whole thing away — picking the wrong project is the
+    /// likelier mistake, and starting over costs the query you just typed.
+    #[test]
+    fn the_draft_label_tracks_the_stage() {
+        let picker = ProjectPicker::default();
+        assert_eq!(Draft::Project(picker).label(), "new session…");
+
+        let mut sp = SessionPicker::new("/work/sitin".into(), "sitin".into());
+        assert_eq!(Draft::Session(sp.clone()).label(), "sitin…");
+        sp.loading = false;
+
+        assert_eq!(
+            Draft::Starting { label: "sitin".into() }.label(),
+            "sitin — starting…"
+        );
+    }
+
+    /// Cancelling must leave the tree exactly as it was found.
+    ///
+    /// Opening a draft moves the cursor to the placeholder at the end of the
+    /// list; without remembering where it came from, Esc left you at the bottom
+    /// of the tree looking at a session you had not chosen.
+    #[test]
+    fn cancelling_a_draft_restores_the_cursor() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let before = state.cursor;
+        let name_before = state.current_name();
+
+        // What `o` does.
+        state.cursor_before_draft = Some(state.cursor);
+        state.draft = Some(Draft::Project(ProjectPicker::default()));
+        state.cursor = state.rows().len() - 1;
+        assert!(matches!(state.current_row(), Some(Row::Draft)));
+
+        // What Esc does.
+        state.draft = None;
+        if let Some(previous) = state.cursor_before_draft.take() {
+            state.cursor = previous;
+        }
+
+        assert_eq!(state.cursor, before, "the cursor did not go back");
+        assert_eq!(state.current_name(), name_before);
+        assert!(state.cursor_before_draft.is_none(), "the saved cursor leaked");
+    }
+
+    /// Esc must not invent a step the user never took.
+    ///
+    /// Reached through `o`, the session list sits on top of a project list, so
+    /// Esc goes back to it. Reached through `O` it is the first thing shown,
+    /// and dropping into a project list there would be stranger than closing.
+    #[test]
+    fn esc_goes_back_only_when_there_is_something_to_go_back_to() {
+        let from_o = SessionPicker::from_projects("/work/sitin".into(), "sitin".into());
+        assert!(from_o.from_project_list, "o must leave a list to return to");
+
+        let from_shift_o = SessionPicker::new("/work/sitin".into(), "sitin".into());
+        assert!(
+            !from_shift_o.from_project_list,
+            "O starts at the sessions, so there is no list behind it"
+        );
+
+        // Both describe the same directory either way.
+        assert_eq!(from_o.dir, from_shift_o.dir);
+        assert_eq!(Draft::Session(from_shift_o).label(), "sitin…");
+    }
+
+    fn row(path: &str, name: &str, alias: Option<&str>) -> crate::store::ProjectRow {
+        crate::store::ProjectRow {
+            path: path.into(),
+            name: name.into(),
+            alias: alias.map(str::to_string),
+            last_agent: "claude".into(),
+            last_seen_at: "2026-09-13T00:00:00Z".into(),
+            launch_count: 1,
+        }
+    }
+
+    /// Typing a fragment of the *path* has to find the project — that is the
+    /// whole point: you remember "sitin", not where it lives.
+    #[test]
+    fn the_picker_matches_on_name_alias_and_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sitin = tmp.path().join("projects/devs/sitin");
+        let other = tmp.path().join("work/iotex");
+        std::fs::create_dir_all(&sitin).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        let rows = vec![
+            row(sitin.to_str().unwrap(), "sitin", None),
+            row(other.to_str().unwrap(), "iotex", Some("IoTeX 主线")),
+        ];
+
+        let mut p = ProjectPicker::new(rows);
+        assert_eq!(p.matches().len(), 2, "an empty query shows everything");
+
+        // By folder name, which is also part of the path.
+        p.query = "sitin".into();
+        assert_eq!(p.matches().len(), 1);
+        assert!(p.selected().unwrap().path.ends_with("devs/sitin"));
+
+        // By a path fragment that is in neither name.
+        p.query = "devs/".into();
+        assert_eq!(p.matches().len(), 1);
+
+        // By the alias the user chose, which is not the folder name.
+        p.query = "iotex 主线".into();
+        assert_eq!(p.matches().len(), 1);
+        assert_eq!(p.selected().unwrap().label, "IoTeX 主线");
+
+        p.query = "nothing-like-this".into();
+        assert!(p.matches().is_empty());
+        p.clamp();
+        assert!(p.selected().is_none(), "no match must not resolve to a row");
+    }
+
+    /// A directory that has since been deleted must not be offered: picking it
+    /// could only ever produce "directory no longer exists". Seventeen of the
+    /// sixty-two recorded paths on this machine are in that state.
+    #[test]
+    fn the_picker_hides_directories_that_are_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("live");
+        std::fs::create_dir_all(&live).unwrap();
+
+        let rows = vec![
+            row(live.to_str().unwrap(), "live", None),
+            row(&tmp.path().join("deleted").to_string_lossy(), "deleted", None),
+        ];
+
+        let p = ProjectPicker::new(rows);
+        let paths: Vec<&str> = p.matches().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths.len(), 1, "a vanished directory was offered");
+        assert!(paths[0].ends_with("live"));
+    }
+
+    /// Narrowing the list must not strand the cursor past its end.
+    #[test]
+    fn the_picker_cursor_stays_inside_the_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        for n in ["alpha", "alpine", "beta"] {
+            std::fs::create_dir_all(tmp.path().join(n)).unwrap();
+        }
+        let rows = ["alpha", "alpine", "beta"]
+            .iter()
+            .map(|n| row(&tmp.path().join(n).to_string_lossy(), n, None))
+            .collect();
+
+        let mut p = ProjectPicker::new(rows);
+        p.move_by(2);
+        assert_eq!(p.cursor, 2);
+
+        // "alp" leaves two rows; the cursor was on the third.
+        p.query = "alp".into();
+        p.clamp();
+        assert_eq!(p.cursor, 1, "cursor left past the end of the narrowed list");
+        assert!(p.selected().is_some());
+
+        p.move_by(-5);
+        assert_eq!(p.cursor, 0, "moving up past the top must stop at the top");
     }
 
     #[test]

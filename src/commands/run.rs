@@ -81,26 +81,40 @@ pub fn run_in(
     let cwd = cwd
         .canonicalize()
         .with_context(|| format!("cannot canonicalize {}", cwd.display()))?;
-    let base = session::session_name(&agent.alias, &cwd);
-
     let tmux_ok = tmux::is_available();
+
+    let (name, argv, session_exists) = resume_plan(agent, &cwd, session_id, tmux_ok, true);
+    launch(agent, &cwd, &name, argv, Vec::new(), session_exists, tmux_ok, agents)
+}
+
+/// Work out which session should hold `session_id`, and how to launch it.
+///
+/// The directory's primary session is its home only while it is free, or
+/// already on this very thread. Once it is busy with a *different* one, taking
+/// it over would abandon the agent running there — so the conversation gets a
+/// session of its own, named the way `amux new` names a second workspace.
+///
+/// Returns the session name, the argv to run in it, and whether it already
+/// exists. Split out of [`run_in`] so the TUI can reach the same decision
+/// without [`launch`]'s final `attach_or_switch`, which hands over the
+/// terminal the TUI is drawing on.
+pub(crate) fn resume_plan(
+    agent: &Agent,
+    cwd: &std::path::Path,
+    session_id: &str,
+    tmux_ok: bool,
+    announce: bool,
+) -> (String, Vec<String>, bool) {
+    let base = session::session_name(&agent.alias, cwd);
     let live = |n: &str| tmux_ok && tmux::has_session(n);
 
-    // Which session should hold this conversation?
-    //
-    // The directory's primary session is its home only while it is free, or
-    // already on this very thread. Once it is busy with a *different* one,
-    // taking it over would abandon the agent running there — so the request
-    // used to be dropped instead, silently re-attaching the caller to whatever
-    // was already open. Give the conversation a session of its own, named the
-    // way `amux new` names a second workspace for a directory.
-    let (name, session_exists) = if !live(&base) || already_open(agent, &cwd, &base, session_id) {
+    let (name, session_exists) = if !live(&base) || already_open(agent, cwd, &base, session_id) {
         let exists = live(&base);
         (base, exists)
     } else {
         let side = format!("{base}-{}", super::list::short_id(session_id));
         let exists = live(&side);
-        if !exists {
+        if !exists && announce {
             println!("{base} is on another conversation — opening {side} alongside it");
         }
         (side, exists)
@@ -113,8 +127,7 @@ pub fn run_in(
         // Remember it, so relaunching this session resumes the same thread.
         super::session_ids::store_id(&name, session_id);
     }
-
-    launch(agent, &cwd, &name, argv, Vec::new(), session_exists, tmux_ok, agents)
+    (name, argv, session_exists)
 }
 
 /// Whether the directory's primary session is already holding `session_id`.

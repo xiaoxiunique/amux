@@ -145,7 +145,7 @@ fn human_size(bytes: u64) -> String {
 
 /// "3分钟前" / "2小时前" / "5天前" — more scannable than a timestamp when the
 /// question is "which one was I just in".
-fn relative_time(epoch_secs: f64) -> String {
+pub(crate) fn relative_time(epoch_secs: f64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
