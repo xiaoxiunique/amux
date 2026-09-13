@@ -1086,6 +1086,11 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
     // the cursor on something selectable, since the first row is a heading
     // whenever the first project has several sessions.
     state.restore_arrangement();
+    // Whatever is running right now, recorded before anything else happens.
+    // The change-detection below only fires when the set *moves*, so opening
+    // and closing amux without starting anything would never write the list —
+    // and that list is what `amux restore` needs after the machine goes down.
+    crate::commands::sessions::auto_save(agents);
 
     let outcome = event_loop(&mut state)?;
     state.save_arrangement();
@@ -1410,6 +1415,12 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 known = names;
                 let keep = state.current_name();
                 reload(state, keep);
+                // Record what is running, so `amux restore` can bring it back.
+                // `auto_save` only ever ran from `amux run`, and the TUI starts
+                // sessions through `create_detached` — so everything opened
+                // here was missing from the saved list, which is exactly the
+                // list you need after the machine has gone down.
+                crate::commands::sessions::auto_save(&state.agents);
                 dirty = true;
             }
             // Titles are refined as an agent works, so re-read them even when
