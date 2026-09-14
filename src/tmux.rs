@@ -51,6 +51,39 @@ pub fn is_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Environment a multiplexer leaves on its clients, which makes a command run
+/// from inside one look like a nested session.
+///
+/// Both prefixes, because rmux sets **both** — `RMUX`/`RMUX_PANE` *and* the
+/// `TMUX` names it is compatible with. Stripping only the latter leaves the
+/// former to be found, and `attach-session` then treats a fresh attach as a
+/// switch and fails with "switch-client requires an unambiguous attached
+/// client". That is not hypothetical: it is what broke the phone's terminal
+/// once serve could be started from the tree, which runs inside a session.
+///
+/// One list because there were four, and only one of them was right.
+pub const CLIENT_MARKERS: &[&str] = &[
+    "TMUX",
+    "TMUX_PANE",
+    "TMUX_PROGRAM",
+    "TMUX_CONF",
+    "TMUX_CONF_LOCAL",
+    "TMUX_SOCKET",
+    "RMUX",
+    "RMUX_PANE",
+    "RMUX_PROGRAM",
+    "RMUX_CONF",
+    "RMUX_CONF_LOCAL",
+    "RMUX_SOCKET",
+];
+
+/// Drop every marker, so the command runs as if from outside any session.
+pub fn scrub_client_env(command: &mut Command) {
+    for key in CLIENT_MARKERS {
+        command.env_remove(key);
+    }
+}
+
 pub fn in_tmux() -> bool {
     std::env::var("TMUX").map(|v| !v.is_empty()).unwrap_or(false)
 }
@@ -401,5 +434,34 @@ mod tests {
             opt.contains("latest"),
             "new sessions must be pinned to the latest client, got {opt:?}"
         );
+    }
+
+    /// Every marker rmux leaves behind must be dropped — both spellings of it.
+    ///
+    /// rmux sets `RMUX`/`RMUX_PANE` *and* the `TMUX` names it is compatible
+    /// with, and a scrub that knows only the `TMUX` half leaves the command
+    /// looking nested. `attach-session` then switches instead of attaching and
+    /// dies with "requires an unambiguous attached client" — which is exactly
+    /// how the phone's terminal stopped working, and it fails only when serve
+    /// happens to have been started from inside a session, so nothing about it
+    /// shows up in ordinary use.
+    #[test]
+    fn both_multiplexers_markers_are_scrubbed() {
+        let mut command = Command::new("true");
+        scrub_client_env(&mut command);
+
+        let removed: Vec<&str> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .filter_map(|(key, _)| key.to_str())
+            .collect();
+
+        // What rmux actually exports onto a client, read off this machine.
+        for key in ["TMUX", "TMUX_PANE", "TMUX_PROGRAM", "RMUX", "RMUX_PANE"] {
+            assert!(removed.contains(&key), "{key} survives the scrub: {removed:?}");
+        }
+        // Neither prefix may be represented only by its bare name.
+        assert!(CLIENT_MARKERS.iter().filter(|k| k.starts_with("RMUX")).count() > 1);
+        assert!(CLIENT_MARKERS.iter().filter(|k| k.starts_with("TMUX")).count() > 1);
     }
 }

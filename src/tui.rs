@@ -1075,7 +1075,7 @@ impl LiveTerm {
         // knows about the latter. Removed explicitly rather than by omission —
         // the builder merges over the inherited environment, so leaving a
         // variable out does not unset it.
-        for key in ["TMUX", "TMUX_PANE", "TMUX_PROGRAM", "RMUX", "RMUX_PANE", "RMUX_PROGRAM"] {
+        for key in crate::tmux::CLIENT_MARKERS {
             command.env_remove(key);
         }
         command.env("TERM", "xterm-256color");

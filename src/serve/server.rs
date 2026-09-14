@@ -634,13 +634,7 @@ fn discover_tmux_server_program_path() -> Option<String> {
 
 fn sanitized_command(program: &str) -> Command {
     let mut command = Command::new(program);
-    command
-        .env_remove("TMUX")
-        .env_remove("TMUX_PANE")
-        .env_remove("TMUX_PROGRAM")
-        .env_remove("TMUX_CONF")
-        .env_remove("TMUX_CONF_LOCAL")
-        .env_remove("TMUX_SOCKET");
+    crate::tmux::scrub_client_env(&mut command);
     // When serve is started from inside a Claude Code session it inherits that
     // session's markers. An agent launched further down this chain then sees
     // itself as a *child* session and turns transcript saving off — so the
@@ -663,12 +657,9 @@ fn tmux_command() -> Command {
 }
 
 fn sanitize_tmux_command_builder(command: &mut CommandBuilder) {
-    command.env_remove("TMUX");
-    command.env_remove("TMUX_PANE");
-    command.env_remove("TMUX_PROGRAM");
-    command.env_remove("TMUX_CONF");
-    command.env_remove("TMUX_CONF_LOCAL");
-    command.env_remove("TMUX_SOCKET");
+    for key in crate::tmux::CLIENT_MARKERS {
+        command.env_remove(key);
+    }
 }
 
 fn scroll_tmux_pane(pane_id: &str, lines: i32) {
