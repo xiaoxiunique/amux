@@ -5,8 +5,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -1347,6 +1346,19 @@ fn focused_term<'a>(live: &'a mut [LiveTerm], state: &AppState) -> Option<&'a mu
     live.iter_mut().find(|t| t.session == wanted)
 }
 
+/// Mouse reporting, limited to the events amux reads.
+///
+/// crossterm's `EnableMouseCapture` also turns on 1002 and 1003 — report motion
+/// while a button is held, and report every motion at all. Neither is used:
+/// `encode_mouse` returns nothing for `Moved` and `Drag`, so the pointer merely
+/// crossing the window woke the loop for events it then threw away.
+///
+/// 1000 is press and release, which is what the click handling and the wheel
+/// need. 1006 is the coordinate encoding that still works past column 223.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+/// Turned off in the order they were turned on, innermost first.
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+
 /// How often amux reads its own cost. Frequent enough to answer for the moment,
 /// slow enough that the figure is readable rather than twitching.
 const USAGE_INTERVAL: Duration = Duration::from_secs(2);
@@ -1400,7 +1412,9 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     // warning: Ghostty asks before pasting text with newlines *unless* the
     // program has said it can tell a paste from typing, and until now amux
     // could not — so the warning was right.
-    execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
+    write!(out, "{MOUSE_ON}")?;
+    out.flush()?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2291,12 +2305,8 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     // Detach before restoring the screen, so the client goes away cleanly.
     drop(live);
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture,
-        DisableBracketedPaste
-    )?;
+    write!(terminal.backend_mut(), "{MOUSE_OFF}")?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
     terminal.show_cursor()?;
     Ok(result)
 }
