@@ -148,6 +148,29 @@ pub fn send_text(name: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Paste `text` into a session's active pane as one block.
+///
+/// Through a buffer rather than `send-keys -l`, because `paste-buffer -p` wraps
+/// the text in bracketed-paste markers when the program has asked for them. An
+/// agent then takes a multi-line paste as one input instead of as a line per
+/// newline — which is the thing Ghostty's paste warning is actually about.
+pub fn paste_text(name: &str, text: &str) -> Result<()> {
+    const BUFFER: &str = "amux-paste";
+    // `--` so text beginning with a dash is content, not a flag.
+    let staged = Command::new(mux_bin())
+        .args(["set-buffer", "-b", BUFFER, "--", text])
+        .status()?;
+    if !staged.success() {
+        bail!("could not stage the paste");
+    }
+    // `-d` drops the buffer afterwards, so a paste does not linger in the
+    // multiplexer's stack where the next one would find it.
+    Command::new(mux_bin())
+        .args(["paste-buffer", "-b", BUFFER, "-t", name, "-d", "-p"])
+        .status()?;
+    Ok(())
+}
+
 /// Send a bare Enter keypress to a session's active pane.
 pub fn send_enter(name: &str) -> Result<()> {
     send_key(name, "Enter")

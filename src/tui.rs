@@ -5,7 +5,8 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, MouseButton, MouseEvent, MouseEventKind,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -1350,6 +1351,41 @@ fn focused_term<'a>(live: &'a mut [LiveTerm], state: &AppState) -> Option<&'a mu
 /// slow enough that the figure is readable rather than twitching.
 const USAGE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Put a pasted block into whichever of amux's own text fields is open.
+///
+/// True when one took it. The fields are all one line — a name, a filter, a
+/// query — so the newlines that made this a paste in the first place become
+/// spaces rather than arriving as characters no field can show.
+fn paste_into_field(state: &mut AppState, text: &str) -> bool {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        // Whitespace only: taken, so it cannot fall through to an agent.
+        return true;
+    }
+    if let Some(name) = state.renaming.as_mut() {
+        name.push_str(&flat);
+        return true;
+    }
+    if state.filtering {
+        state.filter.push_str(&flat);
+        return true;
+    }
+    match state.draft.as_mut() {
+        // The project list searches as you type, so it is always taking text.
+        Some(Draft::Project(picker)) => {
+            picker.query.push_str(&flat);
+            picker.clamp();
+            true
+        }
+        Some(Draft::Session(picker)) if picker.filtering => {
+            picker.query.push_str(&flat);
+            picker.clamp();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Size of the terminal column, in cells, for the current frame size.
 fn term_size(area: Rect) -> (u16, u16) {
     // Minus the border on each side.
@@ -1359,7 +1395,12 @@ fn term_size(area: Rect) -> (u16, u16) {
 fn event_loop(state: &mut AppState) -> Result<Outcome> {
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    // Bracketed paste, so a pasted block arrives as one event rather than as a
+    // burst of keystrokes. Declaring it also settles the terminal's own paste
+    // warning: Ghostty asks before pasting text with newlines *unless* the
+    // program has said it can tell a paste from typing, and until now amux
+    // could not — so the warning was right.
+    execute!(out, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1639,6 +1680,31 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         _ => {}
                     }
                     dirty = true;
+                }
+                continue;
+            }
+
+            if let Event::Paste(text) = &ev {
+                dirty = true;
+                if state.browsing {
+                    if let Some(term) = tool.as_mut() {
+                        term.write(text.as_bytes());
+                    }
+                } else if !paste_into_field(state, text) {
+                    // Nothing of amux's own is taking text, so it is meant for
+                    // the agent — but only if you had said so by pressing `i`.
+                    // A paste that lands on the tree would otherwise go into
+                    // whichever session the cursor happened to be on.
+                    match state.current_name().filter(|_| state.inserting) {
+                        Some(name) => {
+                            if let Err(why) = tmux::paste_text(&name, text) {
+                                state.notice = Some(why.to_string());
+                            }
+                        }
+                        None => {
+                            state.notice = Some("press i first, then paste".into());
+                        }
+                    }
                 }
                 continue;
             }
@@ -2225,7 +2291,12 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     // Detach before restoring the screen, so the client goes away cleanly.
     drop(live);
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
     Ok(result)
 }
@@ -4229,6 +4300,61 @@ mod tests {
             state.row_at_line(last).is_none(),
             "a click on the footer selected a session"
         );
+    }
+
+    /// A pasted block goes to whichever field is open — and to none when the
+    /// tree is merely being navigated.
+    ///
+    /// The last case is the one worth guarding: falling through means the text
+    /// reaches an agent, chosen by wherever the cursor happened to be sitting.
+    #[test]
+    fn a_paste_lands_in_the_open_field_and_nowhere_otherwise() {
+        let mut state = AppState::with_agents(projects(), crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+
+        // Nothing open: not taken, so the caller decides where it goes.
+        assert!(!paste_into_field(&mut state, "some text"));
+
+        // Renaming.
+        state.renaming = Some("adobe".into());
+        assert!(paste_into_field(&mut state, "-test"));
+        assert_eq!(state.renaming.as_deref(), Some("adobe-test"));
+        state.renaming = None;
+
+        // The tree filter.
+        state.filtering = true;
+        assert!(paste_into_field(&mut state, "rev"));
+        assert_eq!(state.filter, "rev");
+        state.filtering = false;
+
+        // The project list, which searches as you type.
+        state.draft = Some(Draft::Project(ProjectPicker::default()));
+        assert!(paste_into_field(&mut state, "sitin"));
+        let Some(Draft::Project(p)) = state.draft.as_ref() else { panic!() };
+        assert_eq!(p.query, "sitin");
+
+        // The conversation list only takes text while searching; otherwise its
+        // keys are commands and a paste belongs to the agent instead.
+        let mut picker = SessionPicker::new("/work/alpha".into(), "alpha".into());
+        picker.filtering = false;
+        state.draft = Some(Draft::Session(picker));
+        assert!(!paste_into_field(&mut state, "xhs"));
+        let Some(Draft::Session(p)) = state.draft.as_mut() else { panic!() };
+        p.filtering = true;
+        assert!(paste_into_field(&mut state, "xhs"));
+        let Some(Draft::Session(p)) = state.draft.as_ref() else { panic!() };
+        assert_eq!(p.query, "xhs");
+
+        // Newlines are what made this a paste, and no field can show them.
+        state.draft = None;
+        state.renaming = Some(String::new());
+        assert!(paste_into_field(&mut state, "one\ntwo\r\nthree"));
+        assert_eq!(state.renaming.as_deref(), Some("one two three"));
+
+        // Whitespace alone is taken rather than passed on — an empty paste must
+        // not become a keystroke an agent has to deal with.
+        assert!(paste_into_field(&mut state, "   \n  "));
+        assert_eq!(state.renaming.as_deref(), Some("one two three"));
     }
 
     /// A path too long for the popup must lose its *front*. The tail is what
