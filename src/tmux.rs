@@ -259,6 +259,23 @@ pub fn kill_session(name: &str) -> Result<()> {
 /// past the first one's, even after that client is gone.
 ///
 /// Best-effort: a multiplexer without the option must not fail the launch.
+/// Let `name` size itself to whichever client is looking at it.
+///
+/// A window left on *manual* sizing keeps whatever size it last had, and a
+/// client smaller than that does not get a viewport onto it — the multiplexer
+/// draws the whole window and expects the terminal to cope. A pane preview is
+/// a grid exactly its own size, so every row past its height is simply
+/// dropped: measured on a 53-row window shown to a 25-row client, thirty of
+/// the cursor positions sent were off the end of it, and what lives down there
+/// is the agent's input box.
+pub fn follow_client(name: &str) {
+    let _ = Command::new(mux_bin())
+        .args(["set-option", "-t", name, "window-size", "latest"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 pub fn pin_window_size(name: &str) {
     // Resize first, then set the option — not the other way round.
     //
@@ -351,12 +368,16 @@ pub fn attach_or_switch(name: &str) -> Result<()> {
         Command::new(mux_bin())
             .args(["switch-client", "-t", name])
             .status()?;
-        // The client moved after the pin above ran, so recompute against it.
+        // The client moved after the pin above ran, so recompute against it —
+        // then put the option back, because `resize-window` is itself what
+        // switches a window to manual sizing. Leaving it manual is how a
+        // session ends up larger than every client that can see it.
         let _ = Command::new(mux_bin())
             .args(["resize-window", "-t", name, "-A"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
+        follow_client(name);
         Ok(())
     } else {
         #[cfg(unix)]

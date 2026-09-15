@@ -1109,6 +1109,11 @@ const DEVICE_ATTRIBUTES: &[u8] = b"\x1b[?62;22c";
 impl LiveTerm {
     /// Attach to `session` in a pty of the given size.
     fn open(session: &str, cols: u16, rows: u16) -> Option<Self> {
+        // A pane is a small client, and it only works as a window onto the
+        // session if the session agrees to be that size. One left on manual
+        // sizing is drawn whole regardless, and everything below this pane's
+        // height — the input box, most of the time — never arrives.
+        tmux::follow_client(session);
         let mut command = CommandBuilder::new(tmux::mux_bin());
         command.arg("attach-session");
         command.arg("-t");
