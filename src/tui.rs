@@ -1199,7 +1199,16 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
 
     match outcome {
         Outcome::Quit => Ok(()),
-        Outcome::Attach(name) => tmux::attach_or_switch(&name),
+        // Back into the tree once the client detaches, rather than out to the
+        // shell: a full-screen session is where you go to select and copy, and
+        // that should cost the trip, not the session list.
+        Outcome::Attach(name) => {
+            if tmux::attach_and_return(&name)? {
+                run_tui(agents)
+            } else {
+                Ok(())
+            }
+        }
         Outcome::Kill(name) => {
             tmux::kill_session(&name)?;
             // re-enter the TUI with refreshed list
@@ -2933,7 +2942,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("N", "another session for this agent"),
         ("Tab", "next session of this project"),
         ("Y", "browse files with yazi"),
-        ("A", "attach full screen, leaving amux"),
+        ("A", "full screen; detach comes back"),
         ("d", "kill the selected session"),
         ("/", "filter projects"),
         (",", "settings"),
@@ -4585,7 +4594,7 @@ mod tests {
         helping.cursor = helping.first_selectable();
         helping.helping = true;
         let keys = drawn(&helping, 140);
-        for expected in ["A", "attach full screen", "Y", "p", "gg / G", "^u ^d"] {
+        for expected in ["A", "full screen", "Y", "p", "gg / G", "^u ^d"] {
             assert!(keys.contains(expected), "the key list omits {expected}");
         }
     }

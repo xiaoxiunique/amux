@@ -319,6 +319,30 @@ fn resize_after_attach(name: &str) {
     let _ = spawned;
 }
 
+/// Attach to `name` and come back here when the client detaches.
+///
+/// [`attach_or_switch`] replaces this process, which is right for `amux run`
+/// and wrong for the tree: giving the whole terminal to one session is how you
+/// select and copy from it — the tree draws two columns into one screen, and a
+/// terminal's selection is a rectangle over all of them — and afterwards you
+/// want the tree back, with its pins and cursor where you left them.
+///
+/// Returns false when there was nothing to come back from: inside another
+/// session this is a client switch, which returns at once and leaves the
+/// terminal showing somewhere else entirely.
+pub fn attach_and_return(name: &str) -> Result<bool> {
+    if in_tmux() {
+        attach_or_switch(name)?;
+        return Ok(false);
+    }
+    pin_window_size(name);
+    resize_after_attach(name);
+    Command::new(mux_bin())
+        .args(["attach-session", "-t", name])
+        .status()?;
+    Ok(true)
+}
+
 pub fn attach_or_switch(name: &str) -> Result<()> {
     // Covers sessions created before the option was set — attaching is exactly
     // when a stale size becomes visible.
