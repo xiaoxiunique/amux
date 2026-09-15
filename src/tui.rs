@@ -233,6 +233,39 @@ impl SessionPicker {
     }
 }
 
+/// A drag across one pane: what to highlight, and what to copy when it ends.
+///
+/// The terminal cannot do this itself. Its own selection is a rectangle over
+/// the whole screen, so dragging across a pane takes the session list and the
+/// borders with it — which is why this is amux's job and not Shift's.
+///
+/// Coordinates are cells inside the pane, not the screen, so a highlight cannot
+/// stray onto a neighbour and the text comes from the same grid it was drawn
+/// from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Selection {
+    /// Which pane, by its place in the layout.
+    pub pane: usize,
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+}
+
+impl Selection {
+    /// The ends in reading order — a drag runs backwards as readily as forwards.
+    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// Nothing was dragged: this was a click, and belongs to the agent.
+    pub fn is_click(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
 /// A short description for each live session: what it is actually about.
 ///
 /// The label wins when there is one — it is the user's own words, and it is the
@@ -409,6 +442,8 @@ pub struct AppState {
     /// A click arrives as a screen position, and turning that back into a row
     /// needs to know where the list started — rows are not a fixed height, and
     /// the list scrolls.
+    /// A drag over a pane, while it is happening and until it is copied.
+    pub selection: Option<Selection>,
     /// What amux is costing, for the footer. None until the first sample —
     /// and on a platform with no way to ask.
     pub usage: Option<crate::usage::Usage>,
@@ -473,6 +508,7 @@ impl AppState {
             browsing: false,
             pending_g: false,
             pinned: Vec::new(),
+            selection: None,
             usage: None,
             view_offset: std::cell::Cell::new(0),
             view_height: std::cell::Cell::new(20),
@@ -1303,6 +1339,47 @@ fn status_marker(status: Option<&crate::serve::server::SessionStatus>) -> (&'sta
 }
 
 /// Which stacked pane the screen row `row` falls in.
+/// The pane under a screen position: which one, and the area inside its border.
+///
+/// Both halves matter. The index ties a drag to one pane so its highlight
+/// cannot stray onto a neighbour, and the inner area is what turns a screen
+/// position into a cell in *that* pane's grid — the whole column's origin is
+/// only the right answer when there is a single pane, which is how forwarded
+/// clicks used to land in the wrong place once anything was pinned.
+fn pane_hit(
+    area: Rect,
+    pinned: usize,
+    browse: bool,
+    column: u16,
+    row: u16,
+) -> Option<(usize, Rect)> {
+    let rects = pane_rects(area, pinned, browse);
+    let rects = if rects.is_empty() { vec![area] } else { rects };
+    let index = rects.iter().position(|r| {
+        column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+    })?;
+    let r = rects[index];
+    let inner = Rect {
+        x: r.x + 1,
+        y: r.y + 1,
+        width: r.width.saturating_sub(2),
+        height: r.height.saturating_sub(2),
+    };
+    Some((index, inner))
+}
+
+/// A screen position as a cell inside `inner`, when it is in there at all.
+fn cell_in(inner: Rect, column: u16, row: u16) -> Option<(u16, u16)> {
+    if column < inner.x
+        || column >= inner.x + inner.width
+        || row < inner.y
+        || row >= inner.y + inner.height
+    {
+        return None;
+    }
+    Some((row - inner.y, column - inner.x))
+}
+
 fn pane_at(
     live: &[LiveTerm],
     area: Rect,
@@ -1363,10 +1440,14 @@ fn focused_term<'a>(live: &'a mut [LiveTerm], state: &AppState) -> Option<&'a mu
 /// crossing the window woke the loop for events it then threw away.
 ///
 /// 1000 is press and release, which is what the click handling and the wheel
-/// need. 1006 is the coordinate encoding that still works past column 223.
-const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
+/// need. 1002 adds motion while a button is down, which is a drag, and a drag
+/// over a pane is how you select text in it. 1003 — motion with no button at
+/// all — is still not asked for: nothing reads it.
+///
+/// 1006 is the coordinate encoding that still works past column 223.
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 /// Turned off in the order they were turned on, innermost first.
-const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
 /// How often amux reads its own cost. Frequent enough to answer for the moment,
 /// slow enough that the figure is readable rather than twitching.
@@ -1405,6 +1486,55 @@ fn paste_into_field(state: &mut AppState, text: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// The text a drag covers, read off the pane's own screen.
+///
+/// Linear rather than rectangular: from the anchor to the end of its row, whole
+/// rows after it, and the start of the last row up to the head — which is what
+/// selecting text means everywhere else, and what vt100 offers for exactly this
+/// purpose. Trailing blanks go, so copying a line does not bring the padding
+/// the terminal drew it with.
+fn copy_selection(live: &[LiveTerm], selection: Selection) -> Option<String> {
+    let term = live.get(selection.pane)?;
+    let ((r1, c1), (r2, c2)) = selection.ordered();
+    // The head sits *on* the last cell the pointer covered, and the end column
+    // is exclusive, so it has to include that cell.
+    let text = term.parser.screen().contents_between(r1, c1, r2, c2.saturating_add(1));
+    let trimmed: Vec<&str> = text.lines().map(|l| l.trim_end()).collect();
+    let out = trimmed.join("\n");
+    (!out.trim().is_empty()).then_some(out)
+}
+
+/// Hand `text` to the system clipboard through the terminal itself.
+///
+/// OSC 52 rather than `pbcopy`: it needs no subprocess, works the same on every
+/// platform, and keeps working when amux is on the far side of an ssh session —
+/// the terminal doing the copying is the one in front of the person.
+fn put_on_clipboard(out: &mut impl Write, text: &str) -> Result<()> {
+    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Standard base64, which is the only encoding OSC 52 accepts.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        for i in 0..4 {
+            // A short final chunk pads rather than inventing bytes it never had.
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - i * 6)) as usize & 0x3f] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Size of the terminal column, in cells, for the current frame size.
@@ -1645,12 +1775,78 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     && row > area.y
                     && row < area.y + area.height.saturating_sub(1);
                 let clicked = matches!(kind, MouseEventKind::Down(MouseButton::Left));
+                let hit = pane_hit(
+                    area,
+                    state.pinned.len(),
+                    state.has_browse_pane(),
+                    column,
+                    row,
+                );
+                // A drag over a pane is a selection, and belongs to amux rather
+                // than to the agent: the agent has no idea what is on its own
+                // screen where the pointer is, and the terminal cannot select
+                // one column of a split without taking the rest of the row.
+                if inside && !state.browsing {
+                    if let (MouseEventKind::Drag(MouseButton::Left), Some((pane, inner))) =
+                        (kind, hit)
+                    {
+                        if let Some(cell) = cell_in(inner, column, row) {
+                            match state.selection.as_mut() {
+                                Some(sel) if sel.pane == pane => sel.head = cell,
+                                _ => {}
+                            }
+                            dirty = true;
+                        }
+                        continue;
+                    }
+                    if let (MouseEventKind::Up(MouseButton::Left), Some(sel)) =
+                        (kind, state.selection)
+                    {
+                        state.selection = None;
+                        dirty = true;
+                        if sel.is_click() {
+                            // A press is only a request to type once it turns
+                            // out not to have been the start of a drag. Going
+                            // in on the press put you in insert mode for the
+                            // length of every selection, and wrote the mode
+                            // line over the one message the gesture produces.
+                            if !state.inserting {
+                                state.inserting = true;
+                                state.focus_before_insert = Some(Column::Tree);
+                                ime::resume_typing(saved_ime.take());
+                            }
+                        } else {
+                            match copy_selection(&live, sel) {
+                                Some(text) => {
+                                    let n = text.chars().count();
+                                    match put_on_clipboard(terminal.backend_mut(), &text) {
+                                        Ok(()) => {
+                                            state.notice = Some(format!("copied {n} characters"))
+                                        }
+                                        Err(why) => state.notice = Some(why.to_string()),
+                                    }
+                                }
+                                None => state.notice = Some("nothing to copy".into()),
+                            }
+                            // The drag was the gesture; the release that ends it
+                            // is not a click the agent should also see.
+                            continue;
+                        }
+                    }
+                }
                 if inside {
                     // Clicking a pane makes it the one the keyboard reaches —
                     // with several stacked, "the terminal" is otherwise
                     // whichever the tree happens to be on. Then hand the click
                     // to the agent as well, so selecting text still works.
                     if clicked {
+                        if let Some((pane, inner)) = hit {
+                            state.selection = cell_in(inner, column, row).map(|cell| Selection {
+                                pane,
+                                anchor: cell,
+                                head: cell,
+                            });
+                        }
                         if let Some(name) = pane_at(
                             &live,
                             area,
@@ -1662,15 +1858,14 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             select_session(state, &name);
                         }
                         state.focus = Column::Terminal;
-                        if !state.inserting {
-                            state.inserting = true;
-                            state.focus_before_insert = Some(Column::Tree);
-                            ime::resume_typing(saved_ime.take());
-                        }
                         dirty = true;
                     }
-                    if let Some(term) = focused_term(&mut live, state) {
-                        let bytes = encode_mouse(kind, column - area.x - 1, row - area.y - 1);
+                    // Relative to the pane, not to the column: with anything
+                    // pinned they are different places, and the agent was being
+                    // told the pointer was somewhere it never was.
+                    let cell = hit.and_then(|(_, inner)| cell_in(inner, column, row));
+                    if let (Some(term), Some((r, c))) = (focused_term(&mut live, state), cell) {
+                        let bytes = encode_mouse(kind, c, r);
                         if !bytes.is_empty() {
                             term.write(&bytes);
                         }
@@ -2794,6 +2989,7 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
             None => render_terminal(f, state, live, columns[1]),
         }
     }
+    highlight_selection(f, state, columns[1]);
 
     if let Some(pick) = &state.picking_provider {
         render_provider_picker(f, pick, outer[0]);
@@ -2931,6 +3127,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("gg / G", "first / last session"),
         ("^u ^d ^b ^f", "half and whole pages"),
         ("JK", "scroll the pane's history"),
+        ("drag", "select in a pane, copies on release"),
         ("Enter / i", "type into the selected session"),
         ("Esc", "stop typing"),
         ("^↑ ^↓", "switch sessions while typing"),
@@ -3509,6 +3706,46 @@ fn render_terminal(f: &mut Frame, state: &AppState, live: &[LiveTerm], area: Rec
     }
     for (i, rect) in rects.iter().enumerate() {
         render_one_terminal(f, state, live.get(i), *rect);
+    }
+}
+
+/// Mark the cells a drag covers, so the selection is visible while it is made.
+///
+/// Applied over the drawn pane rather than woven into it: the pane is a
+/// terminal's own screen, colours and all, and reversing the cells afterwards
+/// leaves that untouched — the same thing a terminal does to show a selection.
+fn highlight_selection(f: &mut Frame, state: &AppState, area: Rect) {
+    let Some(selection) = state.selection else { return };
+    if selection.is_click() {
+        return;
+    }
+    let rects = pane_rects(area, state.pinned.len(), state.has_browse_pane());
+    let rect = match rects.get(selection.pane) {
+        Some(r) => *r,
+        None if selection.pane == 0 => area,
+        None => return,
+    };
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    let ((r1, c1), (r2, c2)) = selection.ordered();
+    let buffer = f.buffer_mut();
+    for row in r1..=r2 {
+        if row >= inner.height {
+            break;
+        }
+        // Linear, matching what gets copied: the first row runs from the anchor
+        // to its end, the last to the head, and anything between is whole.
+        let from = if row == r1 { c1 } else { 0 };
+        let to = if row == r2 { c2 } else { inner.width.saturating_sub(1) };
+        for col in from..=to.min(inner.width.saturating_sub(1)) {
+            if let Some(cell) = buffer.cell_mut((inner.x + col, inner.y + row)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
+        }
     }
 }
 
@@ -4374,6 +4611,69 @@ mod tests {
         // not become a keystroke an agent has to deal with.
         assert!(paste_into_field(&mut state, "   \n  "));
         assert_eq!(state.renaming.as_deref(), Some("one two three"));
+    }
+
+    /// base64 has to be exactly right or the terminal silently drops the paste.
+    ///
+    /// The padding is where a hand-rolled encoder goes wrong, and the failure is
+    /// invisible: OSC 52 carries no reply, so a bad encoding is a copy that
+    /// simply did not happen.
+    #[test]
+    fn base64_matches_the_standard_including_its_padding() {
+        // The canonical vectors from RFC 4648, which exist to catch this.
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        // Bytes past ASCII, since a pane is full of them.
+        assert_eq!(base64("统一".as_bytes()), "57uf5LiA");
+    }
+
+    /// A drag runs in whichever direction the hand moves; what is copied must
+    /// not depend on that.
+    #[test]
+    fn a_selection_reads_the_same_dragged_either_way() {
+        let forward = Selection { pane: 1, anchor: (2, 5), head: (7, 9) };
+        let backward = Selection { pane: 1, anchor: (7, 9), head: (2, 5) };
+        assert_eq!(forward.ordered(), ((2, 5), (7, 9)));
+        assert_eq!(backward.ordered(), ((2, 5), (7, 9)));
+        assert_eq!(forward.ordered(), backward.ordered());
+
+        // Backwards within one row, too — the row comparison alone would miss
+        // this and copy from the later column to the earlier one.
+        let same_row = Selection { pane: 0, anchor: (3, 40), head: (3, 4) };
+        assert_eq!(same_row.ordered(), ((3, 4), (3, 40)));
+
+        // A press with no drag is a click, and belongs to the agent.
+        assert!(Selection { pane: 0, anchor: (1, 1), head: (1, 1) }.is_click());
+        assert!(!same_row.is_click());
+    }
+
+    /// A click has to land on the pane it was aimed at, in that pane's own
+    /// coordinates.
+    ///
+    /// Using the whole column's origin is right only while there is one pane;
+    /// with anything pinned the panes sit in quadrants, and a press in the
+    /// bottom-right was being reported as though it were in the top-left.
+    #[test]
+    fn a_position_maps_to_the_pane_it_is_over() {
+        let area = Rect { x: 50, y: 0, width: 100, height: 40 };
+        // Three pinned plus a browser: four quadrants.
+        let (pane, inner) = pane_hit(area, 3, true, 55, 3).expect("top-left quadrant");
+        assert_eq!(pane, 0);
+        assert_eq!(cell_in(inner, 55, 3), Some((2, 4)));
+
+        let (pane, inner) = pane_hit(area, 3, true, 145, 35).expect("bottom-right quadrant");
+        assert_eq!(pane, 3, "a press in the last quadrant named the first");
+        // Well inside that quadrant, so small and not near a hundred-odd.
+        let (row, col) = cell_in(inner, 145, 35).expect("inside its border");
+        assert!(row < 20 && col < 50, "reported as {row},{col} — the column's origin, not the pane's");
+
+        // The border itself is not a cell of the grid.
+        assert_eq!(cell_in(inner, inner.x + inner.width, 35), None);
     }
 
     /// A path too long for the popup must lose its *front*. The tail is what
