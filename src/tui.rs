@@ -442,6 +442,9 @@ pub struct AppState {
     /// A click arrives as a screen position, and turning that back into a row
     /// needs to know where the list started — rows are not a fixed height, and
     /// the list scrolls.
+    /// What the pane that follows the cursor is showing. Held across a move
+    /// back onto a pinned session, so the layout does not flicker.
+    pub browsing_session: Option<String>,
     /// A drag over a pane, while it is happening and until it is copied.
     pub selection: Option<Selection>,
     /// What amux is costing, for the footer. None until the first sample —
@@ -508,6 +511,7 @@ impl AppState {
             browsing: false,
             pending_g: false,
             pinned: Vec::new(),
+            browsing_session: None,
             selection: None,
             usage: None,
             view_offset: std::cell::Cell::new(0),
@@ -717,12 +721,48 @@ impl AppState {
     /// showing one session twice wastes the space that made pinning worth it.
     pub fn visible_sessions(&self) -> Vec<String> {
         let mut out = self.pinned.clone();
-        if let Some(current) = self.current_name() {
-            if !out.contains(&current) {
-                out.push(current);
+        // Whatever the following pane last settled on, or — before it has
+        // settled on anything — whatever the cursor is on.
+        let follow = self.browsing_session.clone().or_else(|| self.current_name());
+        if let Some(name) = follow {
+            if !out.contains(&name) {
+                out.push(name);
             }
         }
         out
+    }
+
+    /// Remember what the following pane is showing.
+    ///
+    /// It follows the cursor onto anything not already held — but it does not
+    /// empty when the cursor moves *back* onto something held. It used to: the
+    /// pane existed only while the cursor sat on an unpinned session, so
+    /// glancing at a pinned one tore the pane down and rebuilt it a moment
+    /// later, and the whole column reflowed twice for a keystroke that was
+    /// meant to change nothing.
+    pub fn follow_cursor(&mut self) {
+        if let Some(current) = self.current_name() {
+            if !self.pinned.contains(&current) {
+                self.browsing_session = Some(current);
+            }
+        }
+    }
+
+    /// Forget what the following pane was showing once that session is gone,
+    /// so it does not hold a pane open on nothing.
+    ///
+    /// Pinning it needs no such care: the visible list already refuses to name
+    /// the same session twice, and keeping it means unpinning puts it back
+    /// where you left it.
+    pub fn prune_browsing(&mut self) {
+        let Some(name) = self.browsing_session.as_ref() else { return };
+        let live = self
+            .projects
+            .iter()
+            .any(|p| p.sessions.iter().any(|s| s.name == *name));
+        if !live {
+            self.browsing_session = None;
+        }
     }
 
     /// Whether the browsing pane is showing something of its own.
@@ -1612,6 +1652,8 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
 
     let result = loop {
         state.clamp();
+        state.prune_browsing();
+        state.follow_cursor();
 
         // Attach to whatever is in view, and drop terminals that no longer are.
         let wanted = state.visible_sessions();
@@ -5280,6 +5322,74 @@ mod tests {
         state.cursor = state.first_selectable();
         state.toggle_pin().unwrap();
         assert!(state.pinned.is_empty());
+    }
+
+    /// Glancing back at a held session must not tear down the pane beside it.
+    ///
+    /// The following pane used to exist only while the cursor sat on something
+    /// unpinned, so moving onto a pin dropped it — three panes became two,
+    /// every remaining pane was re-laid-out and re-attached, and then the next
+    /// move put it all back. Nothing about what you were looking at had
+    /// changed; the column just flickered.
+    #[test]
+    fn the_following_pane_keeps_its_session_when_the_cursor_returns_to_a_pin() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+
+        // Hold the first two.
+        let a = state.current_name().unwrap();
+        state.toggle_pin().unwrap();
+        state.move_down();
+        let b = state.current_name().unwrap();
+        state.toggle_pin().unwrap();
+        assert_eq!(state.pinned, vec![a.clone(), b.clone()]);
+
+        // Look at a third: three panes.
+        state.move_down();
+        state.follow_cursor();
+        let c = state.current_name().unwrap();
+        assert_ne!(c, a);
+        assert_ne!(c, b);
+        assert_eq!(state.visible_sessions(), vec![a.clone(), b.clone(), c.clone()]);
+        assert!(state.has_browse_pane());
+
+        // Back onto the held ones — the third pane stays, still showing c.
+        state.cursor = state.first_selectable();
+        state.follow_cursor();
+        assert_eq!(state.current_name().as_deref(), Some(a.as_str()));
+        assert_eq!(
+            state.visible_sessions(),
+            vec![a.clone(), b.clone(), c.clone()],
+            "moving onto a pinned session collapsed the layout"
+        );
+
+        state.move_down();
+        state.follow_cursor();
+        assert_eq!(state.current_name().as_deref(), Some(b.as_str()));
+        assert_eq!(state.visible_sessions(), vec![a.clone(), b.clone(), c.clone()]);
+
+        // A different unpinned session does replace it — following the cursor
+        // is still what the pane is for; it just does not empty on the way.
+        state.pinned = vec![a.clone()];
+        state.cursor = state.first_selectable();
+        state.move_down();
+        state.follow_cursor();
+        assert_eq!(state.current_name().as_deref(), Some(b.as_str()));
+        assert_eq!(state.browsing_session.as_deref(), Some(b.as_str()));
+        assert_eq!(state.visible_sessions(), vec![a.clone(), b.clone()]);
+
+        // Pinning what the pane was showing must not list it twice.
+        state.browsing_session = Some(c.clone());
+        state.pinned = vec![a.clone(), b.clone(), c.clone()];
+        state.prune_browsing();
+        assert_eq!(state.visible_sessions(), vec![a.clone(), b.clone(), c.clone()]);
+        assert!(!state.has_browse_pane());
+
+        // A session that has died stops holding a pane open on nothing.
+        state.pinned = vec![a.clone()];
+        state.browsing_session = Some("cc_gone_00000000".into());
+        state.prune_browsing();
+        assert_eq!(state.browsing_session, None);
     }
 
     /// Three is the cap: a fourth would leave every pane too narrow to read.
