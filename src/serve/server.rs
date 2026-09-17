@@ -506,7 +506,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         )
         .route("/api/auto/status", get(api_auto_status))
         .route("/api/auto/enable", post(api_auto_enable))
-        .route("/api/cron/enable", post(api_cron_enable))
+        .route("/api/timer/enable", post(api_timer_enable))
         .route("/api/auto/disable", post(api_auto_disable))
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
@@ -1151,7 +1151,10 @@ pub(crate) fn session_statuses() -> std::collections::BTreeMap<String, SessionSt
                     .ok()
                     .map(|t| t.timestamp()),
             },
-            None => SessionStatus { status: inferred, since: None },
+            None => SessionStatus {
+                status: inferred,
+                since: None,
+            },
         };
 
         // Several panes can share a session; the busiest one describes it.
@@ -1391,8 +1394,17 @@ fn claude_idle_ready(tail: &str) -> bool {
     let yn = contains_any(
         &low,
         &[
-            "yes/no", "(y/n)", " y/n", "proceed?", "do you want", "allow once",
-            "allow always", "yes, continue", "no, skip", "1. yes", "2. no",
+            "yes/no",
+            "(y/n)",
+            " y/n",
+            "proceed?",
+            "do you want",
+            "allow once",
+            "allow always",
+            "yes, continue",
+            "no, skip",
+            "1. yes",
+            "2. no",
         ],
     );
     composer && prompt && !yn && !agent_actively_working(tail)
@@ -1587,9 +1599,7 @@ fn activity_fingerprint(tail: &str) -> String {
             .replace(['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'], "")
             .trim()
             .to_string();
-        if line.is_empty()
-            || line.chars().all(|ch| "╭╮╰╯│─ ".contains(ch))
-            || line.starts_with('›')
+        if line.is_empty() || line.chars().all(|ch| "╭╮╰╯│─ ".contains(ch)) || line.starts_with('›')
         {
             continue;
         }
@@ -2479,7 +2489,9 @@ fn build_snapshot() -> Snapshot {
                 // Idle/Waiting at turn-end, but the agent may have started a new
                 // turn since. If the pane is live-working right now, trust that
                 // over the stale hook so a running task isn't shown as done.
-                Some(_) if agent_actively_working(&tail) => (inferred_status, inferred_reason, None),
+                Some(_) if agent_actively_working(&tail) => {
+                    (inferred_status, inferred_reason, None)
+                }
                 // Stale claude-notification: Claude finished its turn and is back
                 // at the idle input prompt (shows "/clear to save … tokens"),
                 // but the Waiting hook was never cleared. The stranded status
@@ -2775,7 +2787,7 @@ fn broadcast_snapshot(state: &AppState) -> Snapshot {
     // Auto mode reads the statuses `build_snapshot` just computed, so it runs
     // alongside the pending-message flush rather than on its own timer.
     auto_tick(state, &snapshot.panes);
-    cron_tick(state, &snapshot.panes);
+    timer_tick(state, &snapshot.panes);
     // Full build: fire status-change push notifications for phone-initiated turns.
     #[cfg(feature = "full")]
     crate::serve::full::push::notify_status_changes(&snapshot.panes);
@@ -2873,7 +2885,11 @@ fn spawn_snapshot_loop(state: AppState) {
     });
 }
 
-pub(crate) fn is_authed(state: &AppState, headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
+pub(crate) fn is_authed(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+) -> bool {
     if state.token.is_empty() {
         return true;
     }
@@ -2976,16 +2992,22 @@ async fn api_capabilities(
     // `enabled` is the one field that can differ from the cached probe if the
     // flag were toggled, so refresh it rather than serving a stale value.
     if let Some(h) = body.get_mut("herdr").and_then(|h| h.as_object_mut()) {
-        h.insert(
-            "enabled".to_string(),
-            json!(crate::serve::herdr::enabled()),
-        );
+        h.insert("enabled".to_string(), json!(crate::serve::herdr::enabled()));
     }
     // The relay binds after the cached probe, so this would otherwise be null.
     if let Some(d) = body.get_mut("dsh").and_then(|d| d.as_object_mut()) {
-        d.insert("relayPort".to_string(), json!(crate::serve::dsh::relay_port()));
-        d.insert("relayTls".to_string(), json!(crate::serve::dsh::tls_enabled()));
-        d.insert("relayHost".to_string(), json!(crate::serve::dsh::tls_host()));
+        d.insert(
+            "relayPort".to_string(),
+            json!(crate::serve::dsh::relay_port()),
+        );
+        d.insert(
+            "relayTls".to_string(),
+            json!(crate::serve::dsh::tls_enabled()),
+        );
+        d.insert(
+            "relayHost".to_string(),
+            json!(crate::serve::dsh::tls_host()),
+        );
     }
     json_response(StatusCode::OK, json!({ "ok": true, "capabilities": body }))
 }
@@ -3017,7 +3039,10 @@ async fn api_usb_screenshot(
         return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
     }
     let Some(serial) = query.get("serial").filter(|s| !s.is_empty()) else {
-        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "serial is required" }));
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "serial is required" }),
+        );
     };
     match crate::serve::usb::screenshot(serial) {
         Ok((bytes, content_type)) => Response::builder()
@@ -3201,7 +3226,10 @@ async fn api_files_roots(
     if !is_authed(&state, &headers, &query) {
         return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
     }
-    json_response(StatusCode::OK, json!({ "ok": true, "roots": browsable_roots() }))
+    json_response(
+        StatusCode::OK,
+        json!({ "ok": true, "roots": browsable_roots() }),
+    )
 }
 
 async fn api_files_list(
@@ -3217,10 +3245,7 @@ async fn api_files_list(
     let roots = browsable_roots();
     match crate::serve::files::resolve_within(&path, &roots) {
         Ok((dir, root)) => match crate::serve::files::list(&dir, &root, show_all) {
-            Ok(listing) => json_response(
-                StatusCode::OK,
-                json!({ "ok": true, "listing": listing }),
-            ),
+            Ok(listing) => json_response(StatusCode::OK, json!({ "ok": true, "listing": listing })),
             Err(error) => files_error(error),
         },
         Err(error) => files_error(error),
@@ -3312,7 +3337,10 @@ async fn api_files_download(
 
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, crate::serve::files::content_type_for(&file))
+        .header(
+            header::CONTENT_TYPE,
+            crate::serve::files::content_type_for(&file),
+        )
         .header(header::CONTENT_LENGTH, meta.len())
         .header(header::CONTENT_DISPOSITION, disposition)
         .body(Body::from_stream(stream))
@@ -3390,7 +3418,10 @@ async fn api_cron_log(
         return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
     }
     let Some(id) = query.get("id").filter(|v| !v.is_empty()) else {
-        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "id is required" }));
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "id is required" }),
+        );
     };
     match crate::serve::cron::job_log(id) {
         Ok((id, logs)) => json_response(
@@ -3419,7 +3450,10 @@ async fn api_cron_action(
         return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
     }
     if body.id.is_empty() {
-        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "id is required" }));
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "id is required" }),
+        );
     }
     let result = match body.action.as_str() {
         "enable" => crate::serve::cron::enable(&body.id),
@@ -3516,7 +3550,9 @@ fn enqueue_pending(pane_id: &str, text: &str, enter: bool, vim_mode: bool) -> us
         enter,
         vim_mode,
     };
-    let mut queues = PENDING_MESSAGES.lock().expect("pending messages mutex poisoned");
+    let mut queues = PENDING_MESSAGES
+        .lock()
+        .expect("pending messages mutex poisoned");
     let queue = queues.entry(pane_id.to_string()).or_default();
     queue.push(message);
     queue.len()
@@ -3549,7 +3585,9 @@ fn flush_pending_messages(state: &AppState, panes: &[Pane]) {
             }
         }
         let message = {
-            let mut queues = PENDING_MESSAGES.lock().expect("pending messages mutex poisoned");
+            let mut queues = PENDING_MESSAGES
+                .lock()
+                .expect("pending messages mutex poisoned");
             match queues.get_mut(&pane.id) {
                 Some(list) if !list.is_empty() => Some(list.remove(0)),
                 _ => None,
@@ -3563,7 +3601,10 @@ fn flush_pending_messages(state: &AppState, panes: &[Pane]) {
         // below doesn't apply to them.
         if crate::serve::herdr::owns(&pane.id) {
             if let Err(error) = crate::serve::herdr::send(&pane.id, &message.text, message.enter) {
-                eprintln!("[pending] herdr send failed for {}: {error}; re-queued", pane.id);
+                eprintln!(
+                    "[pending] herdr send failed for {}: {error}; re-queued",
+                    pane.id
+                );
                 PENDING_MESSAGES
                     .lock()
                     .expect("pending messages mutex poisoned")
@@ -3679,30 +3720,30 @@ pub(crate) const MIN_EVERY_SECS: u32 = 60;
 /// Sits beside [`auto_tick`] and shares its delivery path, including the rule
 /// that Codex submits with Tab. The difference is the decision: auto asks a
 /// model what to say, a schedule already knows.
-fn cron_tick(state: &AppState, panes: &[Pane]) {
+fn timer_tick(state: &AppState, panes: &[Pane]) {
     for pane in panes {
-        let Some(config) = crate::store::cron_get(&pane.session) else {
+        let Some(config) = crate::store::timer_get(&pane.session) else {
             continue;
         };
         if !config.enabled {
             continue;
         }
-        if !cron_is_due(&config.last_run_at, config.every_secs) {
+        if !timer_is_due(&config.last_run_at, config.every_secs) {
             continue;
         }
 
-        match cron_action(&pane.status, pane_has_pending(&pane.id)) {
-            CronAction::Skip(why) => {
-                crate::store::cron_mark_skipped(&pane.session);
+        match timer_action(&pane.status, pane_has_pending(&pane.id)) {
+            TimerAction::Skip(why) => {
+                crate::store::timer_mark_skipped(&pane.session);
                 eprintln!("[cron] {} — {why}; this run is skipped", pane.session);
                 continue;
             }
-            CronAction::Send => {}
+            TimerAction::Send => {}
         }
 
         match auto_deliver(pane, &config.prompt) {
             Ok(()) => {
-                crate::store::cron_mark_run(&pane.session);
+                crate::store::timer_mark_run(&pane.session);
                 let _ = state.pane_log_refreshes.send(pane.id.clone());
                 eprintln!(
                     "[cron] sent to {} — {}",
@@ -3719,7 +3760,7 @@ fn cron_tick(state: &AppState, panes: &[Pane]) {
 
 /// What to do with a run that has come due.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CronAction {
+pub(crate) enum TimerAction {
     Send,
     /// Dropped, not deferred — with a reason for the log.
     Skip(&'static str),
@@ -3732,21 +3773,21 @@ pub(crate) enum CronAction {
 /// one run instead of earning a burst of them the moment it goes quiet.
 ///
 /// A pane with something already typed into it belongs to whoever typed it.
-pub(crate) fn cron_action(status: &PaneStatus, has_pending: bool) -> CronAction {
+pub(crate) fn timer_action(status: &PaneStatus, has_pending: bool) -> TimerAction {
     if *status == PaneStatus::Running {
-        return CronAction::Skip("the agent is working");
+        return TimerAction::Skip("the agent is working");
     }
     if has_pending {
-        return CronAction::Skip("something is already queued in that pane");
+        return TimerAction::Skip("something is already queued in that pane");
     }
-    CronAction::Send
+    TimerAction::Send
 }
 
 /// Whether `every_secs` have passed since `last_run_at`.
 ///
 /// An unparseable or empty stamp reads as due — a row that lost its clock
 /// should start ticking again rather than sit there forever.
-pub(crate) fn cron_is_due(last_run_at: &str, every_secs: u32) -> bool {
+pub(crate) fn timer_is_due(last_run_at: &str, every_secs: u32) -> bool {
     let Ok(last) = chrono::DateTime::parse_from_rfc3339(last_run_at) else {
         return true;
     };
@@ -3755,7 +3796,7 @@ pub(crate) fn cron_is_due(last_run_at: &str, every_secs: u32) -> bool {
 }
 
 #[cfg(test)]
-mod cron_tests {
+mod timer_tests {
     use super::*;
 
     /// The clock decides, and it decides from the last real send.
@@ -3766,14 +3807,23 @@ mod cron_tests {
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         };
 
-        assert!(!cron_is_due(&stamp(10), 900), "ten seconds into a 15-minute schedule");
-        assert!(!cron_is_due(&stamp(899), 900), "one second short is not due");
-        assert!(cron_is_due(&stamp(901), 900), "past the interval and still not due");
+        assert!(
+            !timer_is_due(&stamp(10), 900),
+            "ten seconds into a 15-minute schedule"
+        );
+        assert!(
+            !timer_is_due(&stamp(899), 900),
+            "one second short is not due"
+        );
+        assert!(
+            timer_is_due(&stamp(901), 900),
+            "past the interval and still not due"
+        );
 
         // A row with no clock, or with a stamp nothing can read, starts ticking
         // rather than sitting there forever.
-        assert!(cron_is_due("", 900));
-        assert!(cron_is_due("not a timestamp", 900));
+        assert!(timer_is_due("", 900));
+        assert!(timer_is_due("not a timestamp", 900));
     }
 
     /// A run that comes due while the agent is working is dropped, not queued.
@@ -3785,20 +3835,20 @@ mod cron_tests {
     /// half-written file.
     #[test]
     fn a_due_run_waits_for_the_agent_to_stop() {
-        assert_eq!(cron_action(&PaneStatus::Idle, false), CronAction::Send);
-        assert_eq!(cron_action(&PaneStatus::Waiting, false), CronAction::Send);
-        assert_eq!(cron_action(&PaneStatus::Done, false), CronAction::Send);
-        assert_eq!(cron_action(&PaneStatus::Failed, false), CronAction::Send);
+        assert_eq!(timer_action(&PaneStatus::Idle, false), TimerAction::Send);
+        assert_eq!(timer_action(&PaneStatus::Waiting, false), TimerAction::Send);
+        assert_eq!(timer_action(&PaneStatus::Done, false), TimerAction::Send);
+        assert_eq!(timer_action(&PaneStatus::Failed, false), TimerAction::Send);
 
         assert!(matches!(
-            cron_action(&PaneStatus::Running, false),
-            CronAction::Skip(_)
+            timer_action(&PaneStatus::Running, false),
+            TimerAction::Skip(_)
         ));
         // And whatever the agent is doing, a pane someone has already typed
         // into is theirs.
         assert!(matches!(
-            cron_action(&PaneStatus::Idle, true),
-            CronAction::Skip(_)
+            timer_action(&PaneStatus::Idle, true),
+            TimerAction::Skip(_)
         ));
     }
 
@@ -3814,9 +3864,12 @@ mod cron_tests {
             (chrono::Utc::now() - chrono::Duration::seconds(ago))
                 .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         };
-        assert!(!cron_is_due(&stamp(5), 1), "a one-second schedule fired");
-        assert!(!cron_is_due(&stamp(30), 10), "a ten-second schedule fired");
-        assert!(cron_is_due(&stamp(61), 1), "still held back past the floor");
+        assert!(!timer_is_due(&stamp(5), 1), "a one-second schedule fired");
+        assert!(!timer_is_due(&stamp(30), 10), "a ten-second schedule fired");
+        assert!(
+            timer_is_due(&stamp(61), 1),
+            "still held back past the floor"
+        );
     }
 }
 
@@ -3871,7 +3924,9 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
         }
 
         {
-            let in_flight = AUTO_IN_FLIGHT.lock().expect("auto in-flight mutex poisoned");
+            let in_flight = AUTO_IN_FLIGHT
+                .lock()
+                .expect("auto in-flight mutex poisoned");
             if in_flight.contains_key(&pane.id) {
                 continue;
             }
@@ -3912,12 +3967,13 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
                     // The user may have taken over while the model was thinking
                     // (started typing, or queued a message). Their turn wins.
                     let still_stopped = cached_pane_status(&pane.id)
-                        == Some(if waiting { PaneStatus::Waiting } else { PaneStatus::Idle });
+                        == Some(if waiting {
+                            PaneStatus::Waiting
+                        } else {
+                            PaneStatus::Idle
+                        });
                     if !still_stopped || pane_has_pending(&pane.id) {
-                        eprintln!(
-                            "[auto] {} moved on before the decision; skipping",
-                            pane.id
-                        );
+                        eprintln!("[auto] {} moved on before the decision; skipping", pane.id);
                     } else {
                         match auto_deliver(&pane, &message) {
                             Ok(()) => {
@@ -3951,7 +4007,10 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
                 crate::serve::auto::Decision::Stop(reason) => {
                     crate::store::auto_disable(&pane.session);
                     if reason.is_empty() {
-                        eprintln!("[auto] stopped {} — model saw nothing left to do", pane.session);
+                        eprintln!(
+                            "[auto] stopped {} — model saw nothing left to do",
+                            pane.session
+                        );
                     } else {
                         eprintln!("[auto] stopped {} — model: {reason}", pane.session);
                     }
@@ -3972,7 +4031,9 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
 }
 
 fn pending_list_json(pane_id: &str) -> serde_json::Value {
-    let queues = PENDING_MESSAGES.lock().expect("pending messages mutex poisoned");
+    let queues = PENDING_MESSAGES
+        .lock()
+        .expect("pending messages mutex poisoned");
     let messages = queues.get(pane_id).cloned().unwrap_or_default();
     json!({
         "ok": true,
@@ -4009,10 +4070,15 @@ async fn api_pending_update(
         return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
     }
     if body.text.len() > 4000 {
-        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "text is too long" }));
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "text is too long" }),
+        );
     }
     let found = {
-        let mut queues = PENDING_MESSAGES.lock().expect("pending messages mutex poisoned");
+        let mut queues = PENDING_MESSAGES
+            .lock()
+            .expect("pending messages mutex poisoned");
         queues
             .get_mut(&body.pane_id)
             .and_then(|list| list.iter_mut().find(|m| m.id == body.id))
@@ -4038,7 +4104,9 @@ async fn api_pending_delete(
         return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
     }
     {
-        let mut queues = PENDING_MESSAGES.lock().expect("pending messages mutex poisoned");
+        let mut queues = PENDING_MESSAGES
+            .lock()
+            .expect("pending messages mutex poisoned");
         if let Some(list) = queues.get_mut(&body.pane_id) {
             list.retain(|m| m.id != body.id);
         }
@@ -4070,7 +4138,7 @@ async fn api_pending_clear(
 /// `POST /api/cron/enable` — put a session on a schedule, or take it off one.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CronRequest {
+struct TimerRequest {
     #[serde(default)]
     session: Option<String>,
     #[serde(default)]
@@ -4128,11 +4196,11 @@ async fn api_auto_status(
     )
 }
 
-async fn api_cron_enable(
+async fn api_timer_enable(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
-    Json(body): Json<CronRequest>,
+    Json(body): Json<TimerRequest>,
 ) -> Response<Body> {
     if !is_authed(&state, &headers, &query) {
         return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
@@ -4146,34 +4214,40 @@ async fn api_cron_enable(
     };
 
     if body.enabled == Some(false) {
-        crate::store::cron_disable(&session);
+        crate::store::timer_disable(&session);
         return json_response(
             StatusCode::OK,
-            json!({ "ok": true, "session": session, "config": crate::store::cron_get(&session) }),
+            json!({ "ok": true, "session": session, "config": crate::store::timer_get(&session) }),
         );
     }
 
     // An empty prompt would schedule a bare Enter, which is not a task.
     let prompt = body.prompt.trim();
     if prompt.is_empty() {
-        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "prompt is required" }));
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "prompt is required" }),
+        );
     }
     if prompt.chars().count() > 4000 {
-        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "prompt is too long" }));
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "prompt is too long" }),
+        );
     }
     let every = body
         .every_secs
         .unwrap_or(1800)
         .clamp(MIN_EVERY_SECS, 24 * 60 * 60);
 
-    let stored = crate::store::cron_enable(&session, prompt, every);
+    let stored = crate::store::timer_enable(&session, prompt, every);
     json_response(
         StatusCode::OK,
         json!({
             "ok": true,
             "session": session,
             "stored": stored,
-            "config": crate::store::cron_get(&session),
+            "config": crate::store::timer_get(&session),
         }),
     )
 }
@@ -4207,8 +4281,12 @@ async fn api_auto_enable(
         .max_turns
         .unwrap_or(crate::serve::auto::DEFAULT_MAX_TURNS)
         .clamp(1, 100);
-    let stored =
-        crate::store::auto_enable(&session, goal, max_turns, body.allow_waiting.unwrap_or(false));
+    let stored = crate::store::auto_enable(
+        &session,
+        goal,
+        max_turns,
+        body.allow_waiting.unwrap_or(false),
+    );
     json_response(
         StatusCode::OK,
         json!({
@@ -5692,12 +5770,14 @@ async fn handle_pane_log_socket(
         .ok()
         .and_then(|panes| panes.into_iter().find(|pane| pane.id == pane_id))
     {
-        Some(pane) if session_agent_name(&pane.session) == Some("opencode") => LogSource::Opencode {
-            session: pane.session,
-            cwd: pane.path,
-            cached: String::new(),
-            built_at: None,
-        },
+        Some(pane) if session_agent_name(&pane.session) == Some("opencode") => {
+            LogSource::Opencode {
+                session: pane.session,
+                cwd: pane.path,
+                cached: String::new(),
+                built_at: None,
+            }
+        }
         _ => LogSource::Terminal,
     };
 
@@ -6042,7 +6122,9 @@ mod tests {
         let agents = crate::config::builtin_agents();
         for name in ["claude", "codex"] {
             let expected = crate::tmux::shell_join(
-                &crate::config::find(&agents, name).expect("builtin agent").command,
+                &crate::config::find(&agents, name)
+                    .expect("builtin agent")
+                    .command,
             );
             assert_eq!(
                 agent_launch_command(name).expect("known agent"),
@@ -6082,7 +6164,12 @@ mod tests {
 
     #[test]
     fn stale_session_file_means_idle() {
-        let (s, _) = infer_status(&pane("cx_proj_1a2b3c4d"), "just some quiet output", false, Some(600.0));
+        let (s, _) = infer_status(
+            &pane("cx_proj_1a2b3c4d"),
+            "just some quiet output",
+            false,
+            Some(600.0),
+        );
         assert_eq!(s, PaneStatus::Idle);
     }
 
@@ -6098,13 +6185,23 @@ mod tests {
     #[test]
     fn permission_prompt_always_waiting() {
         // Even with a fresh file, an on-screen prompt wins (needs the user).
-        let (s, _) = infer_status(&pane("cc_proj_1a2b3c4d"), "Do you want to proceed? (y/n)", false, Some(1.0));
+        let (s, _) = infer_status(
+            &pane("cc_proj_1a2b3c4d"),
+            "Do you want to proceed? (y/n)",
+            false,
+            Some(1.0),
+        );
         assert_eq!(s, PaneStatus::Waiting);
     }
 
     #[test]
     fn error_output_means_failed() {
-        let (s, _) = infer_status(&pane("cx_proj_1a2b3c4d"), "thread panicked\nerror: boom", false, Some(1.0));
+        let (s, _) = infer_status(
+            &pane("cx_proj_1a2b3c4d"),
+            "thread panicked\nerror: boom",
+            false,
+            Some(1.0),
+        );
         assert_eq!(s, PaneStatus::Failed);
     }
 
@@ -6123,19 +6220,32 @@ mod tests {
              • Working (3m 51s • esc to interrupt) · 2 background terminals running · /stop to close\n\
              › Explain this codebase";
         let (s, _) = infer_status(&p, echoed_tool_call, false, None);
-        assert_eq!(s, PaneStatus::Running, "tool-call echo must not read as a prompt");
+        assert_eq!(
+            s,
+            PaneStatus::Running,
+            "tool-call echo must not read as a prompt"
+        );
 
         let startup_warning = "ConnectionRefusedError: [Errno 61] Connection refused\n\
              ⚠ MCP startup incomplete (failed: ida-pro-mcp)\n\
              • Working (12s • esc to interrupt) · /stop to close";
         let (s, _) = infer_status(&p, startup_warning, false, None);
-        assert_eq!(s, PaneStatus::Running, "start-up warning must not latch Failed");
+        assert_eq!(
+            s,
+            PaneStatus::Running,
+            "start-up warning must not latch Failed"
+        );
 
         // Without the spinner the prompt still wins — a real confirmation
         // replaces the spinner rather than sitting beside it.
         let (s, _) = infer_status(&p, "Do you want to proceed?", false, None);
         assert_eq!(s, PaneStatus::Waiting);
-        let (s, _) = infer_status(&p, "ConnectionRefusedError: [Errno 61] refused", false, None);
+        let (s, _) = infer_status(
+            &p,
+            "ConnectionRefusedError: [Errno 61] refused",
+            false,
+            None,
+        );
         assert_eq!(s, PaneStatus::Failed);
     }
 
@@ -6144,9 +6254,15 @@ mod tests {
         // A Claude pane whose terminal is full of "codex"/"gpt-" must still be
         // classified as claude, so status looks at the right session file.
         let cc = pane("cc_proj_1a2b3c4d");
-        assert_eq!(agent_kind_for_pane(&cc, "talking about codex and gpt-5"), Some("claude"));
+        assert_eq!(
+            agent_kind_for_pane(&cc, "talking about codex and gpt-5"),
+            Some("claude")
+        );
         let cx = pane("cx_proj_1a2b3c4d");
-        assert_eq!(agent_kind_for_pane(&cx, "mentions claude a lot"), Some("codex"));
+        assert_eq!(
+            agent_kind_for_pane(&cx, "mentions claude a lot"),
+            Some("codex")
+        );
     }
 
     #[test]
@@ -6175,7 +6291,10 @@ mod tests {
     #[test]
     fn every_configured_agent_is_recognised_by_its_prefix() {
         let pi = pane("p_proj_1a2b3c4d");
-        assert_eq!(agent_kind_for_pane(&pi, "about gpt-5 and claude"), Some("pi"));
+        assert_eq!(
+            agent_kind_for_pane(&pi, "about gpt-5 and claude"),
+            Some("pi")
+        );
         // A known non-codex agent must not be sniffed into codex.
         assert!(!is_codex_pane(&pi, "about gpt-5 and codex"));
         assert!(!pane_is_claude(&pi.session, &pi.command, &pi.title));
@@ -6192,7 +6311,10 @@ mod tests {
         // A name amux did not produce still falls back to content sniffing.
         // (codex sniffing reads the tail; claude's reads session/command/title.)
         let stray = pane("randomshell");
-        assert_eq!(agent_kind_for_pane(&stray, "codex is running"), Some("codex"));
+        assert_eq!(
+            agent_kind_for_pane(&stray, "codex is running"),
+            Some("codex")
+        );
         let stray_cc = pane("my-claude-shell");
         assert_eq!(agent_kind_for_pane(&stray_cc, ""), Some("claude"));
     }
@@ -6205,7 +6327,10 @@ mod tests {
         let name = project_session_name("pi", "/tmp").expect("pi is configured");
         assert!(name.starts_with("p_"), "expected a p_ session, got {name}");
         let name = project_session_name("codex", "/tmp").expect("codex is configured");
-        assert!(name.starts_with("cx_"), "expected a cx_ session, got {name}");
+        assert!(
+            name.starts_with("cx_"),
+            "expected a cx_ session, got {name}"
+        );
         assert!(project_session_name("nosuchagent", "/tmp").is_err());
     }
 
@@ -6214,7 +6339,9 @@ mod tests {
     #[test]
     fn launch_command_covers_agents_without_an_env_override() {
         assert_eq!(agent_launch_command("pi").unwrap(), "pi");
-        assert!(agent_launch_command("claude").unwrap().starts_with("claude"));
+        assert!(agent_launch_command("claude")
+            .unwrap()
+            .starts_with("claude"));
         assert!(agent_launch_command("nosuchagent").is_err());
     }
 
@@ -6237,7 +6364,10 @@ mod tests {
         let (status, reason, since) = hook_status_for_pane(&pane).unwrap();
         assert_eq!(status, PaneStatus::Done);
         assert_eq!(reason, "hook says complete");
-        assert!(since.is_some(), "a hook event carries the moment it happened");
+        assert!(
+            since.is_some(),
+            "a hook event carries the moment it happened"
+        );
 
         std::env::remove_var("AMUX_STATE_DIR");
     }

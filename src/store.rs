@@ -107,7 +107,7 @@ fn open(path: &std::path::Path) -> Option<Connection> {
             enabled       INTEGER NOT NULL DEFAULT 0,
             updated_at    TEXT NOT NULL DEFAULT ''
         );
-        CREATE TABLE IF NOT EXISTS cron (
+        CREATE TABLE IF NOT EXISTS timer (
             session     TEXT PRIMARY KEY,
             prompt      TEXT NOT NULL DEFAULT '',
             every_secs  INTEGER NOT NULL DEFAULT 1800,
@@ -171,7 +171,13 @@ pub fn projects() -> Vec<ProjectRow> {
 }
 
 /// Insert or update one project, leaving any alias the user has set alone.
-pub fn upsert_project(path: &str, name: &str, last_agent: &str, last_seen_at: &str, launch_count: u32) {
+pub fn upsert_project(
+    path: &str,
+    name: &str,
+    last_agent: &str,
+    last_seen_at: &str,
+    launch_count: u32,
+) {
     with_db(|conn| {
         conn.execute(
             "INSERT INTO projects (path, name, alias, last_agent, last_seen_at, launch_count)
@@ -216,7 +222,10 @@ pub fn replace_projects(rows: &[ProjectRow]) {
         }
         // Rebuilding the keep-set as a temp table avoids an IN clause whose
         // length grows with the project count.
-        tx.execute("CREATE TEMP TABLE IF NOT EXISTS keep (path TEXT PRIMARY KEY)", [])?;
+        tx.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS keep (path TEXT PRIMARY KEY)",
+            [],
+        )?;
         tx.execute("DELETE FROM keep", [])?;
         for row in rows {
             tx.execute("INSERT OR IGNORE INTO keep (path) VALUES (?1)", [&row.path])?;
@@ -262,8 +271,8 @@ fn basename(path: &str) -> String {
 
 pub fn labels() -> BTreeMap<String, String> {
     with_db(|conn| {
-        let mut stmt =
-            conn.prepare("SELECT name, label FROM sessions WHERE label IS NOT NULL AND label <> ''")?;
+        let mut stmt = conn
+            .prepare("SELECT name, label FROM sessions WHERE label IS NOT NULL AND label <> ''")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -434,9 +443,9 @@ pub fn auto_list() -> Vec<AutoConfig> {
 /// Arm auto mode, resetting the turn counter so a re-armed goal starts fresh.
 /// Returns false when the database could not be opened (nothing was written).
 pub fn auto_enable(session: &str, goal: &str, max_turns: u32, allow_waiting: bool) -> bool {
-    // The other half of the rule in `cron_enable`: one session, one thing
+    // The other half of the rule in `timer_enable`: one session, one thing
     // typing into it.
-    cron_disable(session);
+    timer_disable(session);
     with_db(|conn| {
         conn.execute(
             "INSERT INTO auto (session, goal, max_turns, used, allow_waiting, enabled, updated_at)
@@ -459,7 +468,7 @@ pub fn auto_enable(session: &str, goal: &str, max_turns: u32, allow_waiting: boo
 /// A session's schedule: what to send, and how often.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CronConfig {
+pub struct TimerConfig {
     pub session: String,
     pub prompt: String,
     pub every_secs: u32,
@@ -475,8 +484,8 @@ pub struct CronConfig {
     pub enabled: bool,
 }
 
-fn cron_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronConfig> {
-    Ok(CronConfig {
+fn timer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimerConfig> {
+    Ok(TimerConfig {
         session: row.get(0)?,
         prompt: row.get(1)?,
         every_secs: row.get(2)?,
@@ -486,13 +495,13 @@ fn cron_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronConfig> {
     })
 }
 
-pub fn cron_get(session: &str) -> Option<CronConfig> {
+pub fn timer_get(session: &str) -> Option<TimerConfig> {
     with_db(|conn| {
         let mut stmt = conn.prepare(
             "SELECT session, prompt, every_secs, last_run_at, skipped, enabled
-             FROM cron WHERE session = ?1",
+             FROM timer WHERE session = ?1",
         )?;
-        let mut rows = stmt.query_map([session], cron_row)?;
+        let mut rows = stmt.query_map([session], timer_row)?;
         Ok(rows.next().transpose()?)
     })
     .flatten()
@@ -504,11 +513,11 @@ pub fn cron_get(session: &str) -> Option<CronConfig> {
 /// two of them typing at one agent interrupt each other. The first send waits a
 /// full interval rather than going out now — arming a schedule should not be a
 /// way to send something immediately by accident.
-pub fn cron_enable(session: &str, prompt: &str, every_secs: u32) -> bool {
+pub fn timer_enable(session: &str, prompt: &str, every_secs: u32) -> bool {
     auto_disable(session);
     with_db(|conn| {
         conn.execute(
-            "INSERT INTO cron (session, prompt, every_secs, last_run_at, skipped, enabled, updated_at)
+            "INSERT INTO timer (session, prompt, every_secs, last_run_at, skipped, enabled, updated_at)
              VALUES (?1, ?2, ?3, ?4, 0, 1, ?4)
              ON CONFLICT(session) DO UPDATE SET
                 prompt = excluded.prompt,
@@ -524,10 +533,10 @@ pub fn cron_enable(session: &str, prompt: &str, every_secs: u32) -> bool {
     .is_some()
 }
 
-pub fn cron_disable(session: &str) {
+pub fn timer_disable(session: &str) {
     with_db(|conn| {
         conn.execute(
-            "UPDATE cron SET enabled = 0, updated_at = ?2 WHERE session = ?1",
+            "UPDATE timer SET enabled = 0, updated_at = ?2 WHERE session = ?1",
             rusqlite::params![session, now()],
         )?;
         Ok(())
@@ -535,10 +544,10 @@ pub fn cron_disable(session: &str) {
 }
 
 /// Record that the prompt went out, which is what the next interval counts from.
-pub fn cron_mark_run(session: &str) {
+pub fn timer_mark_run(session: &str) {
     with_db(|conn| {
         conn.execute(
-            "UPDATE cron SET last_run_at = ?2, updated_at = ?2 WHERE session = ?1",
+            "UPDATE timer SET last_run_at = ?2, updated_at = ?2 WHERE session = ?1",
             rusqlite::params![session, now()],
         )?;
         Ok(())
@@ -548,10 +557,10 @@ pub fn cron_mark_run(session: &str) {
 /// Record that a due run was passed over because the agent was working.
 ///
 /// Deliberately leaves `last_run_at` alone: the run is lost, not deferred.
-pub fn cron_mark_skipped(session: &str) {
+pub fn timer_mark_skipped(session: &str) {
     with_db(|conn| {
         conn.execute(
-            "UPDATE cron SET skipped = skipped + 1, updated_at = ?2 WHERE session = ?1",
+            "UPDATE timer SET skipped = skipped + 1, updated_at = ?2 WHERE session = ?1",
             rusqlite::params![session, now()],
         )?;
         Ok(())
@@ -559,9 +568,9 @@ pub fn cron_mark_skipped(session: &str) {
 }
 
 /// Every session currently on a schedule, for the tree's marker.
-pub fn cron_enabled_sessions() -> std::collections::BTreeSet<String> {
+pub fn timer_enabled_sessions() -> std::collections::BTreeSet<String> {
     with_db(|conn| {
-        let mut stmt = conn.prepare("SELECT session FROM cron WHERE enabled = 1")?;
+        let mut stmt = conn.prepare("SELECT session FROM timer WHERE enabled = 1")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         Ok(rows.filter_map(Result::ok).collect())
     })
@@ -585,7 +594,11 @@ pub fn auto_bump(session: &str) -> u32 {
             "UPDATE auto SET used = used + 1, updated_at = ?2 WHERE session = ?1",
             rusqlite::params![session, now()],
         )?;
-        conn.query_row("SELECT used FROM auto WHERE session = ?1", [session], |row| row.get(0))
+        conn.query_row(
+            "SELECT used FROM auto WHERE session = ?1",
+            [session],
+            |row| row.get(0),
+        )
     })
     .unwrap_or(0)
 }
@@ -696,12 +709,12 @@ mod tests {
         scratch(tmp.path());
         let s = "oc_proj_1a2b3c4d";
 
-        assert!(cron_get(s).is_none());
+        assert!(timer_get(s).is_none());
         assert!(auto_enable(s, "ship it", 5, false));
         assert!(auto_get(s).unwrap().enabled);
 
-        assert!(cron_enable(s, "看一下 CI", 900));
-        let cfg = cron_get(s).unwrap();
+        assert!(timer_enable(s, "看一下 CI", 900));
+        let cfg = timer_get(s).unwrap();
         assert_eq!(cfg.prompt, "看一下 CI");
         assert_eq!(cfg.every_secs, 900);
         assert!(cfg.enabled);
@@ -709,11 +722,17 @@ mod tests {
         // The first run is a full interval away: arming must not be a way to
         // send something right now by accident.
         assert!(!cfg.last_run_at.is_empty(), "arming stamps the clock");
-        assert!(!auto_get(s).unwrap().enabled, "auto was left armed alongside cron");
+        assert!(
+            !auto_get(s).unwrap().enabled,
+            "auto was left armed alongside timer"
+        );
 
         // And back the other way.
         assert!(auto_enable(s, "ship it", 5, false));
-        assert!(!cron_get(s).unwrap().enabled, "cron was left armed alongside auto");
+        assert!(
+            !timer_get(s).unwrap().enabled,
+            "timer was left armed alongside auto"
+        );
     }
 
     /// A skipped run is lost, not deferred.
@@ -729,7 +748,7 @@ mod tests {
         scratch(tmp.path());
         let s = "oc_proj_1a2b3c4d";
 
-        assert!(cron_enable(s, "p", 60));
+        assert!(timer_enable(s, "p", 60));
         // Age the clock to something no fresh stamp could equal: `now()` is
         // millisecond-granular and the whole test runs inside a few of them, so
         // comparing two fresh stamps would pass whether or not a skip touched it.
@@ -738,32 +757,32 @@ mod tests {
             let to = to.to_string();
             with_db(move |conn| {
                 conn.execute(
-                    "UPDATE cron SET last_run_at = ?2 WHERE session = ?1",
+                    "UPDATE timer SET last_run_at = ?2 WHERE session = ?1",
                     rusqlite::params![s, to],
                 )?;
                 Ok(())
             });
         };
         age(AGED);
-        let armed = cron_get(s).unwrap().last_run_at;
+        let armed = timer_get(s).unwrap().last_run_at;
         assert_eq!(armed, AGED);
 
-        cron_mark_skipped(s);
-        cron_mark_skipped(s);
-        let after = cron_get(s).unwrap();
+        timer_mark_skipped(s);
+        timer_mark_skipped(s);
+        let after = timer_get(s).unwrap();
         assert_eq!(after.skipped, 2);
         assert_eq!(after.last_run_at, AGED, "a skip moved the clock");
 
-        cron_mark_run(s);
-        let moved = cron_get(s).unwrap().last_run_at;
+        timer_mark_run(s);
+        let moved = timer_get(s).unwrap().last_run_at;
         assert_ne!(moved, AGED, "a real send must move the clock");
 
         // Disabling leaves the row, so re-arming later starts from a clean slate
         // rather than inheriting a stale skip count.
-        cron_disable(s);
-        assert!(!cron_get(s).unwrap().enabled);
-        assert!(cron_enable(s, "p", 60));
-        assert_eq!(cron_get(s).unwrap().skipped, 0);
+        timer_disable(s);
+        assert!(!timer_get(s).unwrap().enabled);
+        assert!(timer_enable(s, "p", 60));
+        assert_eq!(timer_get(s).unwrap().skipped, 0);
     }
 
     /// The tree asks for one set rather than one row per session.
@@ -773,14 +792,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         scratch(tmp.path());
 
-        assert!(cron_enabled_sessions().is_empty());
-        assert!(cron_enable("cc_a_11111111", "x", 60));
-        assert!(cron_enable("oc_b_22222222", "y", 60));
-        cron_disable("oc_b_22222222");
+        assert!(timer_enabled_sessions().is_empty());
+        assert!(timer_enable("cc_a_11111111", "x", 60));
+        assert!(timer_enable("oc_b_22222222", "y", 60));
+        timer_disable("oc_b_22222222");
 
-        let on = cron_enabled_sessions();
+        let on = timer_enabled_sessions();
         assert!(on.contains("cc_a_11111111"));
-        assert!(!on.contains("oc_b_22222222"), "a disabled schedule still showed");
+        assert!(
+            !on.contains("oc_b_22222222"),
+            "a disabled schedule still showed"
+        );
     }
 
     #[test]
@@ -794,13 +816,22 @@ mod tests {
 
         // Both columns live on one row now, where three files used to
         // disagree about the same session.
-        assert_eq!(labels().get("cc_proj_1a2b3c4d").map(String::as_str), Some("工作"));
-        assert_eq!(conversation_id("cc_proj_1a2b3c4d").as_deref(), Some("conv-a"));
+        assert_eq!(
+            labels().get("cc_proj_1a2b3c4d").map(String::as_str),
+            Some("工作")
+        );
+        assert_eq!(
+            conversation_id("cc_proj_1a2b3c4d").as_deref(),
+            Some("conv-a")
+        );
 
         // An empty label clears rather than storing "".
         set_label("cc_proj_1a2b3c4d", "  ");
         assert!(labels().is_empty());
-        assert_eq!(conversation_id("cc_proj_1a2b3c4d").as_deref(), Some("conv-a"));
+        assert_eq!(
+            conversation_id("cc_proj_1a2b3c4d").as_deref(),
+            Some("conv-a")
+        );
 
         std::env::remove_var("AMUX_DB_PATH");
     }
@@ -852,7 +883,10 @@ mod tests {
         set_alias("/work/iotex", "IoTeX 主线");
         upsert_project("/work/iotex", "iotex", "claude", "2026-09-13T00:00:00Z", 3);
 
-        let row = projects().into_iter().find(|p| p.path == "/work/iotex").unwrap();
+        let row = projects()
+            .into_iter()
+            .find(|p| p.path == "/work/iotex")
+            .unwrap();
         assert_eq!(row.alias.as_deref(), Some("IoTeX 主线"));
         assert_eq!(row.last_agent, "claude");
         assert_eq!(row.launch_count, 3);
@@ -873,7 +907,10 @@ mod tests {
         scratch(tmp.path());
 
         set_alias("/work/secrets", "私密");
-        let row = projects().into_iter().find(|p| p.path == "/work/secrets").unwrap();
+        let row = projects()
+            .into_iter()
+            .find(|p| p.path == "/work/secrets")
+            .unwrap();
         assert_eq!(row.alias.as_deref(), Some("私密"));
         assert!(
             row.last_agent.is_empty(),
@@ -881,8 +918,17 @@ mod tests {
         );
 
         // Actually launching there turns it into one, keeping the name.
-        upsert_project("/work/secrets", "secrets", "claude", "2026-09-13T00:00:00Z", 1);
-        let row = projects().into_iter().find(|p| p.path == "/work/secrets").unwrap();
+        upsert_project(
+            "/work/secrets",
+            "secrets",
+            "claude",
+            "2026-09-13T00:00:00Z",
+            1,
+        );
+        let row = projects()
+            .into_iter()
+            .find(|p| p.path == "/work/secrets")
+            .unwrap();
         assert_eq!(row.last_agent, "claude");
         assert_eq!(row.alias.as_deref(), Some("私密"));
 
@@ -913,8 +959,14 @@ mod tests {
 
         let rows = projects();
         let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
-        assert!(paths.contains(&"/work/other"), "the refreshed row is missing");
-        assert!(!paths.contains(&"/work/plain"), "an unnamed row should be evicted");
+        assert!(
+            paths.contains(&"/work/other"),
+            "the refreshed row is missing"
+        );
+        assert!(
+            !paths.contains(&"/work/plain"),
+            "an unnamed row should be evicted"
+        );
         assert!(
             paths.contains(&"/work/named"),
             "eviction silently discarded a name the user chose"
@@ -966,7 +1018,11 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1, "project row not imported");
         let label: String = conn
-            .query_row("SELECT label FROM sessions WHERE name = 'cc_alpha_11111111'", [], |r| r.get(0))
+            .query_row(
+                "SELECT label FROM sessions WHERE name = 'cc_alpha_11111111'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(label, "旧标签");
         let id: String = conn
@@ -998,7 +1054,11 @@ mod tests {
         migrate_from(&conn, &home);
 
         let label: String = conn
-            .query_row("SELECT label FROM sessions WHERE name = 'cc_alpha_11111111'", [], |r| r.get(0))
+            .query_row(
+                "SELECT label FROM sessions WHERE name = 'cc_alpha_11111111'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(label, "新标签", "re-import clobbered newer data");
     }
@@ -1013,7 +1073,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         scratch(tmp.path());
 
-        assert!(cached_summary("/t/a.jsonl", 100.0).is_none(), "empty cache hit");
+        assert!(
+            cached_summary("/t/a.jsonl", 100.0).is_none(),
+            "empty cache hit"
+        );
 
         put_summary("/t/a.jsonl", "claude", Some("逆向登录接口"), 100.0);
         assert_eq!(
@@ -1022,7 +1085,10 @@ mod tests {
         );
 
         // A rewritten transcript invalidates it.
-        assert!(cached_summary("/t/a.jsonl", 101.0).is_none(), "stale mtime hit");
+        assert!(
+            cached_summary("/t/a.jsonl", 101.0).is_none(),
+            "stale mtime hit"
+        );
 
         // "No summary" is itself worth caching — recomputing it costs a full scan.
         put_summary("/t/b.jsonl", "codex", None, 5.0);

@@ -413,7 +413,7 @@ pub struct AutoDraft {
 
 /// Which field of the schedule form has the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CronField {
+pub enum TimerField {
     Every,
     Prompt,
 }
@@ -424,11 +424,11 @@ pub enum CronField {
 /// cancels. An empty prompt cannot be armed — a schedule that sends nothing is
 /// a bare Enter every so often, which is not a task.
 #[derive(Debug, Clone)]
-pub struct CronDraft {
-    /// Free text like `30m`, `2h`, `90s` — parsed by [`cron_parse_every`].
+pub struct TimerDraft {
+    /// Free text like `30m`, `2h`, `90s` — parsed by [`timer_parse_every`].
     pub every: String,
     pub prompt: String,
-    pub field: CronField,
+    pub field: TimerField,
 }
 
 /// Parse `30m` / `2h` / `90s` / a bare number of minutes into seconds, or say
@@ -438,7 +438,7 @@ pub struct CronDraft {
 /// unreadable text is to type it, and arming on a silent default would start
 /// typing at a session on a schedule nobody chose. The floor is the daemon's,
 /// applied again here so the form cannot show a promise it will not keep.
-pub fn cron_parse_every(raw: &str) -> Option<u32> {
+pub fn timer_parse_every(raw: &str) -> Option<u32> {
     let text = raw.trim().to_lowercase();
     if text.is_empty() {
         return None;
@@ -462,7 +462,7 @@ pub fn cron_parse_every(raw: &str) -> Option<u32> {
 }
 
 /// How an interval is written back into the form.
-pub fn cron_every_label(secs: u32) -> String {
+pub fn timer_every_label(secs: u32) -> String {
     if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
     } else if secs.is_multiple_of(60) {
@@ -602,7 +602,7 @@ pub struct AppState {
     /// The auto-mode form being filled in.
     pub auto_editing: Option<AutoDraft>,
     /// The schedule form, while it is open.
-    pub cron_editing: Option<CronDraft>,
+    pub timer_editing: Option<TimerDraft>,
     /// Sessions currently on a schedule, refreshed with the tree so a session
     /// being poked on a timer is visible without opening anything.
     pub scheduled: std::collections::BTreeSet<String>,
@@ -645,7 +645,7 @@ impl AppState {
             statuses: std::collections::BTreeMap::new(),
             auto_sessions: std::collections::BTreeMap::new(),
             auto_editing: None,
-            cron_editing: None,
+            timer_editing: None,
             scheduled: std::collections::BTreeSet::new(),
         }
     }
@@ -756,18 +756,18 @@ impl AppState {
     /// Open the schedule form for the selected session, filled in with whatever
     /// it is already on — editing a schedule should start from the current one,
     /// not from a blank. Returns false when the cursor is not on a session.
-    pub fn begin_cron(&mut self) -> bool {
+    pub fn begin_timer(&mut self) -> bool {
         let Some(name) = self.current_name() else {
             return false;
         };
-        let existing = crate::store::cron_get(&name);
-        self.cron_editing = Some(CronDraft {
+        let existing = crate::store::timer_get(&name);
+        self.timer_editing = Some(TimerDraft {
             every: existing
                 .as_ref()
-                .map(|c| cron_every_label(c.every_secs))
+                .map(|c| timer_every_label(c.every_secs))
                 .unwrap_or_else(|| "30m".to_string()),
             prompt: existing.map(|c| c.prompt).unwrap_or_default(),
-            field: CronField::Prompt,
+            field: TimerField::Prompt,
         });
         true
     }
@@ -2661,35 +2661,35 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     dirty = true;
                     continue;
                 }
-                if state.cron_editing.is_some() {
+                if state.timer_editing.is_some() {
                     let mut submit = false;
-                    if let Some(draft) = state.cron_editing.as_mut() {
+                    if let Some(draft) = state.timer_editing.as_mut() {
                         match key.code {
-                            KeyCode::Esc => state.cron_editing = None,
+                            KeyCode::Esc => state.timer_editing = None,
                             KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
                                 draft.field = match draft.field {
-                                    CronField::Every => CronField::Prompt,
-                                    CronField::Prompt => CronField::Every,
+                                    TimerField::Every => TimerField::Prompt,
+                                    TimerField::Prompt => TimerField::Every,
                                 };
                             }
                             KeyCode::Backspace => match draft.field {
-                                CronField::Every => {
+                                TimerField::Every => {
                                     draft.every.pop();
                                 }
-                                CronField::Prompt => {
+                                TimerField::Prompt => {
                                     draft.prompt.pop();
                                 }
                             },
                             KeyCode::Enter => submit = true,
                             KeyCode::Char(c) => match draft.field {
-                                CronField::Every => draft.every.push(c),
-                                CronField::Prompt => draft.prompt.push(c),
+                                TimerField::Every => draft.every.push(c),
+                                TimerField::Prompt => draft.prompt.push(c),
                             },
                             _ => {}
                         }
                     }
                     if submit {
-                        let draft = state.cron_editing.take();
+                        let draft = state.timer_editing.take();
                         if let (Some(draft), Some(name)) = (draft, state.current_name()) {
                             let prompt = draft.prompt.trim().to_string();
                             // Both refusals put the form back rather than
@@ -2697,17 +2697,17 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             // anything: a schedule types at a session while
                             // nobody is watching, so a half-meant one is worse
                             // than none.
-                            match (prompt.is_empty(), cron_parse_every(&draft.every)) {
+                            match (prompt.is_empty(), timer_parse_every(&draft.every)) {
                                 (true, _) => {
                                     state.notice = Some("a schedule needs a prompt".into());
-                                    state.cron_editing = Some(draft);
+                                    state.timer_editing = Some(draft);
                                 }
                                 (_, None) => {
                                     state.notice = Some("that interval does not read".into());
-                                    state.cron_editing = Some(draft);
+                                    state.timer_editing = Some(draft);
                                 }
                                 (false, Some(every)) => {
-                                    if crate::store::cron_enable(&name, &prompt, every) {
+                                    if crate::store::timer_enable(&name, &prompt, every) {
                                         state.scheduled.insert(name.clone());
                                         // The store turns auto off to keep the
                                         // two from typing over each other.
@@ -2718,7 +2718,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                         state.refresh_auto_sessions();
                                         state.notice = Some(format!(
                                             "{name} every {} — {}",
-                                            cron_every_label(every),
+                                            timer_every_label(every),
                                             truncate(&prompt, 40)
                                         ));
                                     } else {
@@ -2794,7 +2794,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                     state.refresh_auto_sessions();
                                     // Mirror of the schedule path: enabling auto
                                     // just disabled any schedule on this session.
-                                    state.scheduled = crate::store::cron_enabled_sessions();
+                                    state.scheduled = crate::store::timer_enabled_sessions();
                                     let what = if goal.is_empty() {
                                         "keep it going".to_string()
                                     } else {
@@ -3255,7 +3255,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     // A standing instruction rather than a conversation. `t`
                     // hands the session to a model; this one only needs a clock.
                     KeyCode::Char('T') => {
-                        if !state.begin_cron() {
+                        if !state.begin_timer() {
                             state.notice = Some("select a session first".into());
                         }
                     }
@@ -3720,7 +3720,7 @@ fn reload(state: &mut AppState, select: Option<String>) {
     state.projects = group_by_project(managed_sessions(&all, &state.agents));
     // Re-read here rather than on every frame: a schedule changes when someone
     // sets one, which is exactly when the session list is reloaded anyway.
-    state.scheduled = crate::store::cron_enabled_sessions();
+    state.scheduled = crate::store::timer_enabled_sessions();
 
     if let Some(target) = select {
         // Open whatever holds it, so there is a row to land on.
@@ -3898,8 +3898,8 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
     if state.auto_editing.is_some() {
         render_auto_form(f, state, outer[0]);
     }
-    if state.cron_editing.is_some() {
-        render_cron_form(f, state, outer[0]);
+    if state.timer_editing.is_some() {
+        render_timer_form(f, state, outer[0]);
     }
     render_status(f, state, outer[1]);
 }
@@ -3958,8 +3958,8 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
 /// A centered popup rather than a column, because it is a decision about the
 /// session you were just looking at — not a mode the whole screen enters.
 /// The schedule form: how often, and what to send.
-fn render_cron_form(f: &mut Frame, state: &AppState, area: Rect) {
-    let Some(draft) = state.cron_editing.as_ref() else {
+fn render_timer_form(f: &mut Frame, state: &AppState, area: Rect) {
+    let Some(draft) = state.timer_editing.as_ref() else {
         return;
     };
     let session = state.current_name().unwrap_or_default();
@@ -3973,8 +3973,8 @@ fn render_cron_form(f: &mut Frame, state: &AppState, area: Rect) {
             Style::default().fg(Color::DarkGray)
         }
     };
-    let every_on = draft.field == CronField::Every;
-    let parsed = cron_parse_every(&draft.every);
+    let every_on = draft.field == TimerField::Every;
+    let parsed = timer_parse_every(&draft.every);
 
     let rows = vec![
         Line::from(vec![
@@ -3986,7 +3986,7 @@ fn render_cron_form(f: &mut Frame, state: &AppState, area: Rect) {
             // could not be read at all.
             match parsed {
                 Some(secs) => Span::styled(
-                    format!("    → {}", cron_every_label(secs)),
+                    format!("    → {}", timer_every_label(secs)),
                     Style::default().fg(Color::DarkGray),
                 ),
                 // Not "using 30m": Enter refuses this, so naming a fallback
@@ -6513,49 +6513,49 @@ mod tests {
     /// `5s` while the thing fires once a minute is worse than being corrected.
     #[test]
     fn an_interval_reads_the_way_it_is_written() {
-        assert_eq!(cron_parse_every("30m"), Some(1800));
-        assert_eq!(cron_parse_every("2h"), Some(7200));
-        assert_eq!(cron_parse_every("90s"), Some(90));
+        assert_eq!(timer_parse_every("30m"), Some(1800));
+        assert_eq!(timer_parse_every("2h"), Some(7200));
+        assert_eq!(timer_parse_every("90s"), Some(90));
         // A bare number is minutes: nobody schedules a standing instruction in
         // seconds, and "5" meaning five seconds would surprise. Deliberately
         // not "30" — that parses to the same 1800 the fallback returns, so it
         // would pass whether or not bare numbers were understood at all.
-        assert_eq!(cron_parse_every("5"), Some(300));
-        assert_eq!(cron_parse_every("45"), Some(2700));
+        assert_eq!(timer_parse_every("5"), Some(300));
+        assert_eq!(timer_parse_every("45"), Some(2700));
 
         // Gibberish falls back, but the form must be able to tell that apart
         // from a real answer. `30m2m` is not hypothetical: it is what tabbing
         // into the pre-filled field and typing produces.
-        assert_eq!(cron_parse_every("30m2m"), None);
-        assert_eq!(cron_parse_every("soon"), None);
+        assert_eq!(timer_parse_every("30m2m"), None);
+        assert_eq!(timer_parse_every("soon"), None);
         // Digits must be one run. Without that check this reads as 230 minutes,
         // because partitioning throws away where the letters sat.
-        assert_eq!(cron_parse_every("2m30"), None);
-        assert_eq!(cron_parse_every(""), None);
-        assert_eq!(cron_parse_every("2m"), Some(120));
-        assert_eq!(cron_parse_every(" 15 M "), Some(900));
+        assert_eq!(timer_parse_every("2m30"), None);
+        assert_eq!(timer_parse_every(""), None);
+        assert_eq!(timer_parse_every("2m"), Some(120));
+        assert_eq!(timer_parse_every(" 15 M "), Some(900));
 
         // Under the floor is lifted to it rather than refused.
         assert_eq!(
-            cron_parse_every("5s"),
+            timer_parse_every("5s"),
             Some(crate::serve::server::MIN_EVERY_SECS)
         );
         assert_eq!(
-            cron_parse_every("0m"),
+            timer_parse_every("0m"),
             Some(crate::serve::server::MIN_EVERY_SECS)
         );
         // And a day is the ceiling.
-        assert_eq!(cron_parse_every("99h"), Some(24 * 60 * 60));
+        assert_eq!(timer_parse_every("99h"), Some(24 * 60 * 60));
 
         // Unreadable falls back rather than trapping the form.
-        assert_eq!(cron_parse_every(""), None);
-        assert_eq!(cron_parse_every("soon"), None);
-        assert_eq!(cron_parse_every("10 fortnights"), None);
+        assert_eq!(timer_parse_every(""), None);
+        assert_eq!(timer_parse_every("soon"), None);
+        assert_eq!(timer_parse_every("10 fortnights"), None);
 
         // What the form shows back is what it parsed.
-        assert_eq!(cron_every_label(1800), "30m");
-        assert_eq!(cron_every_label(7200), "2h");
-        assert_eq!(cron_every_label(90), "90s");
+        assert_eq!(timer_every_label(1800), "30m");
+        assert_eq!(timer_every_label(7200), "2h");
+        assert_eq!(timer_every_label(90), "90s");
     }
 
     /// A path too long for the popup must lose its *front*. The tail is what
