@@ -14,6 +14,7 @@ pub mod herdr;
 pub mod sessions;
 pub mod usb;
 pub mod server;
+pub mod auto;
 
 #[cfg(feature = "full")]
 #[allow(clippy::all, dead_code)]

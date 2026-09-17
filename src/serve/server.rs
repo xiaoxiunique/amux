@@ -1,11 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env, fs,
     io::{Read, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{LazyLock, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -53,6 +53,12 @@ static PENDING_MESSAGES: LazyLock<Mutex<HashMap<String, Vec<PendingMessage>>>> =
 // decide whether a Claude pane is currently busy (so it should queue).
 static PANE_STATUS_CACHE: LazyLock<Mutex<HashMap<String, PaneStatus>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+// `PANE_STATUS_CACHE` keyed by *session*, with the moment the status began.
+// The TUI reads this via `/api/statuses` rather than capturing every pane
+// itself — the daemon already does that sweep, and a second one per TUI is
+// what made a screenful of sessions spawn a subprocess per pane every tick.
+static LATEST_SESSION_STATUSES: LazyLock<Mutex<BTreeMap<String, SessionStatus>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 // Cooldown after a flush, so multi-queued messages are delivered one per idle
 // cycle (giving the agent time to start working) rather than dumped together.
 static PENDING_FLUSH_AT: LazyLock<Mutex<HashMap<String, Instant>>> =
@@ -155,7 +161,7 @@ pub(crate) struct AppState {
     pane_log_refreshes: broadcast::Sender<String>,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum PaneStatus {
     Running,
@@ -468,6 +474,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
 
     let app = Router::new()
         .route("/api/snapshot", get(api_snapshot))
+        .route("/api/statuses", get(api_statuses))
         .route("/api/pane/context", get(api_pane_context))
         .route("/api/send", post(api_send))
         .route("/api/pending", get(api_pending_list))
@@ -497,6 +504,9 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
             "/api/session/labels",
             get(api_session_labels).post(api_session_label_set),
         )
+        .route("/api/auto/status", get(api_auto_status))
+        .route("/api/auto/enable", post(api_auto_enable))
+        .route("/api/auto/disable", post(api_auto_disable))
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
         .route("/api/cron/jobs/running", get(api_cron_running))
@@ -793,6 +803,15 @@ fn capture_pane(pane_id: &str) -> String {
     capture_pane_lines(pane_id, 300)
 }
 
+/// Capture a session's visible screen and recent history, addressed by session
+/// name rather than pane id.
+///
+/// `capture-pane -t` accepts either target, and the TUI (which auto-names a
+/// session from its output) knows the session but not the pane id.
+pub(crate) fn capture_session(session: &str, lines: usize) -> String {
+    capture_pane_lines(session, lines)
+}
+
 fn capture_pane_lines(pane_id: &str, lines: usize) -> String {
     let safe_lines = lines.clamp(50, 5000);
     let primary = run_tmux(&[
@@ -1086,7 +1105,8 @@ pub(crate) fn agent_launch_command_for(agent: &str) -> Result<String, String> {
 /// the render path.
 /// A session's status, with the moment it entered that state when that is
 /// actually known.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SessionStatus {
     pub(crate) status: PaneStatus,
     /// Unix seconds, from the hook that reported the state.
@@ -1230,7 +1250,7 @@ fn session_started_at(session: &str) -> u64 {
     guard.0.get(session).copied().unwrap_or(0)
 }
 
-fn hook_status_for_pane(pane: &BasePane) -> Option<(PaneStatus, String)> {
+fn hook_status_for_pane(pane: &BasePane) -> Option<(PaneStatus, String, Option<i64>)> {
     let started = session_started_at(&pane.session);
     let event = crate::state::current_status_since(&pane.id, &pane.session, started)?;
     let status = match event.state {
@@ -1240,13 +1260,18 @@ fn hook_status_for_pane(pane: &BasePane) -> Option<(PaneStatus, String)> {
         crate::state::HookState::Failed => PaneStatus::Failed,
         crate::state::HookState::Done => PaneStatus::Done,
     };
+    // The hook's own timestamp is the only honest answer to "since when"; an
+    // inferred status has none (see `SessionStatus::since`).
+    let since = chrono::DateTime::parse_from_rfc3339(&event.created_at)
+        .ok()
+        .map(|t| t.timestamp());
     let reason = event.message.unwrap_or_else(|| {
         format!(
             "explicit status from {} at {}",
             event.source, event.created_at
         )
     });
-    Some((status, reason))
+    Some((status, reason, since))
 }
 
 /// Seconds since the pane's agent session file (codex rollout / claude jsonl)
@@ -2230,19 +2255,19 @@ fn interpret_with_deepseek(
     Some(messages)
 }
 
-fn deepseek_api_key() -> String {
+pub(crate) fn deepseek_api_key() -> String {
     env::var("AGENT_MONITOR_DEEPSEEK_API_KEY")
         .or_else(|_| env::var("DEEPSEEK_API_KEY"))
         .unwrap_or_default()
 }
 
-fn deepseek_base_url() -> String {
+pub(crate) fn deepseek_base_url() -> String {
     env::var("AGENT_MONITOR_DEEPSEEK_BASE_URL")
         .or_else(|_| env::var("DEEPSEEK_BASE_URL"))
         .unwrap_or_else(|_| "https://api.deepseek.com".to_string())
 }
 
-fn deepseek_model() -> String {
+pub(crate) fn deepseek_model() -> String {
     env::var("AGENT_MONITOR_DEEPSEEK_MODEL")
         .or_else(|_| env::var("DEEPSEEK_MODEL"))
         .unwrap_or_else(|_| "deepseek-v4-flash".to_string())
@@ -2446,27 +2471,44 @@ fn build_snapshot() -> Snapshot {
             let changed_recently = track_pane_activity(&pane.id, &tail);
             let activity_age_secs = agent_kind_for_pane(&pane, &tail)
                 .and_then(|agent| session_activity_age(agent, &pane.path));
-            let inferred = infer_status(&pane, &tail, changed_recently, activity_age_secs);
-            let (status, reason) = match hook_status_for_pane(&pane) {
+            let (inferred_status, inferred_reason) =
+                infer_status(&pane, &tail, changed_recently, activity_age_secs);
+            let (status, reason, since) = match hook_status_for_pane(&pane) {
                 // A completion hook (codex-notify / claude-stop) latches Done/
                 // Idle/Waiting at turn-end, but the agent may have started a new
                 // turn since. If the pane is live-working right now, trust that
                 // over the stale hook so a running task isn't shown as done.
-                Some(_) if agent_actively_working(&tail) => inferred,
+                Some(_) if agent_actively_working(&tail) => (inferred_status, inferred_reason, None),
                 // Stale claude-notification: Claude finished its turn and is back
                 // at the idle input prompt (shows "/clear to save … tokens"),
                 // but the Waiting hook was never cleared. The stranded status
                 // blocks the pending-message flush (Idle/Done only). We lock
                 // this override behind a strong idle signal that is absent
                 // during mid-task y-n prompts so we never flush into one.
-                Some((PaneStatus::Waiting, _)) if claude_idle_ready(&tail) => inferred,
-                Some(hooked) => hooked,
-                None => inferred,
+                Some((PaneStatus::Waiting, _, _)) if claude_idle_ready(&tail) => {
+                    (inferred_status, inferred_reason, None)
+                }
+                Some((hooked_status, hooked_reason, hooked_since)) => {
+                    (hooked_status, hooked_reason, hooked_since)
+                }
+                None => (inferred_status, inferred_reason, None),
             };
             PANE_STATUS_CACHE
                 .lock()
                 .expect("pane status cache mutex poisoned")
                 .insert(pane.id.clone(), status.clone());
+            // The same status, keyed by session, for the TUI to read instead of
+            // capturing every pane itself.
+            LATEST_SESSION_STATUSES
+                .lock()
+                .expect("session status cache mutex poisoned")
+                .insert(
+                    pane.session.clone(),
+                    SessionStatus {
+                        status: status.clone(),
+                        since,
+                    },
+                );
             let messages = interaction_messages_for_pane(&pane, &tail, &status, &reason, &now);
 
             Pane {
@@ -2526,6 +2568,18 @@ fn append_herdr_panes(panes: &mut Vec<Pane>, now: &str) {
             .lock()
             .expect("pane status cache mutex poisoned")
             .insert(b.id.clone(), status.clone());
+        // No hook timeline for a bridged pane, so no "since" — same as any
+        // inferred status.
+        LATEST_SESSION_STATUSES
+            .lock()
+            .expect("session status cache mutex poisoned")
+            .insert(
+                b.session.clone(),
+                SessionStatus {
+                    status: status.clone(),
+                    since: None,
+                },
+            );
 
         // Reuse the same interaction-message builder the rmux panes use, so
         // the client renders herdr panes identically.
@@ -2717,6 +2771,9 @@ fn clean_command_output(output: String) -> Option<String> {
 fn broadcast_snapshot(state: &AppState) -> Snapshot {
     let snapshot = build_snapshot();
     flush_pending_messages(state, &snapshot.panes);
+    // Auto mode reads the statuses `build_snapshot` just computed, so it runs
+    // alongside the pending-message flush rather than on its own timer.
+    auto_tick(state, &snapshot.panes);
     // Full build: fire status-change push notifications for phone-initiated turns.
     #[cfg(feature = "full")]
     crate::serve::full::push::notify_status_changes(&snapshot.panes);
@@ -2887,6 +2944,24 @@ static CAPABILITIES: LazyLock<serde_json::Value> = LazyLock::new(|| {
 /// Report which optional tools this machine has, so the client can hide
 /// features instead of discovering they are missing by calling them and
 /// handling the failure.
+/// Per-session statuses, for the TUI to mirror the daemon's sweep instead of
+/// running its own. Tiny on purpose: shipping the whole snapshot would drag
+/// every pane's scrollback across the loopback socket every couple of seconds.
+async fn api_statuses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let statuses = LATEST_SESSION_STATUSES
+        .lock()
+        .expect("session status cache mutex poisoned")
+        .clone();
+    json_response(StatusCode::OK, json!({ "ok": true, "statuses": statuses }))
+}
+
 async fn api_capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3530,6 +3605,217 @@ fn flush_pending_messages(state: &AppState, panes: &[Pane]) {
     }
 }
 
+/// Per-pane cooldown so a pane that stays Idle isn't asked on every 2.5s poll.
+static AUTO_LAST_FIRE: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Panes with a decision in flight, so the next poll doesn't start a second one
+/// before the model has answered.
+static AUTO_IN_FLIGHT: LazyLock<Mutex<HashMap<String, ()>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Whether the missing-key warning has been printed. The condition persists
+/// until the daemon is restarted with the key, so say it once.
+static AUTO_NO_KEY_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// How long to leave a pane alone after one continuation.
+const AUTO_COOLDOWN: Duration = Duration::from_secs(20);
+
+/// A single-line, length-capped preview for the auto log.
+fn preview(text: &str, max: usize) -> String {
+    let flat = text.replace(['\n', '\r'], " ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        flat.chars().take(max).collect::<String>() + "…"
+    }
+}
+
+/// Type one auto continuation into a pane, mirroring `api_send`'s delivery:
+/// herdr panes go through its API, rmux panes through paste + submit key.
+fn auto_deliver(pane: &Pane, text: &str) -> Result<(), String> {
+    if crate::serve::herdr::owns(&pane.id) {
+        return crate::serve::herdr::send(&pane.id, text, true);
+    }
+    exit_tmux_copy_mode(&pane.id);
+    paste_text(&pane.id, text)?;
+    // Codex submits with Tab, everything else with Enter — the same rule
+    // `api_send` applies, kept in one place so a continuation lands the way a
+    // typed message would.
+    let key = if pane_is_codex(&pane.session, &pane.command, &pane.title) {
+        "Tab"
+    } else {
+        "Enter"
+    };
+    send_key_parts(&pane.id, &[key])
+}
+
+/// True when a pane has a user message waiting for the flush.
+fn pane_has_pending(pane_id: &str) -> bool {
+    PENDING_MESSAGES
+        .lock()
+        .expect("pending messages mutex poisoned")
+        .get(pane_id)
+        .map(|queue| !queue.is_empty())
+        .unwrap_or(false)
+}
+
+/// Continue sessions whose agent has stopped, until the goal is met or the turn
+/// budget is spent.
+///
+/// Runs from `broadcast_snapshot`, i.e. every 2.5s next to the pane status it
+/// depends on. The model call is slow, so it is handed to a blocking task; the
+/// in-flight guard stops the next poll from starting a second one, and the
+/// cooldown stops a pane that stays Idle from being re-asked immediately.
+fn auto_tick(state: &AppState, panes: &[Pane]) {
+    // `broadcast_snapshot` normally runs inside the server's tokio runtime;
+    // if it is ever called outside one, skip auto rather than panic.
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+
+    // Without a deciding model there is nothing to ask. A missing CLI is a
+    // configuration problem, not a reason to disarm every goal, so leave them
+    // armed and say it once rather than every poll.
+    if !crate::serve::auto::model_available() {
+        if !AUTO_NO_KEY_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[auto] {} is not on PATH; auto is idle until it is",
+                crate::serve::auto::model_cli()
+            );
+        }
+        return;
+    }
+
+    for pane in panes {
+        let Some(config) = crate::store::auto_get(&pane.session) else {
+            continue;
+        };
+        if !config.enabled {
+            continue;
+        }
+        if config.used >= config.max_turns {
+            crate::store::auto_disable(&pane.session);
+            continue;
+        }
+        let waiting = match pane.status {
+            PaneStatus::Idle => false,
+            PaneStatus::Waiting => {
+                // Answering a y/n or permission prompt on the user's behalf is
+                // only ever done when they explicitly asked for it.
+                if !config.allow_waiting {
+                    continue;
+                }
+                true
+            }
+            _ => continue,
+        };
+
+        // A queued user message is the user's own turn, delivered by
+        // `flush_pending_messages`; never race it with an automatic one.
+        if pane_has_pending(&pane.id) {
+            continue;
+        }
+
+        {
+            let in_flight = AUTO_IN_FLIGHT.lock().expect("auto in-flight mutex poisoned");
+            if in_flight.contains_key(&pane.id) {
+                continue;
+            }
+        }
+        if let Some(at) = AUTO_LAST_FIRE
+            .lock()
+            .expect("auto cooldown mutex poisoned")
+            .get(&pane.id)
+        {
+            if at.elapsed() < AUTO_COOLDOWN {
+                continue;
+            }
+        }
+
+        AUTO_IN_FLIGHT
+            .lock()
+            .expect("auto in-flight mutex poisoned")
+            .insert(pane.id.clone(), ());
+        AUTO_LAST_FIRE
+            .lock()
+            .expect("auto cooldown mutex poisoned")
+            .insert(pane.id.clone(), Instant::now());
+
+        let pane = pane.clone();
+        let state = state.clone();
+        // Dropping the handle detaches the task, which is what we want: the
+        // decision runs to completion while the poll loop moves on.
+        let _task = handle.spawn_blocking(move || {
+            let decision = crate::serve::auto::decide(
+                &config.goal,
+                &pane.tail,
+                config.used,
+                config.max_turns,
+                waiting,
+            );
+            match decision {
+                crate::serve::auto::Decision::Continue(message) => {
+                    // The user may have taken over while the model was thinking
+                    // (started typing, or queued a message). Their turn wins.
+                    let still_stopped = cached_pane_status(&pane.id)
+                        == Some(if waiting { PaneStatus::Waiting } else { PaneStatus::Idle });
+                    if !still_stopped || pane_has_pending(&pane.id) {
+                        eprintln!(
+                            "[auto] {} moved on before the decision; skipping",
+                            pane.id
+                        );
+                    } else {
+                        match auto_deliver(&pane, &message) {
+                            Ok(()) => {
+                                let used = crate::store::auto_bump(&pane.session);
+                                // Nudge the pane-log stream so the new turn is
+                                // visible without waiting for the next poll.
+                                let _ = state.pane_log_refreshes.send(pane.id.clone());
+                                if used >= config.max_turns {
+                                    crate::store::auto_disable(&pane.session);
+                                    eprintln!(
+                                        "[auto] budget spent for {} ({used}/{}); auto off",
+                                        pane.session, config.max_turns
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[auto] continued {} ({used}/{}) — {}",
+                                        pane.session,
+                                        config.max_turns,
+                                        preview(&message, 160)
+                                    );
+                                }
+                            }
+                            // Leave it armed: a failed paste may be a transient
+                            // pane problem, and the cooldown spaces out retries.
+                            Err(error) => {
+                                eprintln!("[auto] delivery failed for {}: {error}", pane.id);
+                            }
+                        }
+                    }
+                }
+                crate::serve::auto::Decision::Stop(reason) => {
+                    crate::store::auto_disable(&pane.session);
+                    if reason.is_empty() {
+                        eprintln!("[auto] stopped {} — model saw nothing left to do", pane.session);
+                    } else {
+                        eprintln!("[auto] stopped {} — model: {reason}", pane.session);
+                    }
+                }
+                crate::serve::auto::Decision::Unavailable => {
+                    // Could not ask — already logged. Leave it armed; the
+                    // cooldown spaces the retries, and `deepseek_api_key` is
+                    // checked up front so the persistent no-key case never
+                    // reaches here.
+                }
+            }
+            AUTO_IN_FLIGHT
+                .lock()
+                .expect("auto in-flight mutex poisoned")
+                .remove(&pane.id);
+        });
+    }
+}
+
 fn pending_list_json(pane_id: &str) -> serde_json::Value {
     let queues = PENDING_MESSAGES.lock().expect("pending messages mutex poisoned");
     let messages = queues.get(pane_id).cloned().unwrap_or_default();
@@ -3624,6 +3910,111 @@ async fn api_pending_clear(
         .expect("pending messages mutex poisoned")
         .remove(pane_id);
     json_response(StatusCode::OK, pending_list_json(pane_id))
+}
+
+/// Body shared by the auto endpoints. Prefer `session`; `paneId` is resolved
+/// against the current pane list as a convenience for the app.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoArmRequest {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    pane_id: Option<String>,
+    #[serde(default)]
+    goal: String,
+    #[serde(default)]
+    max_turns: Option<u32>,
+    #[serde(default)]
+    allow_waiting: Option<bool>,
+}
+
+/// Turn an auto request's `session`/`paneId` into a session name.
+fn resolve_auto_session(session: Option<&str>, pane_id: Option<&str>) -> Option<String> {
+    if let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(session.to_string());
+    }
+    let pane_id = pane_id.map(str::trim).filter(|s| !s.is_empty())?;
+    list_panes()
+        .ok()
+        .and_then(|panes| panes.into_iter().find(|pane| pane.id == pane_id))
+        .map(|pane| pane.session)
+}
+
+async fn api_auto_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    json_response(
+        StatusCode::OK,
+        json!({ "ok": true, "items": crate::store::auto_list() }),
+    )
+}
+
+async fn api_auto_enable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<AutoArmRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let Some(session) = resolve_auto_session(body.session.as_deref(), body.pane_id.as_deref())
+    else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "session or a known paneId is required" }),
+        );
+    };
+    // An empty goal is the default "keep going" mode, not an error: the model
+    // decides only from the agent's own output whether work can be carried on.
+    let goal = body.goal.trim();
+    if goal.chars().count() > 4000 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "goal is too long" }),
+        );
+    }
+    let max_turns = body
+        .max_turns
+        .unwrap_or(crate::serve::auto::DEFAULT_MAX_TURNS)
+        .clamp(1, 100);
+    let stored =
+        crate::store::auto_enable(&session, goal, max_turns, body.allow_waiting.unwrap_or(false));
+    json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "session": session,
+            "stored": stored,
+            "config": crate::store::auto_get(&session),
+        }),
+    )
+}
+
+async fn api_auto_disable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<AutoArmRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let Some(session) = resolve_auto_session(body.session.as_deref(), body.pane_id.as_deref())
+    else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "session or a known paneId is required" }),
+        );
+    };
+    crate::store::auto_disable(&session);
+    json_response(StatusCode::OK, json!({ "ok": true, "session": session }))
 }
 
 async fn api_send(
@@ -5004,6 +5395,53 @@ async fn pane_log_ws(
     .into_response()
 }
 
+/// How often an opencode pane's log is rebuilt from its database. The store is
+/// large and the log only grows, so once a second is plenty — the phone shows
+/// it a beat behind, which is the price of having history at all.
+const OPENCODE_LOG_REFRESH: Duration = Duration::from_millis(1000);
+
+/// Where a pane's log comes from.
+///
+/// Most agents print to the terminal's normal buffer, so `capture-pane` has
+/// their history. opencode's full TUI draws into its own viewport and leaves
+/// nothing in the scrollback, so its log is read from the messages it persists.
+enum LogSource {
+    Terminal,
+    Opencode {
+        session: String,
+        cwd: String,
+        cached: String,
+        built_at: Option<Instant>,
+    },
+}
+
+/// The pane's current log, refreshing an opencode pane's from its store at most
+/// once per [`OPENCODE_LOG_REFRESH`].
+fn pane_log_text(source: &mut LogSource, pane_id: &str, line_count: usize) -> String {
+    match source {
+        LogSource::Terminal => capture_pane_lines(pane_id, line_count),
+        LogSource::Opencode {
+            session,
+            cwd,
+            cached,
+            built_at,
+        } => {
+            let stale = built_at
+                .map(|at| at.elapsed() >= OPENCODE_LOG_REFRESH)
+                .unwrap_or(true);
+            if stale {
+                *built_at = Some(Instant::now());
+                if let Some(log) =
+                    crate::commands::session_ids::opencode_history(session, cwd, line_count)
+                {
+                    *cached = log;
+                }
+            }
+            cached.clone()
+        }
+    }
+}
+
 async fn handle_pane_log_socket(
     socket: WebSocket,
     query: HashMap<String, String>,
@@ -5024,6 +5462,21 @@ async fn handle_pane_log_socket(
 
     let line_count = pane_log_line_count(query.get("lines"));
     let (mut sender, mut receiver) = socket.split();
+
+    // Resolved once: which amux session this pane is, and whether its history
+    // has to come from the agent's own store rather than the terminal.
+    let mut source = match list_panes()
+        .ok()
+        .and_then(|panes| panes.into_iter().find(|pane| pane.id == pane_id))
+    {
+        Some(pane) if session_agent_name(&pane.session) == Some("opencode") => LogSource::Opencode {
+            session: pane.session,
+            cwd: pane.path,
+            cached: String::new(),
+            built_at: None,
+        },
+        _ => LogSource::Terminal,
+    };
 
     async fn send_pane_tail(
         sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
@@ -5049,8 +5502,9 @@ async fn handle_pane_log_socket(
         pane_id: &str,
         line_count: usize,
         last_tail: &mut String,
+        source: &mut LogSource,
     ) -> Result<(), axum::Error> {
-        let next_tail = capture_pane_lines(pane_id, line_count);
+        let next_tail = pane_log_text(source, pane_id, line_count);
         if next_tail == *last_tail {
             return Ok(());
         }
@@ -5059,7 +5513,7 @@ async fn handle_pane_log_socket(
         send_pane_tail(sender, pane_id, last_tail).await
     }
 
-    let mut last_tail = capture_pane_lines(&pane_id, line_count);
+    let mut last_tail = pane_log_text(&mut source, &pane_id, line_count);
     if send_pane_tail(&mut sender, &pane_id, &last_tail)
         .await
         .is_err()
@@ -5071,19 +5525,19 @@ async fn handle_pane_log_socket(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail).await.is_err() {
+                if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail, &mut source).await.is_err() {
                     break;
                 }
             }
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) if text.contains("refresh") => {
-                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail).await.is_err() {
+                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail, &mut source).await.is_err() {
                             break;
                         }
                     }
                     Some(Ok(Message::Binary(data))) if data.windows(7).any(|item| item == b"refresh") => {
-                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail).await.is_err() {
+                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail, &mut source).await.is_err() {
                             break;
                         }
                     }
@@ -5094,7 +5548,7 @@ async fn handle_pane_log_socket(
             refresh = refreshes.recv() => {
                 match refresh {
                     Ok(refresh_pane_id) if refresh_pane_id == pane_id => {
-                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail).await.is_err() {
+                        if capture_and_send_if_changed(&mut sender, &pane_id, line_count, &mut last_tail, &mut source).await.is_err() {
                             break;
                         }
                     }
@@ -5557,9 +6011,10 @@ mod tests {
         .unwrap();
 
         let pane = pane("cc-glm_proj_1a2b3c4d");
-        let (status, reason) = hook_status_for_pane(&pane).unwrap();
+        let (status, reason, since) = hook_status_for_pane(&pane).unwrap();
         assert_eq!(status, PaneStatus::Done);
         assert_eq!(reason, "hook says complete");
+        assert!(since.is_some(), "a hook event carries the moment it happened");
 
         std::env::remove_var("AMUX_STATE_DIR");
     }

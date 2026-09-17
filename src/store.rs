@@ -97,6 +97,15 @@ fn open(path: &std::path::Path) -> Option<Connection> {
             summary      TEXT,
             source_mtime REAL NOT NULL,
             updated_at   TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS auto (
+            session       TEXT PRIMARY KEY,
+            goal          TEXT NOT NULL DEFAULT '',
+            max_turns     INTEGER NOT NULL DEFAULT 10,
+            used          INTEGER NOT NULL DEFAULT 0,
+            allow_waiting INTEGER NOT NULL DEFAULT 0,
+            enabled       INTEGER NOT NULL DEFAULT 0,
+            updated_at    TEXT NOT NULL DEFAULT ''
         );",
     )
     .ok()?;
@@ -363,6 +372,100 @@ pub fn set_setting(key: &str, value: &str) {
     });
 }
 
+// --------------------------------------------------------------- auto mode
+
+/// Auto mode: keep a stopped agent going until its goal is met or the turn
+/// budget runs out. One row per multiplexer session, keyed by session name
+/// because that is what the daemon's pane snapshots carry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoConfig {
+    pub session: String,
+    pub goal: String,
+    pub max_turns: u32,
+    pub used: u32,
+    pub allow_waiting: bool,
+    pub enabled: bool,
+}
+
+fn auto_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutoConfig> {
+    Ok(AutoConfig {
+        session: row.get(0)?,
+        goal: row.get(1)?,
+        max_turns: row.get(2)?,
+        used: row.get(3)?,
+        allow_waiting: row.get::<_, i64>(4)? != 0,
+        enabled: row.get::<_, i64>(5)? != 0,
+    })
+}
+
+pub fn auto_get(session: &str) -> Option<AutoConfig> {
+    with_db(|conn| {
+        conn.query_row(
+            "SELECT session, goal, max_turns, used, allow_waiting, enabled
+             FROM auto WHERE session = ?1",
+            [session],
+            auto_row,
+        )
+    })
+}
+
+pub fn auto_list() -> Vec<AutoConfig> {
+    with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT session, goal, max_turns, used, allow_waiting, enabled
+             FROM auto ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], auto_row)?;
+        rows.collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Arm auto mode, resetting the turn counter so a re-armed goal starts fresh.
+/// Returns false when the database could not be opened (nothing was written).
+pub fn auto_enable(session: &str, goal: &str, max_turns: u32, allow_waiting: bool) -> bool {
+    with_db(|conn| {
+        conn.execute(
+            "INSERT INTO auto (session, goal, max_turns, used, allow_waiting, enabled, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4, 1, ?5)
+             ON CONFLICT(session) DO UPDATE SET
+                goal = excluded.goal,
+                max_turns = excluded.max_turns,
+                used = 0,
+                allow_waiting = excluded.allow_waiting,
+                enabled = 1,
+                updated_at = excluded.updated_at",
+            rusqlite::params![session, goal, max_turns, allow_waiting, now()],
+        )?;
+        Ok(())
+    })
+    .is_some()
+}
+
+/// Disarm without forgetting the goal — re-enabling resumes the same budget.
+pub fn auto_disable(session: &str) {
+    with_db(|conn| {
+        conn.execute(
+            "UPDATE auto SET enabled = 0, updated_at = ?2 WHERE session = ?1",
+            rusqlite::params![session, now()],
+        )?;
+        Ok(())
+    });
+}
+
+/// Count one delivered continuation; returns the new total.
+pub fn auto_bump(session: &str) -> u32 {
+    with_db(|conn| {
+        conn.execute(
+            "UPDATE auto SET used = used + 1, updated_at = ?2 WHERE session = ?1",
+            rusqlite::params![session, now()],
+        )?;
+        conn.query_row("SELECT used FROM auto WHERE session = ?1", [session], |row| row.get(0))
+    })
+    .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------- migration
 
 /// Import the three JSON stores this database replaces, once.
@@ -475,6 +578,41 @@ mod tests {
         set_label("cc_proj_1a2b3c4d", "  ");
         assert!(labels().is_empty());
         assert_eq!(conversation_id("cc_proj_1a2b3c4d").as_deref(), Some("conv-a"));
+
+        std::env::remove_var("AMUX_DB_PATH");
+    }
+
+    #[test]
+    fn auto_mode_round_trips_and_counts_turns() {
+        let _guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        scratch(tmp.path());
+
+        assert!(auto_get("cc_proj_1a2b3c4d").is_none());
+
+        assert!(auto_enable("cc_proj_1a2b3c4d", "ship the feature", 3, true));
+        let cfg = auto_get("cc_proj_1a2b3c4d").unwrap();
+        assert_eq!(cfg.goal, "ship the feature");
+        assert_eq!(cfg.max_turns, 3);
+        assert_eq!(cfg.used, 0);
+        assert!(cfg.allow_waiting);
+        assert!(cfg.enabled);
+
+        assert_eq!(auto_bump("cc_proj_1a2b3c4d"), 1);
+        assert_eq!(auto_bump("cc_proj_1a2b3c4d"), 2);
+        assert_eq!(auto_get("cc_proj_1a2b3c4d").unwrap().used, 2);
+
+        auto_disable("cc_proj_1a2b3c4d");
+        assert!(!auto_get("cc_proj_1a2b3c4d").unwrap().enabled);
+
+        // Re-arming resets the counter, so a fresh run gets its full budget.
+        assert!(auto_enable("cc_proj_1a2b3c4d", "second goal", 5, false));
+        let cfg = auto_get("cc_proj_1a2b3c4d").unwrap();
+        assert_eq!(cfg.used, 0);
+        assert_eq!(cfg.goal, "second goal");
+        assert!(!cfg.allow_waiting);
+
+        assert_eq!(auto_list().len(), 1);
 
         std::env::remove_var("AMUX_DB_PATH");
     }

@@ -1,7 +1,7 @@
 use crate::commands::sessions::{managed_sessions, ManagedSession};
 use crate::config::Agent;
 use crate::tmux;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::event::{
@@ -370,6 +370,39 @@ pub struct ProviderPick {
     pub force_extra: bool,
 }
 
+/// Which field of the auto form has the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoField {
+    Goal,
+    Turns,
+    Prompts,
+}
+
+/// The auto-mode form: a goal, a turn budget, and whether prompts are answered.
+///
+/// Auto mode needs a goal before it can decide anything, so it is a small form
+/// rather than a bare toggle. Opened with `t` on a session (or `a` in settings);
+/// Tab moves between fields, Enter arms, Esc cancels.
+#[derive(Debug, Clone)]
+pub struct AutoDraft {
+    pub goal: String,
+    /// Digits only, so a half-typed value is trivial to interpret.
+    pub max_turns: String,
+    /// Whether a continuation may also answer a y/n or permission prompt. Off
+    /// by default; turning it on lets the agent approve on your behalf.
+    pub allow_waiting: bool,
+    pub field: AutoField,
+}
+
+/// Parse the form's turn field, defaulting and clamping so a half-typed number
+/// never blocks arming.
+pub fn auto_max_turns(raw: &str) -> u32 {
+    raw.trim()
+        .parse::<u32>()
+        .unwrap_or(crate::serve::auto::DEFAULT_MAX_TURNS)
+        .clamp(1, 100)
+}
+
 /// Pure UI state, independent of rendering and of the multiplexer.
 pub struct AppState {
     pub projects: Vec<Project>,
@@ -483,6 +516,13 @@ pub struct AppState {
     /// simply draws no marker — the tree must not wait on status to be useful,
     /// and a sweep costs one terminal capture per pane.
     pub statuses: std::collections::BTreeMap<String, crate::serve::server::SessionStatus>,
+    /// Sessions with auto mode armed, by name — the tree marks them and the
+    /// form prefills from them. Re-read on the reload tick, so a budget the
+    /// daemon exhausted, or a goal armed from the phone, shows up without
+    /// anything here changing.
+    pub auto_sessions: std::collections::BTreeMap<String, crate::store::AutoConfig>,
+    /// The auto-mode form being filled in.
+    pub auto_editing: Option<AutoDraft>,
 }
 
 impl AppState {
@@ -520,6 +560,8 @@ impl AppState {
             cursor_before_draft: None,
             descriptions: std::collections::BTreeMap::new(),
             statuses: std::collections::BTreeMap::new(),
+            auto_sessions: std::collections::BTreeMap::new(),
+            auto_editing: None,
         }
     }
 
@@ -602,6 +644,41 @@ impl AppState {
         self.current_project().map(|p| p.dir.clone())
     }
 
+    /// Re-read which sessions have auto armed.
+    ///
+    /// Cheap (one query) and called on the reload tick, so the tree badge
+    /// reflects the daemon and other clients, not only what this screen did.
+    pub fn refresh_auto_sessions(&mut self) {
+        self.auto_sessions = crate::store::auto_list()
+            .into_iter()
+            .filter(|config| config.enabled)
+            .map(|config| (config.session.clone(), config))
+            .collect();
+    }
+
+    /// Whether this session has auto mode armed.
+    pub fn auto_on(&self, name: &str) -> bool {
+        self.auto_sessions.contains_key(name)
+    }
+
+    /// Open the auto form for the selected session, prefilled from what is
+    /// stored. Returns false when the cursor is not on a session.
+    pub fn begin_auto(&mut self) -> bool {
+        let Some(name) = self.current_name() else {
+            return false;
+        };
+        let stored = self.auto_sessions.get(&name);
+        self.auto_editing = Some(AutoDraft {
+            goal: stored.map(|c| c.goal.clone()).unwrap_or_default(),
+            max_turns: stored
+                .map(|c| c.max_turns.to_string())
+                .unwrap_or_else(|| crate::serve::auto::DEFAULT_MAX_TURNS.to_string()),
+            allow_waiting: stored.is_some_and(|c| c.allow_waiting),
+            field: AutoField::Goal,
+        });
+        true
+    }
+
     /// How many lines a row occupies. Must match the renderer, or a click
     /// lands on the wrong session.
     pub fn row_height(&self, row: Row) -> u16 {
@@ -623,6 +700,57 @@ impl AppState {
             2
         } else {
             1
+        }
+    }
+
+    /// Scroll the tree's viewport, leaving the cursor where it is.
+    ///
+    /// A wheel over a list scrolls the list — it does not pick things. Moving
+    /// the selection instead meant you could not read past what was selected
+    /// without also changing which session the right-hand column was showing.
+    pub fn scroll_view(&mut self, delta: isize) {
+        let rows = self.rows().len();
+        if rows == 0 {
+            return;
+        }
+        let next = self.view_offset.get() as isize + delta;
+        self.view_offset
+            .set(next.clamp(0, rows as isize - 1) as usize);
+    }
+
+    /// Bring the cursor back into view after it has moved.
+    ///
+    /// Only after it *moves*: the viewport is otherwise the wheel's to place,
+    /// and re-centring on every tick would undo each scroll as fast as it was
+    /// made.
+    pub fn ensure_cursor_visible(&self) {
+        let rows = self.rows();
+        if rows.is_empty() {
+            return;
+        }
+        let cursor = self.cursor.min(rows.len() - 1);
+        if cursor < self.view_offset.get() {
+            self.view_offset.set(cursor);
+            return;
+        }
+        // Walk back from the cursor until the rows between it and the top no
+        // longer fit, which is the lowest offset that still shows it whole.
+        let height = self.view_height.get().max(1);
+        let mut used = 0u16;
+        let mut first = cursor;
+        loop {
+            used += self.row_height(rows[first]);
+            if used > height {
+                first += 1;
+                break;
+            }
+            if first == 0 {
+                break;
+            }
+            first -= 1;
+        }
+        if first > self.view_offset.get() {
+            self.view_offset.set(first);
         }
     }
 
@@ -1008,6 +1136,59 @@ pub enum Row {
 /// "stop", so it stands in.
 pub const KEY_TO_INTERRUPT: &str = "Ctrl-C";
 
+/// What a button on a pane's top border does when clicked.
+#[derive(Debug, Clone, Copy)]
+enum PaneAction {
+    /// Write this key's bytes straight into the pane's pty.
+    Key(KeyCode, KeyModifiers),
+    /// Arm auto mode for the pane's session with the default "keep going"
+    /// goal, or disarm it if already armed.
+    ToggleAuto,
+    /// Ask the model for a short title for the pane's session and set it as the
+    /// session's label.
+    AutoName,
+}
+
+/// A control drawn on a pane's top border.
+///
+/// The keys exist because a few have no keyboard route to the agent at all:
+/// `Esc` leaves insert mode, so an agent waiting on an Escape can otherwise
+/// never be given one. The auto toggle exists so the mode is one click, not a
+/// remembered keybinding.
+struct PaneButton {
+    label: &'static str,
+    action: PaneAction,
+}
+
+const PANE_BUTTONS: &[PaneButton] = &[
+    // Rightmost, nearest the corner: the mode toggle, so it is the first thing
+    // that fits and the easiest to hit.
+    PaneButton {
+        label: "auto",
+        action: PaneAction::ToggleAuto,
+    },
+    PaneButton {
+        label: "name",
+        action: PaneAction::AutoName,
+    },
+    PaneButton {
+        label: "esc",
+        action: PaneAction::Key(KeyCode::Esc, KeyModifiers::NONE),
+    },
+    PaneButton {
+        label: "^C",
+        action: PaneAction::Key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    },
+    PaneButton {
+        label: "tab",
+        action: PaneAction::Key(KeyCode::Tab, KeyModifiers::NONE),
+    },
+    PaneButton {
+        label: "enter",
+        action: PaneAction::Key(KeyCode::Enter, KeyModifiers::NONE),
+    },
+];
+
 /// Group sessions into projects by their working directory.
 ///
 /// `session_cwd` is one subprocess per session, so this runs once per refresh
@@ -1259,6 +1440,48 @@ enum Outcome {
     Quit,
     Attach(String),
     Kill(String),
+    /// Replace this process with a fresh `amux`, so a rebuilt binary is what
+    /// comes back. Re-entering the loop in-process would keep the old one.
+    Restart,
+}
+
+/// Session statuses from the running daemon, or `None` when there is none.
+///
+/// One GET replaces the `capture-pane` subprocess per pane that
+/// [`crate::serve::server::session_statuses`] spawns — and the daemon has
+/// already done that sweep. `None` on any failure, including a token-protected
+/// daemon we cannot authenticate to, so the caller falls back to sweeping.
+fn daemon_statuses(
+) -> Option<std::collections::BTreeMap<String, crate::serve::server::SessionStatus>> {
+    let port = crate::serve::daemon_port();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let value: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/api/statuses"))
+        .send()
+        .ok()?
+        .json()
+        .ok()?;
+    parse_statuses(&value)
+}
+
+/// Map a `/api/statuses` body onto session statuses.
+///
+/// Split from the request so the wire shape is testable without a server.
+fn parse_statuses(
+    value: &serde_json::Value,
+) -> Option<std::collections::BTreeMap<String, crate::serve::server::SessionStatus>> {
+    use crate::serve::server::{PaneStatus, SessionStatus};
+
+    let mut out = std::collections::BTreeMap::new();
+    for (session, entry) in value.get("statuses")?.as_object()? {
+        let status: PaneStatus = serde_json::from_value(entry.get("status")?.clone()).ok()?;
+        let since = entry.get("since").and_then(|s| s.as_i64());
+        out.insert(session.clone(), SessionStatus { status, since });
+    }
+    Some(out)
 }
 
 pub fn run_tui(agents: &[Agent]) -> Result<()> {
@@ -1295,7 +1518,31 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
             // re-enter the TUI with refreshed list
             run_tui(agents)
         }
+        Outcome::Restart => restart_amux(),
     }
+}
+
+/// Replace the running amux with a fresh one, in the same terminal.
+///
+/// `exec` on unix puts the new binary in this very process, so the shell that
+/// launched amux never sees it exit and no new window opens. Elsewhere the best
+/// available is a child on the same console plus exit.
+#[cfg(unix)]
+fn restart_amux() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().context("cannot find the amux binary")?;
+    // `exec` returns only on failure.
+    let error = std::process::Command::new(exe).exec();
+    Err(anyhow::anyhow!("could not restart amux: {error}"))
+}
+
+#[cfg(not(unix))]
+fn restart_amux() -> Result<()> {
+    let exe = std::env::current_exe().context("cannot find the amux binary")?;
+    std::process::Command::new(exe)
+        .spawn()
+        .context("could not restart amux")?;
+    Ok(())
 }
 
 
@@ -1582,6 +1829,30 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// Open the file browser on the selected project, or close it if it is open.
+///
+/// One place, because three keys reach it: `Y` from the tree, F2 from either
+/// mode, and whichever of them you press again while it is up.
+fn toggle_browser(state: &mut AppState, tool: &mut Option<LiveTerm>, area: Rect) {
+    if state.browsing {
+        *tool = None;
+        state.browsing = false;
+        return;
+    }
+    let Some(dir) = state.current_dir() else {
+        state.notice = Some("nothing selected".into());
+        return;
+    };
+    let (cols, rows) = term_size(terminal_column(area));
+    match LiveTerm::run("files", "yazi", &[dir.clone()], &dir, cols, rows) {
+        Some(term) => {
+            *tool = Some(term);
+            state.browsing = true;
+        }
+        None => state.notice = Some("could not start yazi — is it installed?".into()),
+    }
+}
+
 /// Size of the terminal column, in cells, for the current frame size.
 fn term_size(area: Rect) -> (u16, u16) {
     // Minus the border on each side.
@@ -1634,6 +1905,10 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     // Descriptions are resolved off-thread too: each one may read an agent's
     // transcript, and there is one per live session.
     let (desc_tx, desc_rx) = mpsc::channel::<std::collections::BTreeMap<String, String>>();
+
+    // Auto-naming asks a model, which can take seconds; the answer comes back
+    // here as `(session, label)` — `None` meaning it could not be named.
+    let (name_tx, name_rx) = mpsc::channel::<(String, Option<String>)>();
     {
         let tx = desc_tx.clone();
         let projects = state.projects.clone();
@@ -1648,15 +1923,29 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     // very loop it is meant to annotate.
     let (status_tx, status_rx) = mpsc::channel();
     std::thread::spawn(move || loop {
+        // The daemon already captures every pane on its own poll; mirroring its
+        // result costs one small request instead of a `capture-pane` subprocess
+        // per pane. With no daemon — or one we cannot authenticate to — fall
+        // back to the local sweep, which is what this always used to do.
+        let statuses = daemon_statuses().unwrap_or_else(crate::serve::server::session_statuses);
         // `send` failing means the TUI has exited and dropped the receiver.
-        if status_tx.send(crate::serve::server::session_statuses()).is_err() {
+        if status_tx.send(statuses).is_err() {
             return;
         }
         std::thread::sleep(STATUS_EVERY);
     });
 
+    // The viewport is the wheel's to place; only a cursor that has actually
+    // moved gets to pull it back. Re-centring every tick would undo each scroll
+    // as fast as it was made.
+    let mut last_cursor = usize::MAX;
+
     let result = loop {
         state.clamp();
+        if state.cursor != last_cursor {
+            last_cursor = state.cursor;
+            state.ensure_cursor_visible();
+        }
         state.prune_browsing();
         state.follow_cursor();
 
@@ -1760,6 +2049,22 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             }
         }
 
+        // A finished auto-name. The label is already stored; this only puts it
+        // on screen now instead of waiting for the next description sweep.
+        while let Ok((session, label)) = name_rx.try_recv() {
+            match label {
+                Some(label) => {
+                    state.descriptions.insert(session.clone(), label.clone());
+                    state.notice = Some(format!("{session} → {label}"));
+                }
+                None => {
+                    state.notice =
+                        Some(format!("could not name {session} (DeepSeek key set?)"));
+                }
+            }
+            dirty = true;
+        }
+
         // Keep only the newest sweep; anything behind it is already superseded.
         let mut newest = None;
         while let Ok(map) = status_rx.try_recv() {
@@ -1794,6 +2099,15 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 // blank for as long as it takes to notice.
                 last_describe = Instant::now() - DESCRIBE_EVERY;
             }
+
+            // Auto is armed from the phone or the API too, and the daemon
+            // disarms it when a budget runs out — so the badge has to be
+            // re-read, not only written when this screen changes it.
+            let previous = state.auto_sessions.clone();
+            state.refresh_auto_sessions();
+            if state.auto_sessions != previous {
+                dirty = true;
+            }
         }
 
         // Titles are refined as an agent works, so re-read them even when the
@@ -1817,6 +2131,102 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 // Only the terminal column forwards — a wheel over the lists
                 // should move the selection, not scroll someone's agent.
                 let area = terminal_column(terminal.get_frame().area());
+
+                // A click on a pane's on-screen control does that one thing and
+                // is nothing else: no selection, no click handed to the agent.
+                // It wins over every other mouse meaning because a button is
+                // drawn over the pane.
+                if matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+                    if let Some((index, button)) = pane_button_hit(state, &live, area, column, row) {
+                        match PANE_BUTTONS[button].action {
+                            PaneAction::Key(code, modifiers) => {
+                                let bytes = encode_key(code, modifiers);
+                                if let Some(term) = live.get_mut(index) {
+                                    if !bytes.is_empty() {
+                                        term.write(&bytes);
+                                    }
+                                    let name = term.session.clone();
+                                    select_session(state, &name);
+                                }
+                            }
+                            // One click arms the default "keep going" mode (no
+                            // goal, the default budget); another disarms it.
+                            // The full form (`t`) is for a goal and a budget.
+                            PaneAction::ToggleAuto => {
+                                let name = live
+                                    .get(index)
+                                    .map(|term| term.session.clone())
+                                    .or_else(|| state.current_name());
+                                if let Some(name) = name {
+                                    select_session(state, &name);
+                                    if state.auto_on(&name) {
+                                        crate::store::auto_disable(&name);
+                                        state.notice = Some(format!("auto off for {name}"));
+                                    } else if crate::store::auto_enable(
+                                        &name,
+                                        "",
+                                        crate::serve::auto::DEFAULT_MAX_TURNS,
+                                        false,
+                                    ) {
+                                        state.notice =
+                                            Some(format!("auto on for {name} — keep it going"));
+                                    } else {
+                                        state.notice =
+                                            Some("auto not saved — database unavailable".into());
+                                    }
+                                    state.refresh_auto_sessions();
+                                }
+                            }
+                            // Name the session from what it is doing, so the
+                            // tree says something useful. Off-thread: the model
+                            // takes seconds, and a frame must not wait on it.
+                            PaneAction::AutoName => {
+                                let name = live
+                                    .get(index)
+                                    .map(|term| term.session.clone())
+                                    .or_else(|| state.current_name());
+                                if let Some(name) = name {
+                                    select_session(state, &name);
+                                    let cwd = state
+                                        .projects
+                                        .iter()
+                                        .find(|p| p.sessions.iter().any(|s| s.name == name))
+                                        .map(|p| p.dir.clone())
+                                        .unwrap_or_default();
+                                    let tx = name_tx.clone();
+                                    let session = name.clone();
+                                    state.notice = Some(format!("naming {name}…"));
+                                    std::thread::spawn(move || {
+                                        // opencode leaves no scrollback in the
+                                        // terminal, so its conversation is read
+                                        // from its own store; every other
+                                        // agent's history is the pane itself.
+                                        let context =
+                                            crate::commands::session_ids::opencode_history(
+                                                &session, &cwd, 120,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                crate::serve::server::capture_session(
+                                                    &session, 120,
+                                                )
+                                            });
+                                        let label = crate::serve::auto::suggest_label(&context);
+                                        if let Some(label) = &label {
+                                            let _ = crate::serve::sessions::set_label(
+                                                &session, label,
+                                            );
+                                        }
+                                        let _ = tx.send((session, label));
+                                    });
+                                }
+                            }
+                        }
+                        state.focus = Column::Terminal;
+                        dirty = true;
+                        continue;
+                    }
+                }
+
                 let inside = column > area.x
                     && column < area.x + area.width.saturating_sub(1)
                     && row > area.y
@@ -1919,14 +2329,63 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     }
                 } else {
                     match kind {
-                        MouseEventKind::ScrollDown => state.move_down(),
-                        MouseEventKind::ScrollUp => state.move_up(),
+                        MouseEventKind::ScrollDown => state.scroll_view(1),
+                        MouseEventKind::ScrollUp => state.scroll_view(-1),
                         // A click in the tree selects what was clicked. The
                         // hand is already on the mouse; making it reach for
                         // hjkl to do what a click obviously means is the kind
                         // of thing that makes a TUI feel hostile.
                         MouseEventKind::Down(MouseButton::Left) => {
                             let tree = tree_column(terminal.get_frame().area());
+                            // A border button wins over selecting a row: it sits
+                            // on the border, so no row is under it anyway.
+                            let on_button = tree_button_rects(tree)
+                                .into_iter()
+                                .find(|(rect, _, _)| {
+                                    row == rect.y
+                                        && column >= rect.x
+                                        && column < rect.x + rect.width
+                                });
+                            if let Some((_, button, _)) = on_button {
+                                match button {
+                                    // Leaves the loop; `event_loop` restores the
+                                    // terminal on the way out, then `run_tui`
+                                    // execs a fresh amux in its place.
+                                    TreeButton::Restart => break Outcome::Restart,
+                                    TreeButton::Respawn => {
+                                        if let Some(name) = state.current_name() {
+                                            let found =
+                                                state.projects.iter().find_map(|project| {
+                                                    project
+                                                        .sessions
+                                                        .iter()
+                                                        .find(|s| s.name == name)
+                                                        .map(|s| {
+                                                            (project.dir.clone(), s.alias.clone())
+                                                        })
+                                                });
+                                            if let Some((dir, alias)) = found {
+                                                let tx = spawn_tx.clone();
+                                                let agents = state.agents.clone();
+                                                state.notice =
+                                                    Some(format!("restarting {name}…"));
+                                                std::thread::spawn(move || {
+                                                    let _ = tx.send(restart_session(
+                                                        &name, &dir, &alias, &agents,
+                                                    ));
+                                                });
+                                            } else {
+                                                state.notice =
+                                                    Some("select a session first".into());
+                                            }
+                                        } else {
+                                            state.notice = Some("select a session first".into());
+                                        }
+                                        dirty = true;
+                                        continue;
+                                    }
+                                }
+                            }
                             if row > tree.y && row < tree.y + tree.height.saturating_sub(1) {
                                 if let Some(index) = state.row_at_line(row - tree.y - 1) {
                                     if state.selectable(state.rows()[index]) {
@@ -1996,9 +2455,8 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     // `Y` closes, everything else goes to the browser — it
                     // needs Esc and the arrow keys for its own navigation. The
                     // cost is yazi's unyank, which this keymap does not bind.
-                    if key.code == KeyCode::Char('Y') {
-                        tool = None;
-                        state.browsing = false;
+                    if matches!(key.code, KeyCode::Char('Y') | KeyCode::F(2)) {
+                        toggle_browser(state, &mut tool, terminal.get_frame().area());
                     } else if let Some(term) = tool.as_mut() {
                         let bytes = encode_key(key.code, key.modifiers);
                         if !bytes.is_empty() {
@@ -2038,6 +2496,87 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     dirty = true;
                     continue;
                 }
+                if state.auto_editing.is_some() {
+                    let mut submit = false;
+                    if let Some(draft) = state.auto_editing.as_mut() {
+                        match key.code {
+                            KeyCode::Esc => state.auto_editing = None,
+                            KeyCode::Backspace => match draft.field {
+                                AutoField::Goal => {
+                                    draft.goal.pop();
+                                }
+                                AutoField::Turns => {
+                                    draft.max_turns.pop();
+                                }
+                                AutoField::Prompts => {}
+                            },
+                            KeyCode::Tab => {
+                                draft.field = match draft.field {
+                                    AutoField::Goal => AutoField::Turns,
+                                    AutoField::Turns => AutoField::Prompts,
+                                    AutoField::Prompts => AutoField::Goal,
+                                };
+                            }
+                            KeyCode::BackTab => {
+                                draft.field = match draft.field {
+                                    AutoField::Goal => AutoField::Prompts,
+                                    AutoField::Turns => AutoField::Goal,
+                                    AutoField::Prompts => AutoField::Turns,
+                                };
+                            }
+                            // A checkbox needs a key that is not part of the
+                            // text, so it is Space and only on its own field.
+                            KeyCode::Char(' ') if draft.field == AutoField::Prompts => {
+                                draft.allow_waiting = !draft.allow_waiting;
+                            }
+                            KeyCode::Char(c) => match draft.field {
+                                AutoField::Goal => draft.goal.push(c),
+                                AutoField::Turns if c.is_ascii_digit() => {
+                                    if draft.max_turns.len() < 3 {
+                                        draft.max_turns.push(c);
+                                    }
+                                }
+                                _ => {}
+                            },
+                            KeyCode::Enter => submit = true,
+                            _ => {}
+                        }
+                    }
+                    if submit {
+                        let fields = state.auto_editing.as_ref().map(|draft| {
+                            (
+                                draft.goal.trim().to_string(),
+                                auto_max_turns(&draft.max_turns),
+                                draft.allow_waiting,
+                            )
+                        });
+                        state.auto_editing = None;
+                        match (state.current_name(), fields) {
+                            (Some(name), Some((goal, turns, allow_waiting))) => {
+                                // An empty goal is the default "keep going"
+                                // mode, not an error.
+                                if crate::store::auto_enable(&name, &goal, turns, allow_waiting) {
+                                    state.refresh_auto_sessions();
+                                    let what = if goal.is_empty() {
+                                        "keep it going".to_string()
+                                    } else {
+                                        goal.clone()
+                                    };
+                                    state.notice = Some(format!(
+                                        "auto on for {name} — {what}, up to {turns} continuations"
+                                    ));
+                                } else {
+                                    state.notice =
+                                        Some("auto not saved — database unavailable".into());
+                                }
+                            }
+                            (None, _) => {}
+                            _ => {}
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 if state.helping {
                     state.helping = false;
                     dirty = true;
@@ -2057,6 +2596,21 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                 state.notice = Some(format!("monitor stopped (pid {pid})"))
                             }
                             None => state.notice = Some("monitor was not running".into()),
+                        },
+                        // Arm auto mode for the session under the cursor. The
+                        // same form `t` opens from the tree.
+                        KeyCode::Char('a') => {
+                            if !state.begin_auto() {
+                                state.notice = Some("select a session first".into());
+                            }
+                        }
+                        KeyCode::Char('x') => match state.current_name() {
+                            Some(name) => {
+                                crate::store::auto_disable(&name);
+                                state.refresh_auto_sessions();
+                                state.notice = Some(format!("auto disarmed for {name}"));
+                            }
+                            None => state.notice = Some("select a session first".into()),
                         },
                         _ => {}
                     }
@@ -2300,6 +2854,15 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     let alt = key.modifiers.contains(KeyModifiers::ALT);
                     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                     match key.code {
+                        // Reaches the browser from inside a session, where `Y`
+                        // is a letter the agent is owed. Insert mode is left
+                        // standing, so closing the browser puts you back at the
+                        // prompt you were typing at.
+                        KeyCode::F(2) => {
+                            toggle_browser(state, &mut tool, terminal.get_frame().area());
+                            dirty = true;
+                            continue;
+                        }
                         KeyCode::Char('j') if alt => {
                             state.move_down();
                             dirty = true;
@@ -2401,23 +2964,9 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     // Browse the selected project without leaving for another
                     // window: the column is free while you are reading, and
                     // this is what it is for.
-                    KeyCode::Char('Y') => match state.current_dir() {
-                        Some(dir) => {
-                            let (cols, rows) =
-                                term_size(terminal_column(terminal.get_frame().area()));
-                            match LiveTerm::run("files", "yazi", &[dir.clone()], &dir, cols, rows) {
-                                Some(term) => {
-                                    tool = Some(term);
-                                    state.browsing = true;
-                                }
-                                None => {
-                                    state.notice =
-                                        Some("could not start yazi — is it installed?".into())
-                                }
-                            }
-                        }
-                        None => state.notice = Some("nothing selected".into()),
-                    },
+                    KeyCode::Char('Y') | KeyCode::F(2) => {
+                        toggle_browser(state, &mut tool, terminal.get_frame().area());
+                    }
                     // Hold this session on screen, or let go of it. Pinned
                     // panes stay put while the rest of the column keeps
                     // following the cursor.
@@ -2463,8 +3012,18 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                 Some(crate::store::labels().get(&name).cloned().unwrap_or_default());
                         }
                     }
+                    // Auto mode: keep this session's agent going when it stops.
+                    // A form, because the decision needs a goal and a budget.
+                    KeyCode::Char('t') => {
+                        if !state.begin_auto() {
+                            state.notice = Some("select a session first".into());
+                        }
+                    }
                     KeyCode::Char('~') | KeyCode::F(1) => state.helping = true,
-                    KeyCode::Char(',') => state.settings = true,
+                    KeyCode::Char(',') => {
+                        state.settings = true;
+                        state.refresh_auto_sessions();
+                    }
                     KeyCode::Char('o') => {
                         state.draft =
                             Some(Draft::Project(ProjectPicker::new(crate::store::projects())));
@@ -2871,6 +3430,42 @@ fn managed_names(agents: &[Agent]) -> Vec<String> {
 }
 
 /// Re-read the session list, keeping `select` selected if it is still there.
+/// Kill a session's agent and start it again under the same name, resuming the
+/// conversation it was on.
+///
+/// Off the event loop on purpose: `create_detached` blocks while codex answers
+/// its launch prompts. A session started with a provider (`<alias>-<provider>_
+/// …`) restarts as the plain agent — the provider is not recorded anywhere amux
+/// can read it back from.
+fn restart_session(name: &str, dir: &str, alias: &str, agents: &[Agent]) -> Result<String, String> {
+    let cwd = std::path::Path::new(dir)
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let agent = crate::config::find(agents, alias)
+        .ok_or_else(|| format!("unknown agent '{alias}'"))?
+        .clone();
+
+    // Resume exactly the conversation this session owned when the transcript is
+    // still there; otherwise the directory's newest, the same order `amux run`
+    // resolves in.
+    let id = crate::commands::session_ids::load_id(name)
+        .filter(|id| crate::commands::session_ids::session_file_exists(&agent.name, &cwd, id))
+        .or_else(|| crate::commands::session_ids::current_id(&agent.name, &cwd));
+
+    crate::tmux::kill_session(name).map_err(|error| error.to_string())?;
+
+    let mut argv = agent.command.clone();
+    if let Some(id) = &id {
+        argv.extend(crate::commands::session_ids::resume_args(&agent.name, id));
+    }
+    crate::commands::run::create_detached(&agent, &cwd, name, &argv, &[])
+        .map_err(|error| error.to_string())?;
+    if let Some(id) = &id {
+        crate::commands::session_ids::store_id(name, id);
+    }
+    Ok(name.to_string())
+}
+
 fn reload(state: &mut AppState, select: Option<String>) {
     let all = tmux::list_session_names().unwrap_or_default();
     state.projects = group_by_project(managed_sessions(&all, &state.agents));
@@ -2967,8 +3562,10 @@ pub fn encode_mouse(kind: MouseEventKind, col: u16, row: u16) -> Vec<u8> {
 /// the agent sees exactly what it would from a real terminal, including the
 /// escape sequences for arrows and the control codes for chords.
 ///
-/// `Esc` is absent on purpose: it leaves insert mode and never reaches the
-/// agent, so `KEY_TO_INTERRUPT` stands in for interrupting one.
+/// `Esc` is here for the on-screen button: from the keyboard it leaves insert
+/// mode and never reaches the agent, so `KEY_TO_INTERRUPT` stands in for a
+/// keyboard interrupt. The button is how an agent that needs a real Escape
+/// gets one.
 pub fn encode_key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     match code {
@@ -2977,6 +3574,7 @@ pub fn encode_key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
             vec![(c.to_ascii_lowercase() as u8) - b'a' + 1]
         }
         KeyCode::Char(c) => c.to_string().into_bytes(),
+        KeyCode::Esc => vec![0x1b],
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Tab => vec![b'\t'],
@@ -3029,7 +3627,7 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
     } else if state.browsing {
         render_tool(f, tool, columns[1]);
     } else if state.settings {
-        render_settings(f, columns[1]);
+        render_settings(f, state, columns[1]);
     } else {
         match &state.draft {
             Some(draft) => render_draft(f, draft, columns[1]),
@@ -3043,6 +3641,9 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
     }
     if state.picking_agent {
         render_agent_picker(f, state, outer[0]);
+    }
+    if state.auto_editing.is_some() {
+        render_auto_form(f, state, outer[0]);
     }
     render_status(f, state, outer[1]);
 }
@@ -3097,6 +3698,102 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 
+
+/// The auto-mode form: a goal, a turn budget, and whether prompts are answered.
+///
+/// A centered popup rather than a column, because it is a decision about the
+/// session you were just looking at — not a mode the whole screen enters.
+fn render_auto_form(f: &mut Frame, state: &AppState, area: Rect) {
+    let Some(draft) = &state.auto_editing else {
+        return;
+    };
+    let session = state.current_name().unwrap_or_default();
+    let style = |field: AutoField| {
+        if draft.field == field {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let text = |field: AutoField, value: &str| {
+        if draft.field == field {
+            format!("{value}_")
+        } else {
+            value.to_string()
+        }
+    };
+
+    let mut rows = vec![
+        Line::styled(format!("  {session}"), Style::default().fg(Color::DarkGray)),
+        Line::raw(""),
+        Line::from({
+            let mut spans = vec![
+                Span::styled("  goal        ", Style::default().fg(Color::DarkGray)),
+                Span::styled(text(AutoField::Goal, &draft.goal), style(AutoField::Goal)),
+            ];
+            // An empty goal is the default "keep going" mode, so say what it
+            // means rather than leaving the field looking unfinished.
+            if draft.goal.is_empty() {
+                spans.push(Span::styled(
+                    "  keep going by default",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            spans
+        }),
+        Line::from(vec![
+            Span::styled("  max turns   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                text(AutoField::Turns, &draft.max_turns),
+                style(AutoField::Turns),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  prompts     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!(
+                    "[{}] answer y/n and permission prompts",
+                    if draft.allow_waiting { "x" } else { " " }
+                ),
+                style(AutoField::Prompts),
+            ),
+        ]),
+    ];
+    // The TUI only records the goal; the daemon is what types. Arming while it
+    // is down would save silently and do nothing.
+    if crate::serve::daemon_pid().is_none() {
+        rows.push(Line::styled(
+            "  the monitor is stopped — start it (,) or nothing continues",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    rows.push(Line::raw(""));
+    rows.push(Line::styled(
+        "  Tab next field   Enter starts   Esc cancels",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let height = (rows.len() as u16 + 2).min(area.height);
+    let width = 58.min(area.width);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" auto mode "),
+        ),
+        popup,
+    );
+}
 
 /// Keep the last `max` characters, marking the cut with a leading ellipsis.
 fn elide_front(path: &str, max: usize) -> String {
@@ -3175,6 +3872,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("^u ^d ^b ^f", "half and whole pages"),
         ("JK", "scroll the pane's history"),
         ("drag", "select in a pane, copies on release"),
+        ("click", "pane auto/name/esc; tree restart/respawn"),
         ("Enter / i", "type into the selected session"),
         ("Esc", "stop typing"),
         ("^↑ ^↓", "switch sessions while typing"),
@@ -3189,6 +3887,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("A", "full screen; detach comes back"),
         ("d", "kill the selected session"),
         ("/", "filter projects"),
+        ("t", "auto mode: keep it going"),
         (",", "settings"),
         ("r", "name this session"),
         ("~", "this list"),
@@ -3234,7 +3933,7 @@ fn render_help(f: &mut Frame, area: Rect) {
 /// The monitor is what the phone app talks to, so whether it is up matters —
 /// and finding out meant leaving for a shell to run `amux serve` or `amux
 /// stop`.
-fn render_settings(f: &mut Frame, area: Rect) {
+fn render_settings(f: &mut Frame, state: &AppState, area: Rect) {
     let pid = crate::serve::daemon_pid();
     let mut rows: Vec<Line> = vec![Line::raw("")];
 
@@ -3263,6 +3962,77 @@ fn render_settings(f: &mut Frame, area: Rect) {
             format!("  log        {}", shorten_home(&log.to_string_lossy())),
             Style::default().fg(Color::DarkGray),
         ));
+    }
+
+    // Auto mode belongs to one session, so name it and show what is stored.
+    // Whether it does anything depends on the monitor above: the TUI only
+    // records the goal, the daemon is what types.
+    rows.push(Line::raw(""));
+    match state.current_name() {
+        Some(name) => {
+            rows.push(Line::styled(
+                format!("  auto       {name}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            match state.auto_sessions.get(&name) {
+                Some(config) => {
+                    rows.push(Line::from(vec![
+                        Span::raw("             "),
+                        Span::styled("armed", Style::default().fg(Color::Green)),
+                        Span::styled(
+                            format!("   {} of {} continuations", config.used, config.max_turns),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                    rows.push(Line::styled(
+                        format!(
+                            "             goal: {}",
+                            if config.goal.is_empty() {
+                                "(keep going)".to_string()
+                            } else {
+                                truncate(&config.goal, (area.width as usize).saturating_sub(22))
+                            }
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    rows.push(Line::styled(
+                        format!(
+                            "             prompts: {}",
+                            if config.allow_waiting {
+                                "answered for you"
+                            } else {
+                                "left to you"
+                            }
+                        ),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    if pid.is_none() {
+                        rows.push(Line::styled(
+                            "             monitor is stopped — nothing will continue it",
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
+                    rows.push(Line::styled(
+                        "             a edits   x disarms",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                None => {
+                    rows.push(Line::from(vec![
+                        Span::raw("             "),
+                        Span::styled("off", Style::default().fg(Color::DarkGray)),
+                    ]));
+                    rows.push(Line::styled(
+                        "             a sets a goal and arms it",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+        }
+        None => rows.push(Line::styled(
+            "  auto       select a session first",
+            Style::default().fg(Color::DarkGray),
+        )),
     }
 
     rows.push(Line::raw(""));
@@ -3445,6 +4215,59 @@ fn tree_width(total: u16) -> u16 {
 const TREE_MAX: u16 = 52;
 
 /// The tree: projects, with their sessions nested under the open ones.
+/// The controls on the sessions panel's top border.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeButton {
+    /// Relaunch the selected session's agent, resuming its conversation.
+    Respawn,
+    /// Replace amux itself with a fresh process.
+    Restart,
+}
+
+const TREE_BUTTONS: &[(TreeButton, &str)] = &[
+    // Rightmost, nearest the corner: after a rebuild, restarting amux is the
+    // one that must be easiest to find.
+    (TreeButton::Restart, " restart "),
+    (TreeButton::Respawn, " respawn "),
+];
+
+/// Where the tree's top-border buttons sit, right to left, with their labels.
+///
+/// One function for drawing and hit-testing, so a click lands on what it looks
+/// like it hits. Empty when the panel is too narrow to hold them without
+/// crowding the " sessions " title.
+fn tree_button_rects(tree: Rect) -> Vec<(Rect, TreeButton, &'static str)> {
+    let mut rects = Vec::new();
+    if tree.height < 2 {
+        return rects;
+    }
+    let total: u16 = TREE_BUTTONS
+        .iter()
+        .map(|(_, label)| label.chars().count() as u16)
+        .sum::<u16>()
+        + TREE_BUTTONS.len().saturating_sub(1) as u16;
+    if tree.width < total + 12 {
+        return rects;
+    }
+    let mut end = tree.x + tree.width - 1;
+    for (button, label) in TREE_BUTTONS {
+        let width = label.chars().count() as u16;
+        end -= width;
+        rects.push((
+            Rect {
+                x: end,
+                y: tree.y,
+                width,
+                height: 1,
+            },
+            *button,
+            label,
+        ));
+        end = end.saturating_sub(1);
+    }
+    rects
+}
+
 fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
     // Inside the border, which is what a description line has to fit within.
     let width = area.width.saturating_sub(2) as usize;
@@ -3493,6 +4316,19 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                 };
                 let (word, colour) = status_marker(status);
                 let age = status_age(status);
+                // A folded (or single-session) project stands in for its
+                // session, so its auto badge belongs on this row — a collapsed
+                // project must not hide the one thing running unattended.
+                let auto = if !expandable {
+                    project
+                        .sessions
+                        .first()
+                        .is_some_and(|s| state.auto_on(&s.name))
+                } else if state.collapsed.contains(&project.dir) {
+                    project.sessions.iter().any(|s| state.auto_on(&s.name))
+                } else {
+                    false
+                };
                 // A project that cannot expand *is* its one session, so its
                 // description belongs here — there is no child row to carry it.
                 let about = (!expandable)
@@ -3528,6 +4364,12 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                     Span::styled(format!("{trailing:<9}"), Style::default().fg(Color::DarkGray)),
                     Span::styled(format!("{word:<8}"), Style::default().fg(colour)),
                     Span::styled(age, Style::default().fg(colour)),
+                    Span::styled(
+                        if auto { "  auto" } else { "" },
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ])];
                 if let Some(about) = about {
                     lines.push(Line::styled(
@@ -3594,6 +4436,12 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                         status_age(state.statuses.get(&session.name)),
                         Style::default().fg(colour),
                     ),
+                    Span::styled(
+                        if state.auto_on(&session.name) { "  auto" } else { "" },
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ])];
                 if let Some(about) = state.descriptions.get(&session.name) {
                     lines.push(Line::styled(
@@ -3638,10 +4486,12 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
         items
     };
 
+    // No `select()`: the list widget drags the offset back to whatever is
+    // selected, which is the whole reason the wheel could not scroll past it.
+    // With nothing selected the offset is honoured, so the highlight is painted
+    // onto the cursor's own row instead.
     let mut list_state = ListState::default();
-    if !state.rows().is_empty() {
-        list_state.select(Some(state.cursor));
-    }
+    *list_state.offset_mut() = state.view_offset.get();
 
     let (border, style) = border_for(state, Column::Tree);
     let block = Block::default()
@@ -3651,6 +4501,19 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
         .title(" sessions ");
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // Buttons on the panel's top border: relaunch the selected session's agent,
+    // or amux itself. Killing and relaunching by hand each time is a tax the
+    // tree should absorb.
+    for (rect, _, label) in tree_button_rects(area) {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+            ))),
+            rect,
+        );
+    }
 
     // The footer holds the bottom row for itself rather than scrolling with the
     // list: a reading of what amux costs is only worth having if it is there
@@ -3667,8 +4530,18 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
         _ => (inner, None),
     };
 
-    let list =
-        List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let items: Vec<ListItem> = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            if i == state.cursor {
+                item.style(Style::default().add_modifier(Modifier::REVERSED))
+            } else {
+                item
+            }
+        })
+        .collect();
+    let list = List::new(items);
     f.render_stateful_widget(list, list_area, &mut list_state);
 
     if let Some((usage, area)) = footer {
@@ -3681,8 +4554,8 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
         );
     }
 
-    // Rendering is what decides where the list starts scrolling from, so record
-    // it here — a click has only a screen position to work back from.
+    // The widget clamps the offset to something renderable; take that back so a
+    // wheel past the end settles rather than leaving the tree blank.
     state.view_offset.set(list_state.offset());
     state.view_height.set(list_area.height);
 }
@@ -3742,6 +4615,81 @@ fn pane_rects(area: Rect, pinned: usize, browse: bool) -> Vec<Rect> {
             }
         }
     }
+}
+
+/// The title a pane's border carries: the session it is showing.
+///
+/// One function for drawing and hit-testing, so the key buttons know how much
+/// room the title takes and are never drawn where they cannot be clicked.
+fn pane_title(state: &AppState, live: Option<&LiveTerm>) -> String {
+    match live.map(|t| t.session.as_str()).or(state.current_name().as_deref()) {
+        Some(name) => format!(" {name} "),
+        None => " terminal ".to_string(),
+    }
+}
+
+/// Where the pane buttons sit on a pane's top border, right to left.
+///
+/// `title_chars` is the title the border carries, so a button never lands on
+/// it. Shared by drawing and hit-testing so a click cannot land on a different
+/// button than the one it looks like.
+fn pane_button_rects(pane: Rect, title_chars: u16) -> Vec<(Rect, usize)> {
+    let mut rects = Vec::new();
+    if pane.width < 4 || pane.height < 3 {
+        return rects;
+    }
+    // First cell a button may occupy: one in from the left corner, past the
+    // title and the space the border puts after it.
+    let min_x = pane.x + 2 + title_chars;
+    // Exclusive right edge, starting at the corner cell and keeping off it.
+    let mut end = pane.x + pane.width - 1;
+    for (index, button) in PANE_BUTTONS.iter().enumerate() {
+        let width = button.label.chars().count() as u16 + 2;
+        // Stop rather than overlap the title, and leave a gap between buttons.
+        if end < min_x + width {
+            break;
+        }
+        end -= width;
+        rects.push((
+            Rect {
+                x: end,
+                y: pane.y,
+                width,
+                height: 1,
+            },
+            index,
+        ));
+        end = end.saturating_sub(1);
+    }
+    rects
+}
+
+/// The pane button under a screen position, if any: (pane index, button index).
+fn pane_button_hit(
+    state: &AppState,
+    live: &[LiveTerm],
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<(usize, usize)> {
+    let rects = pane_rects(area, state.pinned.len(), state.has_browse_pane());
+    let rects = if rects.is_empty() { vec![area] } else { rects };
+    for (index, pane) in rects.iter().enumerate() {
+        let term = live.get(index);
+        // Buttons are drawn only on the focused pane, so only that pane's
+        // buttons may be clicked — otherwise an invisible button would still
+        // fire.
+        if !pane_is_focused(state, term) {
+            continue;
+        }
+        let title_chars = pane_title(state, term).chars().count() as u16;
+        for (rect, button) in pane_button_rects(*pane, title_chars) {
+            if row == rect.y && column >= rect.x && column < rect.x + rect.width {
+                return Some((index, button));
+            }
+        }
+    }
+    None
 }
 
 /// The terminal column: the pinned sessions, and whatever the cursor is on.
@@ -3805,7 +4753,8 @@ fn render_one_terminal(
     let (border, style) = border_for(state, Column::Terminal);
     // Stacked, only one pane can receive the keyboard; the rest must not claim
     // the border that says they can.
-    let (border, style) = if pane_is_focused(state, live) {
+    let focused = pane_is_focused(state, live);
+    let (border, style) = if focused {
         (border, style)
     } else {
         (BorderType::Plain, Style::default().fg(Color::DarkGray))
@@ -3813,10 +4762,8 @@ fn render_one_terminal(
     // Each pane is titled with the session *it* is showing, not the one the
     // cursor is on — stacked, they are rarely the same, and three panes under
     // one name says nothing about which is which.
-    let title = match live.map(|t| t.session.as_str()).or(state.current_name().as_deref()) {
-        Some(name) => format!(" {name} "),
-        None => " terminal ".to_string(),
-    };
+    let title = pane_title(state, live);
+    let title_chars = title.chars().count() as u16;
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(border)
@@ -3834,6 +4781,43 @@ fn render_one_terminal(
                 .block(block),
             area,
         ),
+    }
+
+    // The controls on the border: keys with no keyboard route to the agent,
+    // and the auto toggle. Drawn after the pane so they sit on top of it, and
+    // only on the focused pane: a stack of panes each repeating the same row is
+    // clutter, and the one that is not the keyboard's target does not need them.
+    if focused {
+        let armed = match live {
+            Some(term) => state.auto_on(&term.session),
+            None => state.current_name().is_some_and(|name| state.auto_on(&name)),
+        };
+        for (rect, index) in pane_button_rects(area, title_chars) {
+            let button = &PANE_BUTTONS[index];
+            let (label, style) = match button.action {
+                // Armed reads as a lit button, so the pane itself shows the
+                // mode is on without opening anything.
+                PaneAction::ToggleAuto if armed => (
+                    "AUTO".to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                PaneAction::ToggleAuto => (
+                    "auto".to_string(),
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                ),
+                PaneAction::Key(..) | PaneAction::AutoName => (
+                    button.label.to_string(),
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!(" {label} "), style))),
+                rect,
+            );
+        }
     }
 }
 
@@ -4723,6 +5707,232 @@ mod tests {
         assert_eq!(cell_in(inner, inner.x + inner.width, 35), None);
     }
 
+    /// The on-border controls sit on the top border, right to left, and never
+    /// overlap the title or each other — the geometry a click depends on.
+    #[test]
+    fn pane_buttons_sit_on_the_top_border_clear_of_the_title() {
+        let pane = Rect { x: 0, y: 5, width: 40, height: 10 };
+        let rects = pane_button_rects(pane, 8);
+        assert!(!rects.is_empty());
+        // The auto toggle is rightmost, so it is the first to fit.
+        assert_eq!(rects[0].1, 0);
+        assert!(matches!(PANE_BUTTONS[0].action, PaneAction::ToggleAuto));
+
+        let mut previous = pane.x + pane.width;
+        for (rect, _) in &rects {
+            assert_eq!(rect.y, pane.y, "buttons belong on the top border row");
+            assert!(rect.x >= pane.x + 1, "a button covered the left corner");
+            assert!(
+                rect.x + rect.width <= pane.x + pane.width - 1,
+                "a button covered the right corner"
+            );
+            assert!(rect.x + rect.width <= previous, "buttons overlap");
+            previous = rect.x;
+        }
+
+        // Too narrow for the title plus a button: draw none rather than one
+        // that would be unclickable where it overlaps.
+        assert!(pane_button_rects(Rect { x: 0, y: 0, width: 20, height: 5 }, 14).is_empty());
+    }
+
+    /// The tree's top-border buttons sit right-aligned on the border, keep off
+    /// the corner, and are absent on a panel too narrow to hold them.
+    #[test]
+    fn the_tree_buttons_sit_on_the_border() {
+        let tree = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let rects = tree_button_rects(tree);
+        assert_eq!(rects.len(), TREE_BUTTONS.len());
+        assert_eq!(rects[0].1, TreeButton::Restart, "restart should be rightmost");
+
+        let mut previous = tree.x + tree.width - 1;
+        for (rect, _, label) in &rects {
+            assert_eq!(rect.y, tree.y, "a button belongs on the top border");
+            assert!(rect.x >= tree.x + 1, "a button covered the left corner");
+            assert!(
+                rect.x + rect.width <= previous,
+                "buttons overlap or pass the corner"
+            );
+            assert_eq!(rect.width as usize, label.chars().count());
+            previous = rect.x;
+        }
+
+        assert!(tree_button_rects(Rect { x: 0, y: 0, width: 20, height: 20 }).is_empty());
+        assert!(tree_button_rects(Rect { x: 0, y: 0, width: 60, height: 1 }).is_empty());
+    }
+
+    #[test]
+    fn the_tree_draws_a_restart_button() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let text = drawn(&state, 160);
+        assert!(text.contains("restart"), "no restart button");
+        assert!(text.contains("respawn"), "no respawn button");
+    }
+
+    #[test]
+    fn a_click_maps_to_the_button_it_looks_like() {
+        let state = AppState::new(projects());
+        let area = Rect { x: 0, y: 0, width: 60, height: 20 };
+        let title_chars = pane_title(&state, None).chars().count() as u16;
+        let rects = pane_button_rects(area, title_chars);
+        assert!(!rects.is_empty());
+
+        let (auto, index) = rects[0];
+        assert_eq!(index, 0);
+        assert_eq!(
+            pane_button_hit(&state, &[], area, auto.x, auto.y),
+            Some((0, 0)),
+            "a click on the auto button should name it"
+        );
+        // A cell on the border but left of every button hits nothing.
+        assert_eq!(pane_button_hit(&state, &[], area, area.x + 1, area.y), None);
+        // And the row below the border is the pane, not a button.
+        assert_eq!(pane_button_hit(&state, &[], area, auto.x, area.y + 1), None);
+    }
+
+    /// The esc button's whole reason for existing: bytes an Esc actually
+    /// reaches the agent, which the keyboard's Esc never does.
+    #[test]
+    fn the_esc_button_sends_a_real_escape() {
+        assert!(PANE_BUTTONS.iter().any(|button| matches!(
+            button.action,
+            PaneAction::Key(KeyCode::Esc, _)
+        )));
+        assert_eq!(encode_key(KeyCode::Esc, KeyModifiers::NONE), vec![0x1b]);
+        assert_eq!(
+            encode_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            vec![0x03]
+        );
+    }
+
+    /// The controls are drawn on the pane border, so they are visible — and
+    /// reachable by mouse — without entering insert mode. An armed session
+    /// lights the auto button.
+    #[test]
+    fn the_pane_draws_its_controls() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let text = drawn(&state, 160);
+        assert!(text.contains("auto"), "no auto toggle on the pane");
+        assert!(text.contains("esc"), "no esc button on the pane");
+        assert!(text.contains("^C"), "no interrupt button on the pane");
+        assert!(!text.contains("AUTO"), "an unarmed session should not read AUTO");
+
+        state.auto_sessions.insert(
+            "cc_alpha_11111111".into(),
+            crate::store::AutoConfig {
+                session: "cc_alpha_11111111".into(),
+                goal: String::new(),
+                max_turns: 10,
+                used: 0,
+                allow_waiting: false,
+                enabled: true,
+            },
+        );
+        assert!(
+            drawn(&state, 160).contains("AUTO"),
+            "an armed session should light the auto button"
+        );
+    }
+
+    /// The daemon's `/api/statuses` body maps onto the TUI's session statuses,
+    /// ages and all — including `since: null` for an inferred status.
+    #[test]
+    fn a_status_response_maps_onto_session_statuses() {
+        use crate::serve::server::PaneStatus;
+
+        let value = serde_json::json!({
+            "ok": true,
+            "statuses": {
+                "cc_alpha_11111111": { "status": "waiting", "since": 1_700_000_000 },
+                "cx_beta_22222222": { "status": "running", "since": null }
+            }
+        });
+        let map = parse_statuses(&value).expect("a well-formed body should parse");
+        assert_eq!(
+            map.get("cc_alpha_11111111").map(|s| &s.status),
+            Some(&PaneStatus::Waiting)
+        );
+        assert_eq!(
+            map.get("cc_alpha_11111111").and_then(|s| s.since),
+            Some(1_700_000_000)
+        );
+        assert_eq!(map.get("cx_beta_22222222").and_then(|s| s.since), None);
+
+        // A body without statuses — an unauthorized one, say — yields None, so
+        // the caller falls back to its own sweep rather than showing nothing.
+        assert!(parse_statuses(&serde_json::json!({ "error": "unauthorized" })).is_none());
+    }
+
+    /// The wheel scrolls the list; it does not pick things.
+    ///
+    /// Moving the selection instead meant you could not read further down the
+    /// tree without also changing which session the right-hand column showed —
+    /// a wheel over a list is how you look around, not how you choose.
+    #[test]
+    fn the_wheel_moves_the_viewport_and_leaves_the_cursor_alone() {
+        let many: Vec<Project> = (0..12)
+            .map(|i| Project {
+                dir: format!("/work/p{i}"),
+                name: format!("p{i}"),
+                alias: None,
+                sessions: vec![session(&format!("cc_p{i}_1111111{i}"), "cc")],
+            })
+            .collect();
+        let mut state = AppState::with_agents(many, crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+        state.view_height.set(6);
+        let picked = state.current_name();
+
+        state.scroll_view(3);
+        assert_eq!(state.view_offset.get(), 3, "the viewport did not move");
+        assert_eq!(state.cursor, 0, "the wheel moved the selection");
+        assert_eq!(state.current_name(), picked, "the wheel changed the session");
+
+        // Back up past the top settles rather than wrapping or underflowing.
+        state.scroll_view(-9);
+        assert_eq!(state.view_offset.get(), 0);
+        // And past the end settles on the last row rather than emptying the box.
+        state.scroll_view(999);
+        assert_eq!(state.view_offset.get(), state.rows().len() - 1);
+    }
+
+    /// Moving the cursor still brings it back into view — the wheel owns the
+    /// viewport, but only until you navigate.
+    #[test]
+    fn a_cursor_that_moves_pulls_the_viewport_after_it() {
+        let many: Vec<Project> = (0..12)
+            .map(|i| Project {
+                dir: format!("/work/p{i}"),
+                name: format!("p{i}"),
+                alias: None,
+                sessions: vec![session(&format!("cc_p{i}_1111111{i}"), "cc")],
+            })
+            .collect();
+        let mut state = AppState::with_agents(many, crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+        state.view_height.set(5);
+
+        // Scrolled far away, then the cursor moves: the viewport follows it.
+        state.scroll_view(8);
+        assert_eq!(state.view_offset.get(), 8);
+        state.ensure_cursor_visible();
+        assert_eq!(state.view_offset.get(), 0, "the cursor was left off screen");
+
+        // Walking down past the bottom edge scrolls by as much as it must.
+        for _ in 0..7 {
+            state.move_down();
+        }
+        state.ensure_cursor_visible();
+        let offset = state.view_offset.get();
+        assert!(offset > 0, "the viewport never followed the cursor down");
+        assert!(
+            offset <= state.cursor,
+            "the viewport jumped past the cursor: offset {offset}, cursor {}",
+            state.cursor
+        );
+    }
+
     /// A path too long for the popup must lose its *front*. The tail is what
     /// tells two projects apart; cutting there leaves a column of identical
     /// "/Users/not/projects/devs/…".
@@ -5264,6 +6474,168 @@ mod tests {
             text.contains("s starts it"),
             "a stopped daemon must offer start"
         );
+    }
+
+    /// Arming auto is a goal, not a bare switch, so the settings panel has to
+    /// show what is stored and the form has to show every field it asks for.
+    #[test]
+    fn settings_and_the_form_show_the_auto_state() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        state.settings = true;
+
+        let text = drawn(&state, 160);
+        assert!(text.contains("auto"), "the panel does not mention auto");
+        assert!(text.contains("off"), "an unarmed session should read off");
+        assert!(text.contains("a sets a goal"), "arming is not explained");
+
+        state.auto_sessions.insert(
+            "cc_alpha_11111111".into(),
+            crate::store::AutoConfig {
+                session: "cc_alpha_11111111".into(),
+                goal: "port-the-parser".into(),
+                max_turns: 10,
+                used: 3,
+                allow_waiting: true,
+                enabled: true,
+            },
+        );
+        let text = drawn(&state, 160);
+        assert!(text.contains("armed"));
+        assert!(text.contains("3 of 10"));
+        assert!(text.contains("port-the-parser"));
+        assert!(text.contains("answered for you"));
+
+        // The form is a popup over everything, and lists all three fields.
+        state.auto_editing = Some(AutoDraft {
+            goal: "keep-going".into(),
+            max_turns: "7".into(),
+            allow_waiting: false,
+            field: AutoField::Turns,
+        });
+        let text = drawn(&state, 160);
+        assert!(text.contains("auto mode"), "the form is not titled");
+        assert!(text.contains("keep-going"));
+        assert!(text.contains("max turns"));
+        assert!(text.contains("7_"), "the focused field carries the caret");
+    }
+
+    /// A goal left blank is the default "keep going" mode, and both the panel
+    /// and the form say so rather than showing an empty field.
+    #[test]
+    fn a_blank_goal_reads_as_keep_going() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        state.settings = true;
+        state.auto_sessions.insert(
+            "cc_alpha_11111111".into(),
+            crate::store::AutoConfig {
+                session: "cc_alpha_11111111".into(),
+                goal: String::new(),
+                max_turns: 10,
+                used: 0,
+                allow_waiting: false,
+                enabled: true,
+            },
+        );
+        assert!(drawn(&state, 160).contains("(keep going)"));
+
+        state.auto_editing = Some(AutoDraft {
+            goal: String::new(),
+            max_turns: "10".into(),
+            allow_waiting: false,
+            field: AutoField::Turns,
+        });
+        let text = drawn(&state, 160);
+        assert!(
+            text.contains("keep going by default"),
+            "the form does not explain a blank goal"
+        );
+    }
+
+    /// The tree marks an armed session, so one running unattended is visible
+    /// without opening anything.
+    ///
+    /// Armed is a *different* session from the focused one: the focused pane
+    /// already carries the `auto` toggle, so counting occurrences keeps the two
+    /// apart.
+    #[test]
+    fn the_tree_marks_a_session_that_has_auto_armed() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        assert_eq!(
+            drawn(&state, 160).matches("auto").count(),
+            1,
+            "only the focused pane's toggle should read auto"
+        );
+
+        state.auto_sessions.insert(
+            "cx_beta_22222222".into(),
+            crate::store::AutoConfig {
+                session: "cx_beta_22222222".into(),
+                goal: "ship it".into(),
+                max_turns: 10,
+                used: 0,
+                allow_waiting: false,
+                enabled: true,
+            },
+        );
+        assert_eq!(
+            drawn(&state, 160).matches("auto").count(),
+            2,
+            "the armed session's tree row should add a marker"
+        );
+    }
+
+    #[test]
+    fn the_turn_field_defaults_and_clamps() {
+        let default = crate::serve::auto::DEFAULT_MAX_TURNS;
+        assert_eq!(auto_max_turns(""), default);
+        assert_eq!(auto_max_turns("nonsense"), default);
+        assert_eq!(auto_max_turns("0"), 1);
+        assert_eq!(auto_max_turns("200"), 100);
+        assert_eq!(auto_max_turns("7"), 7);
+    }
+
+    /// The panel reads what is stored, so opening it after arming elsewhere
+    /// shows the armed state rather than a stale "off"; the form then prefills
+    /// from it, so changing a goal is an edit rather than a restart.
+    #[test]
+    fn refresh_auto_sessions_reads_what_is_stored() {
+        let _guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("AMUX_DB_PATH", tmp.path().join("amux.db"));
+
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        assert_eq!(state.current_name().as_deref(), Some("cc_alpha_11111111"));
+        assert!(!state.auto_on("cc_alpha_11111111"));
+
+        assert!(crate::store::auto_enable("cc_alpha_11111111", "goal-x", 4, false));
+        state.refresh_auto_sessions();
+        assert!(state.auto_on("cc_alpha_11111111"));
+        assert_eq!(
+            state
+                .auto_sessions
+                .get("cc_alpha_11111111")
+                .map(|c| c.goal.as_str()),
+            Some("goal-x")
+        );
+
+        crate::store::auto_disable("cc_alpha_11111111");
+        state.refresh_auto_sessions();
+        assert!(!state.auto_on("cc_alpha_11111111"));
+
+        assert!(crate::store::auto_enable("cc_alpha_11111111", "goal-y", 6, true));
+        state.refresh_auto_sessions();
+        assert!(state.begin_auto());
+        let draft = state.auto_editing.as_ref().unwrap();
+        assert_eq!(draft.goal, "goal-y");
+        assert_eq!(draft.max_turns, "6");
+        assert!(draft.allow_waiting);
+        assert_eq!(draft.field, AutoField::Goal);
+
+        std::env::remove_var("AMUX_DB_PATH");
     }
 
     /// The browser takes the column, and says how to get out of it — both

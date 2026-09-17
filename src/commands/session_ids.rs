@@ -867,6 +867,110 @@ fn opencode_sessions(cwd: &Path, limit: usize) -> Vec<PastSession> {
         .collect()
 }
 
+/// How many of a session's newest messages to render. The log only ever shows
+/// the tail, and a long session can hold thousands.
+const OPENCODE_HISTORY_MESSAGES: usize = 20;
+
+/// A session's conversation as plain text, read from opencode's own store.
+///
+/// opencode's full TUI draws into its own viewport and leaves nothing in the
+/// terminal's scrollback — `capture-pane` sees one screenful and no history —
+/// so the monitor reads the messages opencode already persists instead. Only
+/// `text` parts are shown verbatim and `tool` parts as a one-line summary;
+/// reasoning, step markers and patches are noise in a log.
+///
+/// `None` when there is no database, no session for `cwd`, or nothing to show.
+pub(crate) fn opencode_history(session: &str, cwd: &str, max_lines: usize) -> Option<String> {
+    let db = opencode_db()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+
+    // Prefer the session amux recorded for this amux session — that is the
+    // conversation it actually launched — and fall back to the directory's
+    // newest only when nothing was recorded (a session started outside amux).
+    let session_id = crate::store::conversation_id(session)
+        .or_else(|| opencode_sessions(Path::new(cwd), 1).into_iter().next().map(|s| s.id))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.data, p.data
+             FROM (SELECT id, time_created, data FROM message
+                   WHERE session_id = ?1 ORDER BY time_created DESC LIMIT ?2) m
+             LEFT JOIN part p ON p.message_id = m.id
+             ORDER BY m.time_created ASC, p.time_created ASC, p.id ASC",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![session_id, OPENCODE_HISTORY_MESSAGES as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .ok()?
+        .flatten()
+        .collect();
+    render_opencode_rows(rows, max_lines)
+}
+
+/// Render `(message_data, part_data)` rows — newest last — as a plain log.
+///
+/// Split from the query so the formatting (what is shown, what is skipped, how
+/// a user turn is marked) is testable without opencode's database.
+fn render_opencode_rows(rows: Vec<(String, Option<String>)>, max_lines: usize) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for (message, part) in rows {
+        let role = serde_json::from_str::<serde_json::Value>(&message)
+            .ok()
+            .and_then(|value| value.get("role").and_then(|r| r.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        let Some(part) = part else { continue };
+        let Ok(part) = serde_json::from_str::<serde_json::Value>(&part) else {
+            continue;
+        };
+        match part.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                let Some(text) = part.get("text").and_then(|t| t.as_str()) else {
+                    continue;
+                };
+                for line in text.lines() {
+                    let line = line.trim_end();
+                    if role == "user" {
+                        lines.push(format!("> {line}"));
+                    } else {
+                        lines.push(line.to_string());
+                    }
+                }
+            }
+            Some("tool") => {
+                let name = part.get("tool").and_then(|t| t.as_str()).unwrap_or("tool");
+                let detail = part
+                    .pointer("/state/input/command")
+                    .and_then(|c| c.as_str())
+                    .or_else(|| {
+                        part.pointer("/state/input/description")
+                            .and_then(|c| c.as_str())
+                    })
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("");
+                if detail.is_empty() {
+                    lines.push(format!("[tool: {name}]"));
+                } else {
+                    lines.push(format!("[tool: {name}] {detail}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+    let start = lines.len().saturating_sub(max_lines.max(1));
+    Some(lines[start..].join("\n"))
+}
+
 /// The most recent `limit` sessions an agent recorded for `cwd`, newest first.
 ///
 /// Codex stores every rollout in one flat tree and records the cwd inside the
@@ -1364,5 +1468,61 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    /// opencode's stored parts render to a readable log: text verbatim, a user
+    /// turn marked, a tool call as a one-line summary — and the noisy part
+    /// types (reasoning, step markers) dropped.
+    #[test]
+    fn opencode_parts_render_to_a_readable_log() {
+        let rows = vec![
+            (
+                r#"{"role":"user"}"#.to_string(),
+                Some(r#"{"type":"text","text":"do the thing"}"#.to_string()),
+            ),
+            (
+                r#"{"role":"assistant"}"#.to_string(),
+                Some(r#"{"type":"reasoning","text":"hmm"}"#.to_string()),
+            ),
+            (
+                r#"{"role":"assistant"}"#.to_string(),
+                Some(
+                    r#"{"type":"tool","tool":"bash","state":{"input":{"command":"ls\ncd /tmp"}}}"#
+                        .to_string(),
+                ),
+            ),
+            (
+                r#"{"role":"assistant"}"#.to_string(),
+                Some(r#"{"type":"text","text":"done"}"#.to_string()),
+            ),
+            // A step marker contributes nothing, and a part-less message (an
+            // assistant turn still being written) must not crash the reader.
+            (
+                r#"{"role":"assistant"}"#.to_string(),
+                Some(r#"{"type":"step-finish"}"#.to_string()),
+            ),
+            (r#"{"role":"assistant"}"#.to_string(), None),
+        ];
+        assert_eq!(
+            render_opencode_rows(rows, 100).unwrap(),
+            "> do the thing\n[tool: bash] ls\ndone"
+        );
+
+        // The cap keeps the newest lines, not the oldest.
+        let rows = vec![
+            (
+                r#"{"role":"assistant"}"#.to_string(),
+                Some(r#"{"type":"text","text":"one"}"#.to_string()),
+            ),
+            (
+                r#"{"role":"assistant"}"#.to_string(),
+                Some(r#"{"type":"text","text":"two"}"#.to_string()),
+            ),
+        ];
+        assert_eq!(render_opencode_rows(rows, 1).unwrap(), "two");
+
+        // Nothing renderable → None, so the caller keeps its last log rather
+        // than blanking the pane.
+        assert!(render_opencode_rows(Vec::new(), 10).is_none());
     }
 }

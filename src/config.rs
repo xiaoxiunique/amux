@@ -33,35 +33,20 @@ pub fn builtin_agents() -> Vec<Agent> {
             // `--auto` is opencode's counterpart to the two flags above:
             // auto-approve anything not explicitly denied.
             //
-            // `--mini` is not a cosmetic choice. opencode's default TUI draws
-            // into the terminal's *alternate screen*, which has no scrollback
-            // at all — `history-limit` does not apply to it, scrolling up
-            // shows nothing, and `capture-pane` (how the monitor builds a
-            // session's log) returns only the visible rows. The minimal
-            // interface writes to the normal buffer like Claude and Codex do,
-            // so history survives and the phone app can read it.
+            // No `--mini`. It used to be required: opencode's full TUI draws
+            // into its own viewport (alternate screen by default, and even on
+            // the main screen it repaints in place), so the terminal's
+            // scrollback stays empty and `capture-pane` returns one screenful.
+            // The monitor now reads the conversation from opencode's own store
+            // (`session_ids::opencode_history`), so history no longer depends
+            // on the terminal buffer and the full interface can be used.
             //
             // No `--continue` here. Resuming is amux's job — it passes
             // `--session <id>` for the conversation this session actually
             // owns. `--continue` picks the directory's *latest*, so two
             // opencode sessions in one directory would both reopen the same
             // thread, and the second would appear to have lost its work.
-            //
-            // `--replay-limit` caps what mini reprints when a client attaches.
-            // Uncapped it replays the whole conversation *every* time —
-            // measured at 105KB against 19KB for Claude and 11KB for Codex on
-            // the same machine — which the TUI's terminal column turns into a
-            // full redraw each time the cursor lands on the session. Five
-            // messages is enough to show the session is alive without the
-            // scroll; `--no-replay` would leave the column blank until the
-            // agent next says something.
-            command: vec![
-                "opencode".into(),
-                "--auto".into(),
-                "--mini".into(),
-                "--replay-limit".into(),
-                "5".into(),
-            ],
+            command: vec!["opencode".into(), "--auto".into()],
         },
         Agent {
             name: "pi".into(),
@@ -82,15 +67,28 @@ pub fn builtin_agents() -> Vec<Agent> {
     ]
 }
 
-/// Default config path: `$XDG_CONFIG_HOME/amux/config.toml`, else
-/// `~/.config/amux/config.toml` (XDG layout on all platforms, including macOS).
-pub fn config_path() -> Option<PathBuf> {
+/// amux's config directory: `$XDG_CONFIG_HOME/amux`, else `~/.config/amux`
+/// (XDG layout on all platforms, including macOS).
+pub fn config_dir() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("amux").join("config.toml"));
+            return Some(PathBuf::from(xdg).join("amux"));
         }
     }
-    dirs::home_dir().map(|h| h.join(".config").join("amux").join("config.toml"))
+    dirs::home_dir().map(|h| h.join(".config").join("amux"))
+}
+
+/// Default config path: `<config_dir>/config.toml`.
+pub fn config_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("config.toml"))
+}
+
+/// Where the auto-mode supervisor prompt can be overridden.
+///
+/// Read fresh at each decision; a missing or empty file means the built-in
+/// default is used, so deleting it is how you go back.
+pub fn auto_prompt_path() -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("auto-prompt.md"))
 }
 
 pub fn parse_config(toml_str: &str) -> Result<Vec<Agent>> {
@@ -190,18 +188,13 @@ mod tests {
         assert_eq!(by_alias("cx").unwrap().name, "codex");
         let oc = by_alias("oc").expect("opencode ships as a builtin");
         assert_eq!(oc.name, "opencode");
-        // --mini keeps opencode out of the alternate screen, which has no
-        // scrollback: without it the session's history is unrecoverable and
-        // the monitor can only ever capture the visible rows.
-        assert!(oc.command.contains(&"--mini".to_string()));
+        // The full interface: `--mini` is gone now that history no longer
+        // depends on the terminal's scrollback (the monitor reads opencode's
+        // own store instead).
+        assert!(!oc.command.contains(&"--mini".to_string()));
+        assert!(oc.command.contains(&"--auto".to_string()));
         // Resuming is amux's job (`--session <id>`), not a blanket --continue.
         assert!(!oc.command.contains(&"--continue".to_string()));
-        // Uncapped, mini reprints the whole conversation on every attach —
-        // which the TUI does each time the cursor lands on the session.
-        let limit = oc.command.iter().position(|a| a == "--replay-limit");
-        assert!(limit.is_some(), "replay is uncapped");
-        assert_eq!(oc.command.get(limit.unwrap() + 1).map(String::as_str), Some("5"));
-        assert!(oc.command.contains(&"--auto".to_string()));
         let pi = by_alias("p").expect("pi ships as a builtin");
         assert_eq!(pi.name, "pi");
         // pi runs its tools without an approval gate, so the command carries no
