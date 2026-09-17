@@ -211,6 +211,11 @@ pub(crate) struct Pane {
     /// for the UI, independent of the coarse status enum.
     activity_age_secs: Option<f64>,
     messages: Vec<InteractionMessage>,
+    /// The schedule armed on this pane's session, absent when there is none.
+    /// Absent rather than a flag plus dead fields: a client that has it knows
+    /// both that it is on and what it will send.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timer: Option<crate::store::TimerConfig>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -2542,12 +2547,19 @@ fn build_snapshot() -> Snapshot {
                 updated_at: now.clone(),
                 activity_age_secs,
                 messages,
+                timer: None,
             }
         })
         .collect();
 
     let mut panes: Vec<Pane> = panes;
     append_herdr_panes(&mut panes, &now);
+    // One read for the whole snapshot, after every source has contributed, so
+    // a pane added by a future path is covered without remembering to ask.
+    let timers = crate::store::timers_enabled();
+    for pane in &mut panes {
+        pane.timer = timers.get(&pane.session).cloned();
+    }
 
     Snapshot {
         ok: true,
@@ -2629,6 +2641,7 @@ fn append_herdr_panes(panes: &mut Vec<Pane>, now: &str) {
             updated_at: now.to_string(),
             activity_age_secs: None,
             messages,
+            timer: None,
         });
     }
 }

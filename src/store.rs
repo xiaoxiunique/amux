@@ -568,6 +568,26 @@ pub fn timer_mark_skipped(session: &str) {
 }
 
 /// Every session currently on a schedule, for the tree's marker.
+/// Every armed schedule, by session.
+///
+/// One query for a whole snapshot. The alternative — asking per pane while
+/// building the list — is forty round trips every two and a half seconds to
+/// answer a question about at most a handful of sessions.
+pub fn timers_enabled() -> std::collections::BTreeMap<String, TimerConfig> {
+    with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT session, prompt, every_secs, last_run_at, skipped, enabled
+             FROM timer WHERE enabled = 1",
+        )?;
+        let rows = stmt.query_map([], timer_row)?;
+        Ok(rows
+            .filter_map(Result::ok)
+            .map(|c| (c.session.clone(), c))
+            .collect())
+    })
+    .unwrap_or_default()
+}
+
 pub fn timer_enabled_sessions() -> std::collections::BTreeSet<String> {
     with_db(|conn| {
         let mut stmt = conn.prepare("SELECT session FROM timer WHERE enabled = 1")?;
