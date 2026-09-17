@@ -411,6 +411,67 @@ pub struct AutoDraft {
     pub field: AutoField,
 }
 
+/// Which field of the schedule form has the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronField {
+    Every,
+    Prompt,
+}
+
+/// The schedule form: how often, and what to send.
+///
+/// Opened on a session; Tab moves between the two fields, Enter arms, Esc
+/// cancels. An empty prompt cannot be armed — a schedule that sends nothing is
+/// a bare Enter every so often, which is not a task.
+#[derive(Debug, Clone)]
+pub struct CronDraft {
+    /// Free text like `30m`, `2h`, `90s` — parsed by [`cron_parse_every`].
+    pub every: String,
+    pub prompt: String,
+    pub field: CronField,
+}
+
+/// Parse `30m` / `2h` / `90s` / a bare number of minutes into seconds, or say
+/// it could not be read.
+///
+/// There is no fallback. The form starts pre-filled, so the only way to reach
+/// unreadable text is to type it, and arming on a silent default would start
+/// typing at a session on a schedule nobody chose. The floor is the daemon's,
+/// applied again here so the form cannot show a promise it will not keep.
+pub fn cron_parse_every(raw: &str) -> Option<u32> {
+    let text = raw.trim().to_lowercase();
+    if text.is_empty() {
+        return None;
+    }
+    let (digits, unit): (String, String) = text.chars().partition(|c| c.is_ascii_digit());
+    let n = digits.parse::<u32>().ok()?;
+    // Digits must be one run: `30m2m` splits into "302" and "mm", which would
+    // otherwise parse as a perfectly good five hours.
+    if text.trim_end_matches(|c: char| !c.is_ascii_digit()).len() != digits.len() {
+        return None;
+    }
+    let secs = match unit.trim() {
+        "s" | "sec" | "secs" => n,
+        "h" | "hr" | "hour" | "hours" => n.saturating_mul(3600),
+        // A bare number reads as minutes: nobody schedules a standing
+        // instruction in seconds, and "5" meaning five seconds would surprise.
+        "" | "m" | "min" | "mins" => n.saturating_mul(60),
+        _ => return None,
+    };
+    Some(secs.clamp(crate::serve::server::MIN_EVERY_SECS, 24 * 60 * 60))
+}
+
+/// How an interval is written back into the form.
+pub fn cron_every_label(secs: u32) -> String {
+    if secs.is_multiple_of(3600) {
+        format!("{}h", secs / 3600)
+    } else if secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Parse the form's turn field, defaulting and clamping so a half-typed number
 /// never blocks arming.
 pub fn auto_max_turns(raw: &str) -> u32 {
@@ -540,6 +601,11 @@ pub struct AppState {
     pub auto_sessions: std::collections::BTreeMap<String, crate::store::AutoConfig>,
     /// The auto-mode form being filled in.
     pub auto_editing: Option<AutoDraft>,
+    /// The schedule form, while it is open.
+    pub cron_editing: Option<CronDraft>,
+    /// Sessions currently on a schedule, refreshed with the tree so a session
+    /// being poked on a timer is visible without opening anything.
+    pub scheduled: std::collections::BTreeSet<String>,
 }
 
 impl AppState {
@@ -579,6 +645,8 @@ impl AppState {
             statuses: std::collections::BTreeMap::new(),
             auto_sessions: std::collections::BTreeMap::new(),
             auto_editing: None,
+            cron_editing: None,
+            scheduled: std::collections::BTreeSet::new(),
         }
     }
 
@@ -685,8 +753,25 @@ impl AppState {
         self.auto_sessions.contains_key(name)
     }
 
-    /// Open the auto form for the selected session, prefilled from what is
-    /// stored. Returns false when the cursor is not on a session.
+    /// Open the schedule form for the selected session, filled in with whatever
+    /// it is already on — editing a schedule should start from the current one,
+    /// not from a blank. Returns false when the cursor is not on a session.
+    pub fn begin_cron(&mut self) -> bool {
+        let Some(name) = self.current_name() else {
+            return false;
+        };
+        let existing = crate::store::cron_get(&name);
+        self.cron_editing = Some(CronDraft {
+            every: existing
+                .as_ref()
+                .map(|c| cron_every_label(c.every_secs))
+                .unwrap_or_else(|| "30m".to_string()),
+            prompt: existing.map(|c| c.prompt).unwrap_or_default(),
+            field: CronField::Prompt,
+        });
+        true
+    }
+
     pub fn begin_auto(&mut self) -> bool {
         let Some(name) = self.current_name() else {
             return false;
@@ -2576,6 +2661,76 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     dirty = true;
                     continue;
                 }
+                if state.cron_editing.is_some() {
+                    let mut submit = false;
+                    if let Some(draft) = state.cron_editing.as_mut() {
+                        match key.code {
+                            KeyCode::Esc => state.cron_editing = None,
+                            KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
+                                draft.field = match draft.field {
+                                    CronField::Every => CronField::Prompt,
+                                    CronField::Prompt => CronField::Every,
+                                };
+                            }
+                            KeyCode::Backspace => match draft.field {
+                                CronField::Every => {
+                                    draft.every.pop();
+                                }
+                                CronField::Prompt => {
+                                    draft.prompt.pop();
+                                }
+                            },
+                            KeyCode::Enter => submit = true,
+                            KeyCode::Char(c) => match draft.field {
+                                CronField::Every => draft.every.push(c),
+                                CronField::Prompt => draft.prompt.push(c),
+                            },
+                            _ => {}
+                        }
+                    }
+                    if submit {
+                        let draft = state.cron_editing.take();
+                        if let (Some(draft), Some(name)) = (draft, state.current_name()) {
+                            let prompt = draft.prompt.trim().to_string();
+                            // Both refusals put the form back rather than
+                            // dropping what was typed, and neither arms
+                            // anything: a schedule types at a session while
+                            // nobody is watching, so a half-meant one is worse
+                            // than none.
+                            match (prompt.is_empty(), cron_parse_every(&draft.every)) {
+                                (true, _) => {
+                                    state.notice = Some("a schedule needs a prompt".into());
+                                    state.cron_editing = Some(draft);
+                                }
+                                (_, None) => {
+                                    state.notice = Some("that interval does not read".into());
+                                    state.cron_editing = Some(draft);
+                                }
+                                (false, Some(every)) => {
+                                    if crate::store::cron_enable(&name, &prompt, every) {
+                                        state.scheduled.insert(name.clone());
+                                        // The store turns auto off to keep the
+                                        // two from typing over each other.
+                                        // Re-read it rather than assume: the
+                                        // badge prefers auto, so a stale entry
+                                        // would name the wrong one until the
+                                        // next reload.
+                                        state.refresh_auto_sessions();
+                                        state.notice = Some(format!(
+                                            "{name} every {} — {}",
+                                            cron_every_label(every),
+                                            truncate(&prompt, 40)
+                                        ));
+                                    } else {
+                                        state.notice = Some("could not store the schedule".into());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dirty = true;
+                    continue;
+                }
                 if state.auto_editing.is_some() {
                     let mut submit = false;
                     if let Some(draft) = state.auto_editing.as_mut() {
@@ -2637,6 +2792,9 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                 // mode, not an error.
                                 if crate::store::auto_enable(&name, &goal, turns, allow_waiting) {
                                     state.refresh_auto_sessions();
+                                    // Mirror of the schedule path: enabling auto
+                                    // just disabled any schedule on this session.
+                                    state.scheduled = crate::store::cron_enabled_sessions();
                                     let what = if goal.is_empty() {
                                         "keep it going".to_string()
                                     } else {
@@ -3091,6 +3249,13 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     // A form, because the decision needs a goal and a budget.
                     KeyCode::Char('t') => {
                         if !state.begin_auto() {
+                            state.notice = Some("select a session first".into());
+                        }
+                    }
+                    // A standing instruction rather than a conversation. `t`
+                    // hands the session to a model; this one only needs a clock.
+                    KeyCode::Char('T') => {
+                        if !state.begin_cron() {
                             state.notice = Some("select a session first".into());
                         }
                     }
@@ -3553,6 +3718,9 @@ fn restart_session(name: &str, dir: &str, alias: &str, agents: &[Agent]) -> Resu
 fn reload(state: &mut AppState, select: Option<String>) {
     let all = tmux::list_session_names().unwrap_or_default();
     state.projects = group_by_project(managed_sessions(&all, &state.agents));
+    // Re-read here rather than on every frame: a schedule changes when someone
+    // sets one, which is exactly when the session list is reloaded anyway.
+    state.scheduled = crate::store::cron_enabled_sessions();
 
     if let Some(target) = select {
         // Open whatever holds it, so there is a row to land on.
@@ -3730,6 +3898,9 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
     if state.auto_editing.is_some() {
         render_auto_form(f, state, outer[0]);
     }
+    if state.cron_editing.is_some() {
+        render_cron_form(f, state, outer[0]);
+    }
     render_status(f, state, outer[1]);
 }
 
@@ -3786,6 +3957,82 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
 ///
 /// A centered popup rather than a column, because it is a decision about the
 /// session you were just looking at — not a mode the whole screen enters.
+/// The schedule form: how often, and what to send.
+fn render_cron_form(f: &mut Frame, state: &AppState, area: Rect) {
+    let Some(draft) = state.cron_editing.as_ref() else {
+        return;
+    };
+    let session = state.current_name().unwrap_or_default();
+    let cursor = |on: bool| if on { "_" } else { " " };
+    let label = |on: bool| {
+        if on {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+    let every_on = draft.field == CronField::Every;
+    let parsed = cron_parse_every(&draft.every);
+
+    let rows = vec![
+        Line::from(vec![
+            Span::styled("  every   ", label(every_on)),
+            Span::raw(draft.every.clone()),
+            Span::styled(cursor(every_on), Style::default().fg(Color::DarkGray)),
+            // What it actually parsed to, so a mistyped unit is visible before
+            // it is armed rather than an hour later — and said plainly when it
+            // could not be read at all.
+            match parsed {
+                Some(secs) => Span::styled(
+                    format!("    → {}", cron_every_label(secs)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                // Not "using 30m": Enter refuses this, so naming a fallback
+                // would promise something that does not happen.
+                None => Span::styled(
+                    "    ? cannot read that".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
+            },
+        ]),
+        Line::from(vec![
+            Span::styled("  prompt  ", label(!every_on)),
+            Span::raw(truncate(
+                &draft.prompt,
+                area.width.saturating_sub(24) as usize,
+            )),
+            Span::styled(cursor(!every_on), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::raw(""),
+        Line::styled(
+            "  Tab switches   Enter starts it   Esc cancels",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+
+    let height = (rows.len() as u16 + 2).min(area.height);
+    let width = 64.min(area.width);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(Style::default().fg(Color::Blue))
+                .title(format!(" schedule {} ", truncate(&session, 28))),
+        ),
+        popup,
+    );
+}
+
 fn render_auto_form(f: &mut Frame, state: &AppState, area: Rect) {
     let Some(draft) = &state.auto_editing else {
         return;
@@ -3974,6 +4221,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("/", "filter projects"),
         ("t", "auto mode: keep it going"),
         (",", "settings"),
+        ("T", "send a prompt on a timer"),
         ("r", "name this session"),
         ("~", "this list"),
         ("q", "quit"),
@@ -4439,6 +4687,22 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                 // Same column order as the session rows below — what it is,
                 // then how it is doing — so the two line up when a project's
                 // children are open.
+                // Same three branches as `auto`, and for the same reason: a
+                // folded project must not hide that one of its sessions is
+                // being typed at on a timer.
+                let timed = if !expandable {
+                    project
+                        .sessions
+                        .first()
+                        .is_some_and(|s| state.scheduled.contains(&s.name))
+                } else if state.collapsed.contains(&project.dir) {
+                    project
+                        .sessions
+                        .iter()
+                        .any(|s| state.scheduled.contains(&s.name))
+                } else {
+                    false
+                };
                 let pin = project
                     .sessions
                     .first()
@@ -4470,10 +4734,19 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                     ),
                     Span::styled(format!("{word:<8}"), Style::default().fg(colour)),
                     Span::styled(age, Style::default().fg(colour)),
+                    // One slot for both: the store refuses to have auto and a
+                    // schedule on at once, so seeing them share a column is the
+                    // shape of that rule rather than a shortage of room.
                     Span::styled(
-                        if auto { "  auto" } else { "" },
+                        if auto {
+                            "  auto"
+                        } else if timed {
+                            "  timer"
+                        } else {
+                            ""
+                        },
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(if auto { Color::Yellow } else { Color::Blue })
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])];
@@ -4543,11 +4816,17 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                     Span::styled(
                         if state.auto_on(&session.name) {
                             "  auto"
+                        } else if state.scheduled.contains(&session.name) {
+                            "  timer"
                         } else {
                             ""
                         },
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(if state.auto_on(&session.name) {
+                                Color::Yellow
+                            } else {
+                                Color::Blue
+                            })
                             .add_modifier(Modifier::BOLD),
                     ),
                 ])];
@@ -6225,6 +6504,58 @@ mod tests {
         held[first] = None;
         assert_eq!(at(&held, "b"), None);
         assert_eq!(at(&held, "a"), Some(0));
+    }
+
+    /// `30m` and friends turn into seconds, and nothing escapes the floor.
+    ///
+    /// The floor is the daemon's rule, applied again in the form so it cannot
+    /// show you a promise the daemon will not keep — typing `5s` and being told
+    /// `5s` while the thing fires once a minute is worse than being corrected.
+    #[test]
+    fn an_interval_reads_the_way_it_is_written() {
+        assert_eq!(cron_parse_every("30m"), Some(1800));
+        assert_eq!(cron_parse_every("2h"), Some(7200));
+        assert_eq!(cron_parse_every("90s"), Some(90));
+        // A bare number is minutes: nobody schedules a standing instruction in
+        // seconds, and "5" meaning five seconds would surprise. Deliberately
+        // not "30" — that parses to the same 1800 the fallback returns, so it
+        // would pass whether or not bare numbers were understood at all.
+        assert_eq!(cron_parse_every("5"), Some(300));
+        assert_eq!(cron_parse_every("45"), Some(2700));
+
+        // Gibberish falls back, but the form must be able to tell that apart
+        // from a real answer. `30m2m` is not hypothetical: it is what tabbing
+        // into the pre-filled field and typing produces.
+        assert_eq!(cron_parse_every("30m2m"), None);
+        assert_eq!(cron_parse_every("soon"), None);
+        // Digits must be one run. Without that check this reads as 230 minutes,
+        // because partitioning throws away where the letters sat.
+        assert_eq!(cron_parse_every("2m30"), None);
+        assert_eq!(cron_parse_every(""), None);
+        assert_eq!(cron_parse_every("2m"), Some(120));
+        assert_eq!(cron_parse_every(" 15 M "), Some(900));
+
+        // Under the floor is lifted to it rather than refused.
+        assert_eq!(
+            cron_parse_every("5s"),
+            Some(crate::serve::server::MIN_EVERY_SECS)
+        );
+        assert_eq!(
+            cron_parse_every("0m"),
+            Some(crate::serve::server::MIN_EVERY_SECS)
+        );
+        // And a day is the ceiling.
+        assert_eq!(cron_parse_every("99h"), Some(24 * 60 * 60));
+
+        // Unreadable falls back rather than trapping the form.
+        assert_eq!(cron_parse_every(""), None);
+        assert_eq!(cron_parse_every("soon"), None);
+        assert_eq!(cron_parse_every("10 fortnights"), None);
+
+        // What the form shows back is what it parsed.
+        assert_eq!(cron_every_label(1800), "30m");
+        assert_eq!(cron_every_label(7200), "2h");
+        assert_eq!(cron_every_label(90), "90s");
     }
 
     /// A path too long for the popup must lose its *front*. The tail is what
