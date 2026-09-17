@@ -1853,6 +1853,17 @@ fn toggle_browser(state: &mut AppState, tool: &mut Option<LiveTerm>, area: Rect)
     }
 }
 
+/// Where in `spare` an already-attached client for `name` is, if there is one.
+///
+/// Pulled out so the reuse rule can be tested without a multiplexer: getting it
+/// wrong costs a reconnect per pane per keystroke, and a reconnect is invisible
+/// in a unit test and very visible in the hand.
+fn reusable<T>(spare: &[Option<T>], name: &str, session_of: impl Fn(&T) -> &str) -> Option<usize> {
+    spare
+        .iter()
+        .position(|held| held.as_ref().is_some_and(|held| session_of(held) == name))
+}
+
 /// Size of the terminal column, in cells, for the current frame size.
 fn term_size(area: Rect) -> (u16, u16) {
     // Minus the border on each side.
@@ -1957,14 +1968,26 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             state.has_browse_pane(),
         );
         if live.iter().map(|t| &t.session).ne(wanted.iter()) {
+            // Keep the clients that are still wanted rather than tearing the
+            // whole column down. Moving the cursor changes one pane; rebuilding
+            // all of them made every pinned session reconnect too, and each
+            // reconnect is a process, a pty and a fresh repaint. With three
+            // pinned that turned a 79ms switch into 485ms.
+            let mut spare: Vec<Option<LiveTerm>> = std::mem::take(&mut live)
+                .into_iter()
+                .map(Some)
+                .collect();
             live = wanted
                 .iter()
                 .enumerate()
                 .filter_map(|(i, name)| {
-                    // Each pane gets the size of the box it will be drawn in;
-                    // they are deliberately unequal.
                     let (cols, rows) = term_size(rects.get(i).copied().unwrap_or_default());
-                    LiveTerm::open(name, cols, rows)
+                    match reusable(&spare, name, |t| t.session.as_str()) {
+                        // Already attached — it only has to move to wherever the
+                        // new layout puts it, which `resize` below handles.
+                        Some(at) => spare[at].take(),
+                        None => LiveTerm::open(name, cols, rows),
+                    }
                 })
                 .collect();
             dirty = true;
@@ -5931,6 +5954,34 @@ mod tests {
             "the viewport jumped past the cursor: offset {offset}, cursor {}",
             state.cursor
         );
+    }
+
+    /// A pane already attached to the session it wants must be kept, whatever
+    /// place the new layout gives it.
+    ///
+    /// Rebuilding the lot on every change meant each pinned session reconnected
+    /// every time the cursor moved — measured with two pinned, one keystroke
+    /// spawned three clients where one had changed.
+    #[test]
+    fn panes_that_are_still_wanted_are_not_reconnected() {
+        fn at(held: &[Option<String>], name: &str) -> Option<usize> {
+            reusable(held, name, |s: &String| s.as_str())
+        }
+        let mut held: Vec<Option<String>> = ["a", "b", "c"]
+            .iter()
+            .map(|s| Some(s.to_string()))
+            .collect();
+
+        assert_eq!(at(&held, "a"), Some(0));
+        assert_eq!(at(&held, "c"), Some(2), "a pane is found wherever it sits");
+        assert_eq!(at(&held, "d"), None, "a session nobody holds has to be opened");
+
+        // Taken once and not again: two panes of one session would be two
+        // clients on the same screen.
+        let first = at(&held, "b").unwrap();
+        held[first] = None;
+        assert_eq!(at(&held, "b"), None);
+        assert_eq!(at(&held, "a"), Some(0));
     }
 
     /// A path too long for the popup must lose its *front*. The tail is what
