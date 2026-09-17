@@ -106,6 +106,15 @@ fn open(path: &std::path::Path) -> Option<Connection> {
             allow_waiting INTEGER NOT NULL DEFAULT 0,
             enabled       INTEGER NOT NULL DEFAULT 0,
             updated_at    TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS cron (
+            session     TEXT PRIMARY KEY,
+            prompt      TEXT NOT NULL DEFAULT '',
+            every_secs  INTEGER NOT NULL DEFAULT 1800,
+            last_run_at TEXT NOT NULL DEFAULT '',
+            skipped     INTEGER NOT NULL DEFAULT 0,
+            enabled     INTEGER NOT NULL DEFAULT 0,
+            updated_at  TEXT NOT NULL DEFAULT ''
         );",
     )
     .ok()?;
@@ -425,6 +434,9 @@ pub fn auto_list() -> Vec<AutoConfig> {
 /// Arm auto mode, resetting the turn counter so a re-armed goal starts fresh.
 /// Returns false when the database could not be opened (nothing was written).
 pub fn auto_enable(session: &str, goal: &str, max_turns: u32, allow_waiting: bool) -> bool {
+    // The other half of the rule in `cron_enable`: one session, one thing
+    // typing into it.
+    cron_disable(session);
     with_db(|conn| {
         conn.execute(
             "INSERT INTO auto (session, goal, max_turns, used, allow_waiting, enabled, updated_at)
@@ -444,6 +456,118 @@ pub fn auto_enable(session: &str, goal: &str, max_turns: u32, allow_waiting: boo
 }
 
 /// Disarm without forgetting the goal — re-enabling resumes the same budget.
+/// A session's schedule: what to send, and how often.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CronConfig {
+    pub session: String,
+    pub prompt: String,
+    pub every_secs: u32,
+    /// When the prompt was last actually sent — not when it was next due.
+    ///
+    /// The difference matters after a skip: counting from the last real send
+    /// means a busy agent costs you one run, where counting from the due time
+    /// would fire the moment it went quiet and again immediately after.
+    pub last_run_at: String,
+    /// How many runs were skipped because the agent was working. Shown, not
+    /// acted on.
+    pub skipped: u32,
+    pub enabled: bool,
+}
+
+fn cron_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronConfig> {
+    Ok(CronConfig {
+        session: row.get(0)?,
+        prompt: row.get(1)?,
+        every_secs: row.get(2)?,
+        last_run_at: row.get(3)?,
+        skipped: row.get(4)?,
+        enabled: row.get::<_, i64>(5)? != 0,
+    })
+}
+
+pub fn cron_get(session: &str) -> Option<CronConfig> {
+    with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT session, prompt, every_secs, last_run_at, skipped, enabled
+             FROM cron WHERE session = ?1",
+        )?;
+        let mut rows = stmt.query_map([session], cron_row)?;
+        Ok(rows.next().transpose()?)
+    })
+    .flatten()
+}
+
+/// Put a session on a schedule.
+///
+/// Turns auto off for it in the same breath: both paste into the same pane, and
+/// two of them typing at one agent interrupt each other. The first send waits a
+/// full interval rather than going out now — arming a schedule should not be a
+/// way to send something immediately by accident.
+pub fn cron_enable(session: &str, prompt: &str, every_secs: u32) -> bool {
+    auto_disable(session);
+    with_db(|conn| {
+        conn.execute(
+            "INSERT INTO cron (session, prompt, every_secs, last_run_at, skipped, enabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 1, ?4)
+             ON CONFLICT(session) DO UPDATE SET
+                prompt = excluded.prompt,
+                every_secs = excluded.every_secs,
+                last_run_at = excluded.last_run_at,
+                skipped = 0,
+                enabled = 1,
+                updated_at = excluded.updated_at",
+            rusqlite::params![session, prompt, every_secs, now()],
+        )?;
+        Ok(())
+    })
+    .is_some()
+}
+
+pub fn cron_disable(session: &str) {
+    with_db(|conn| {
+        conn.execute(
+            "UPDATE cron SET enabled = 0, updated_at = ?2 WHERE session = ?1",
+            rusqlite::params![session, now()],
+        )?;
+        Ok(())
+    });
+}
+
+/// Record that the prompt went out, which is what the next interval counts from.
+pub fn cron_mark_run(session: &str) {
+    with_db(|conn| {
+        conn.execute(
+            "UPDATE cron SET last_run_at = ?2, updated_at = ?2 WHERE session = ?1",
+            rusqlite::params![session, now()],
+        )?;
+        Ok(())
+    });
+}
+
+/// Record that a due run was passed over because the agent was working.
+///
+/// Deliberately leaves `last_run_at` alone: the run is lost, not deferred.
+pub fn cron_mark_skipped(session: &str) {
+    with_db(|conn| {
+        conn.execute(
+            "UPDATE cron SET skipped = skipped + 1, updated_at = ?2 WHERE session = ?1",
+            rusqlite::params![session, now()],
+        )?;
+        Ok(())
+    });
+}
+
+/// Every session currently on a schedule, for the tree's marker.
+pub fn cron_enabled_sessions() -> std::collections::BTreeSet<String> {
+    with_db(|conn| {
+        let mut stmt = conn.prepare("SELECT session FROM cron WHERE enabled = 1")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
+    })
+    .unwrap_or_default()
+}
+
 pub fn auto_disable(session: &str) {
     with_db(|conn| {
         conn.execute(
@@ -558,6 +682,105 @@ mod tests {
         let path = dir.join("amux.db");
         std::env::set_var("AMUX_DB_PATH", &path);
         path
+    }
+
+    /// A schedule round-trips, and arming one puts auto away.
+    ///
+    /// The exclusion is the part worth pinning down: both of them paste into
+    /// the same pane, and two things typing at one agent interrupt each other
+    /// in ways that are hard to see afterwards.
+    #[test]
+    fn a_schedule_replaces_auto_on_the_same_session() {
+        let _guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        scratch(tmp.path());
+        let s = "oc_proj_1a2b3c4d";
+
+        assert!(cron_get(s).is_none());
+        assert!(auto_enable(s, "ship it", 5, false));
+        assert!(auto_get(s).unwrap().enabled);
+
+        assert!(cron_enable(s, "看一下 CI", 900));
+        let cfg = cron_get(s).unwrap();
+        assert_eq!(cfg.prompt, "看一下 CI");
+        assert_eq!(cfg.every_secs, 900);
+        assert!(cfg.enabled);
+        assert_eq!(cfg.skipped, 0);
+        // The first run is a full interval away: arming must not be a way to
+        // send something right now by accident.
+        assert!(!cfg.last_run_at.is_empty(), "arming stamps the clock");
+        assert!(!auto_get(s).unwrap().enabled, "auto was left armed alongside cron");
+
+        // And back the other way.
+        assert!(auto_enable(s, "ship it", 5, false));
+        assert!(!cron_get(s).unwrap().enabled, "cron was left armed alongside auto");
+    }
+
+    /// A skipped run is lost, not deferred.
+    ///
+    /// `last_run_at` is what the next interval counts from, so a skip must not
+    /// touch it — stamping it would push the schedule out every time the agent
+    /// was busy, and counting from the due time instead would fire the moment
+    /// it went quiet and again immediately after.
+    #[test]
+    fn a_skipped_run_leaves_the_clock_where_it_was() {
+        let _guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        scratch(tmp.path());
+        let s = "oc_proj_1a2b3c4d";
+
+        assert!(cron_enable(s, "p", 60));
+        // Age the clock to something no fresh stamp could equal: `now()` is
+        // millisecond-granular and the whole test runs inside a few of them, so
+        // comparing two fresh stamps would pass whether or not a skip touched it.
+        const AGED: &str = "2000-01-01T00:00:00.000Z";
+        let age = |to: &str| {
+            let to = to.to_string();
+            with_db(move |conn| {
+                conn.execute(
+                    "UPDATE cron SET last_run_at = ?2 WHERE session = ?1",
+                    rusqlite::params![s, to],
+                )?;
+                Ok(())
+            });
+        };
+        age(AGED);
+        let armed = cron_get(s).unwrap().last_run_at;
+        assert_eq!(armed, AGED);
+
+        cron_mark_skipped(s);
+        cron_mark_skipped(s);
+        let after = cron_get(s).unwrap();
+        assert_eq!(after.skipped, 2);
+        assert_eq!(after.last_run_at, AGED, "a skip moved the clock");
+
+        cron_mark_run(s);
+        let moved = cron_get(s).unwrap().last_run_at;
+        assert_ne!(moved, AGED, "a real send must move the clock");
+
+        // Disabling leaves the row, so re-arming later starts from a clean slate
+        // rather than inheriting a stale skip count.
+        cron_disable(s);
+        assert!(!cron_get(s).unwrap().enabled);
+        assert!(cron_enable(s, "p", 60));
+        assert_eq!(cron_get(s).unwrap().skipped, 0);
+    }
+
+    /// The tree asks for one set rather than one row per session.
+    #[test]
+    fn scheduled_sessions_are_listed_for_the_tree() {
+        let _guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        scratch(tmp.path());
+
+        assert!(cron_enabled_sessions().is_empty());
+        assert!(cron_enable("cc_a_11111111", "x", 60));
+        assert!(cron_enable("oc_b_22222222", "y", 60));
+        cron_disable("oc_b_22222222");
+
+        let on = cron_enabled_sessions();
+        assert!(on.contains("cc_a_11111111"));
+        assert!(!on.contains("oc_b_22222222"), "a disabled schedule still showed");
     }
 
     #[test]

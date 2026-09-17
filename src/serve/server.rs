@@ -506,6 +506,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         )
         .route("/api/auto/status", get(api_auto_status))
         .route("/api/auto/enable", post(api_auto_enable))
+        .route("/api/cron/enable", post(api_cron_enable))
         .route("/api/auto/disable", post(api_auto_disable))
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
@@ -2774,6 +2775,7 @@ fn broadcast_snapshot(state: &AppState) -> Snapshot {
     // Auto mode reads the statuses `build_snapshot` just computed, so it runs
     // alongside the pending-message flush rather than on its own timer.
     auto_tick(state, &snapshot.panes);
+    cron_tick(state, &snapshot.panes);
     // Full build: fire status-change push notifications for phone-initiated turns.
     #[cfg(feature = "full")]
     crate::serve::full::push::notify_status_changes(&snapshot.panes);
@@ -3665,6 +3667,159 @@ fn pane_has_pending(pane_id: &str) -> bool {
 /// depends on. The model call is slow, so it is handed to a blocking task; the
 /// in-flight guard stops the next poll from starting a second one, and the
 /// cooldown stops a pane that stays Idle from being re-asked immediately.
+/// The shortest schedule worth honouring.
+///
+/// This runs off the snapshot poll, which is 2.5s, so anything finer would be
+/// approximate anyway — and an agent re-prompted every few seconds never gets
+/// far enough to answer the last one.
+pub(crate) const MIN_EVERY_SECS: u32 = 60;
+
+/// Send each session's scheduled prompt when its interval is up.
+///
+/// Sits beside [`auto_tick`] and shares its delivery path, including the rule
+/// that Codex submits with Tab. The difference is the decision: auto asks a
+/// model what to say, a schedule already knows.
+fn cron_tick(state: &AppState, panes: &[Pane]) {
+    for pane in panes {
+        let Some(config) = crate::store::cron_get(&pane.session) else {
+            continue;
+        };
+        if !config.enabled {
+            continue;
+        }
+        if !cron_is_due(&config.last_run_at, config.every_secs) {
+            continue;
+        }
+
+        match cron_action(&pane.status, pane_has_pending(&pane.id)) {
+            CronAction::Skip(why) => {
+                crate::store::cron_mark_skipped(&pane.session);
+                eprintln!("[cron] {} — {why}; this run is skipped", pane.session);
+                continue;
+            }
+            CronAction::Send => {}
+        }
+
+        match auto_deliver(pane, &config.prompt) {
+            Ok(()) => {
+                crate::store::cron_mark_run(&pane.session);
+                let _ = state.pane_log_refreshes.send(pane.id.clone());
+                eprintln!(
+                    "[cron] sent to {} — {}",
+                    pane.session,
+                    preview(&config.prompt, 160)
+                );
+            }
+            // Not marked as run: a send that did not land should be tried again
+            // on the next poll rather than waiting out another interval.
+            Err(error) => eprintln!("[cron] could not send to {}: {error}", pane.session),
+        }
+    }
+}
+
+/// What to do with a run that has come due.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CronAction {
+    Send,
+    /// Dropped, not deferred — with a reason for the log.
+    Skip(&'static str),
+}
+
+/// Whether a due run should go out now.
+///
+/// A working agent is left alone and the run is lost rather than queued: the
+/// next one falls an interval after the last real *send*, so a long task costs
+/// one run instead of earning a burst of them the moment it goes quiet.
+///
+/// A pane with something already typed into it belongs to whoever typed it.
+pub(crate) fn cron_action(status: &PaneStatus, has_pending: bool) -> CronAction {
+    if *status == PaneStatus::Running {
+        return CronAction::Skip("the agent is working");
+    }
+    if has_pending {
+        return CronAction::Skip("something is already queued in that pane");
+    }
+    CronAction::Send
+}
+
+/// Whether `every_secs` have passed since `last_run_at`.
+///
+/// An unparseable or empty stamp reads as due — a row that lost its clock
+/// should start ticking again rather than sit there forever.
+pub(crate) fn cron_is_due(last_run_at: &str, every_secs: u32) -> bool {
+    let Ok(last) = chrono::DateTime::parse_from_rfc3339(last_run_at) else {
+        return true;
+    };
+    let elapsed = chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc));
+    elapsed.num_seconds() >= every_secs.max(MIN_EVERY_SECS) as i64
+}
+
+#[cfg(test)]
+mod cron_tests {
+    use super::*;
+
+    /// The clock decides, and it decides from the last real send.
+    #[test]
+    fn a_run_is_due_an_interval_after_the_last_one() {
+        let stamp = |ago: i64| {
+            (chrono::Utc::now() - chrono::Duration::seconds(ago))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+
+        assert!(!cron_is_due(&stamp(10), 900), "ten seconds into a 15-minute schedule");
+        assert!(!cron_is_due(&stamp(899), 900), "one second short is not due");
+        assert!(cron_is_due(&stamp(901), 900), "past the interval and still not due");
+
+        // A row with no clock, or with a stamp nothing can read, starts ticking
+        // rather than sitting there forever.
+        assert!(cron_is_due("", 900));
+        assert!(cron_is_due("not a timestamp", 900));
+    }
+
+    /// A run that comes due while the agent is working is dropped, not queued.
+    ///
+    /// This is the half the live test could not reach: a shell `sleep` produces
+    /// no output, so the status heuristic reads it as idle and the pane never
+    /// goes Running. The decision is worth pinning down on its own — sending
+    /// into a working agent is how a scheduled prompt lands in the middle of a
+    /// half-written file.
+    #[test]
+    fn a_due_run_waits_for_the_agent_to_stop() {
+        assert_eq!(cron_action(&PaneStatus::Idle, false), CronAction::Send);
+        assert_eq!(cron_action(&PaneStatus::Waiting, false), CronAction::Send);
+        assert_eq!(cron_action(&PaneStatus::Done, false), CronAction::Send);
+        assert_eq!(cron_action(&PaneStatus::Failed, false), CronAction::Send);
+
+        assert!(matches!(
+            cron_action(&PaneStatus::Running, false),
+            CronAction::Skip(_)
+        ));
+        // And whatever the agent is doing, a pane someone has already typed
+        // into is theirs.
+        assert!(matches!(
+            cron_action(&PaneStatus::Idle, true),
+            CronAction::Skip(_)
+        ));
+    }
+
+    /// Nothing finer than a minute, whatever the row says.
+    ///
+    /// The poll this rides on is 2.5s, so a shorter interval is approximate at
+    /// best; and an agent re-prompted every few seconds never gets far enough
+    /// to answer the last one. A row written before this rule — or by hand —
+    /// must not be able to escape it.
+    #[test]
+    fn nothing_fires_faster_than_a_minute() {
+        let stamp = |ago: i64| {
+            (chrono::Utc::now() - chrono::Duration::seconds(ago))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        };
+        assert!(!cron_is_due(&stamp(5), 1), "a one-second schedule fired");
+        assert!(!cron_is_due(&stamp(30), 10), "a ten-second schedule fired");
+        assert!(cron_is_due(&stamp(61), 1), "still held back past the floor");
+    }
+}
+
 fn auto_tick(state: &AppState, panes: &[Pane]) {
     // `broadcast_snapshot` normally runs inside the server's tokio runtime;
     // if it is ever called outside one, skip auto rather than panic.
@@ -3912,6 +4067,24 @@ async fn api_pending_clear(
     json_response(StatusCode::OK, pending_list_json(pane_id))
 }
 
+/// `POST /api/cron/enable` — put a session on a schedule, or take it off one.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CronRequest {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    pane_id: Option<String>,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    every_secs: Option<u32>,
+    /// Absent means "turn it on". `false` takes the session off its schedule
+    /// without forgetting what the schedule was.
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
 /// Body shared by the auto endpoints. Prefer `session`; `paneId` is resolved
 /// against the current pane list as a convenience for the app.
 #[derive(Debug, Deserialize)]
@@ -3952,6 +4125,56 @@ async fn api_auto_status(
     json_response(
         StatusCode::OK,
         json!({ "ok": true, "items": crate::store::auto_list() }),
+    )
+}
+
+async fn api_cron_enable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<CronRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    let Some(session) = resolve_auto_session(body.session.as_deref(), body.pane_id.as_deref())
+    else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "session or a known paneId is required" }),
+        );
+    };
+
+    if body.enabled == Some(false) {
+        crate::store::cron_disable(&session);
+        return json_response(
+            StatusCode::OK,
+            json!({ "ok": true, "session": session, "config": crate::store::cron_get(&session) }),
+        );
+    }
+
+    // An empty prompt would schedule a bare Enter, which is not a task.
+    let prompt = body.prompt.trim();
+    if prompt.is_empty() {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "prompt is required" }));
+    }
+    if prompt.chars().count() > 4000 {
+        return json_response(StatusCode::BAD_REQUEST, json!({ "error": "prompt is too long" }));
+    }
+    let every = body
+        .every_secs
+        .unwrap_or(1800)
+        .clamp(MIN_EVERY_SECS, 24 * 60 * 60);
+
+    let stored = crate::store::cron_enable(&session, prompt, every);
+    json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "session": session,
+            "stored": stored,
+            "config": crate::store::cron_get(&session),
+        }),
     )
 }
 
