@@ -1243,7 +1243,9 @@ struct LiveTerm {
     parser: vt100::Parser,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Taken when the client is torn down, so the teardown can be moved onto a
+    /// thread instead of held on the frame.
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     output: Receiver<Vec<u8>>,
     /// Tail of the last chunk read, so a device query split across a read
     /// boundary is still recognised whole.
@@ -1370,7 +1372,7 @@ impl LiveTerm {
             parser: vt100::Parser::new(rows, cols, 0),
             master: pair.master,
             writer,
-            child,
+            child: Some(child),
             output,
             carry: Vec::new(),
         })
@@ -1403,12 +1405,42 @@ impl LiveTerm {
         }
     }
 
+    /// Stop the client.
+    ///
+    /// `now` waits for it to actually go; otherwise the killing happens on a
+    /// thread the caller does not wait for. Measured on this machine, killing an
+    /// `rmux attach-session` takes 54ms — which was most of what a switch cost,
+    /// because the pane being replaced was torn down on the very frame that was
+    /// supposed to draw its replacement.
+    ///
+    /// On the way out it has to be `now`: amux exiting while the kills are still
+    /// in flight leaves the clients running, holding sessions open with nothing
+    /// attached to them.
+    fn close(&mut self, now: bool) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let mut stop = move || {
+            let _ = child.kill();
+            let _ = child.wait();
+        };
+        if now {
+            stop();
+        } else {
+            std::thread::spawn(stop);
+        }
+    }
+
     /// Whether the program in the pty has exited.
     ///
     /// A file browser closing itself is how the column gets handed back — the
     /// user quits yazi its own way rather than having to learn amux's.
     fn finished(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+            // Already handed to the teardown thread; nothing is coming.
+            None => true,
+        }
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
@@ -1430,8 +1462,7 @@ impl LiveTerm {
 impl Drop for LiveTerm {
     fn drop(&mut self) {
         // Detaching the client must not take the session with it.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.close(false);
     }
 }
 
@@ -2008,7 +2039,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             let children: Vec<u32> = live
                 .iter()
                 .chain(tool.iter())
-                .filter_map(|t| t.child.process_id())
+                .filter_map(|t| t.child.as_ref()?.process_id())
                 .collect();
             let next = usage.sample(&children);
             if next != state.usage {
@@ -3135,7 +3166,15 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
 
     // Leave the input method as it was found, not as insert mode left it.
     ime::restore(saved_ime.take());
-    // Detach before restoring the screen, so the client goes away cleanly.
+    // Detach before restoring the screen, so the client goes away cleanly — and
+    // wait for it here, where a few tens of milliseconds cost nothing and a
+    // client left running would hold a session open with nobody attached.
+    for term in live.iter_mut() {
+        term.close(true);
+    }
+    if let Some(term) = tool.as_mut() {
+        term.close(true);
+    }
     drop(live);
     disable_raw_mode()?;
     write!(terminal.backend_mut(), "{MOUSE_OFF}")?;
