@@ -616,6 +616,10 @@ pub struct AppState {
     /// windows and Sub2API's today total. None until the first read lands, and
     /// on a machine with neither provider configured.
     pub quota: Option<serde_json::Value>,
+    /// Zen: the tree is hidden and the terminal column fills the whole body.
+    /// Toggled with Ctrl-Z, so a session can be read without the list beside
+    /// it — and brought back without losing the cursor.
+    pub zen: bool,
 }
 
 impl AppState {
@@ -659,6 +663,7 @@ impl AppState {
             timer_editing: None,
             scheduled: std::collections::BTreeSet::new(),
             quota: None,
+            zen: false,
         }
     }
 
@@ -1104,6 +1109,19 @@ impl AppState {
             self.zoomed = None;
         } else {
             self.zoomed = Some(name.to_string());
+        }
+    }
+
+    /// Hide the tree and give the terminal column the whole body, or put the
+    /// tree back.
+    ///
+    /// Nothing is torn down: the tree keeps its cursor and its scroll, so the
+    /// trip is free. The keyboard follows the tree out — a focus left on a
+    /// column nobody can see would send the next `j` somewhere invisible.
+    pub fn toggle_zen(&mut self) {
+        self.zen = !self.zen;
+        if self.zen {
+            self.focus = Column::Terminal;
         }
     }
 
@@ -2138,7 +2156,7 @@ fn toggle_browser(state: &mut AppState, tool: &mut Option<LiveTerm>, area: Rect)
         state.notice = Some("nothing selected".into());
         return;
     };
-    let (cols, rows) = term_size(terminal_column(area));
+    let (cols, rows) = term_size(terminal_area(state, area));
     match LiveTerm::run("files", "yazi", &[dir.clone()], &dir, cols, rows) {
         Some(term) => {
             *tool = Some(term);
@@ -2339,7 +2357,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
         // Attach to whatever is in view, and drop terminals that no longer are.
         let wanted = state.visible_sessions();
         let rects = pane_rects_zoomed(
-            terminal_column(terminal.get_frame().area()),
+            terminal_area(state, terminal.get_frame().area()),
             state.pinned.len(),
             state.has_browse_pane(),
             state.zoom_index(),
@@ -2393,7 +2411,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
         }
 
         if let Some(term) = tool.as_mut() {
-            let (cols, rows) = term_size(terminal_column(terminal.get_frame().area()));
+            let (cols, rows) = term_size(terminal_area(state, terminal.get_frame().area()));
             term.resize(cols, rows);
             if term.pump() {
                 dirty = true;
@@ -2542,7 +2560,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             {
                 // Only the terminal column forwards — a wheel over the lists
                 // should move the selection, not scroll someone's agent.
-                let area = terminal_column(terminal.get_frame().area());
+                let area = terminal_area(state, terminal.get_frame().area());
 
                 // A click on a pane's on-screen control does that one thing and
                 // is nothing else: no selection, no click handed to the agent.
@@ -2785,7 +2803,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         // hjkl to do what a click obviously means is the kind
                         // of thing that makes a TUI feel hostile.
                         MouseEventKind::Down(MouseButton::Left) => {
-                            let tree = tree_column(terminal.get_frame().area());
+                            let tree = tree_area(state, terminal.get_frame().area());
                             // A border button wins over selecting a row: it sits
                             // on the border, so no row is under it anyway.
                             let on_button =
@@ -2893,6 +2911,26 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     }
                     state.notice = Some("kill cancelled".into());
                     continue;
+                }
+
+                // Ctrl-Y toggles the file browser and Ctrl-Z toggles zen, from
+                // either column and without entering a mode. They come before
+                // the browser's catch-all so they are not swallowed as keys for
+                // yazi.
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match key.code {
+                        KeyCode::Char('y') => {
+                            toggle_browser(state, &mut tool, terminal.get_frame().area());
+                            dirty = true;
+                            continue;
+                        }
+                        KeyCode::Char('z') => {
+                            state.toggle_zen();
+                            dirty = true;
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
 
                 if state.browsing {
@@ -4119,6 +4157,26 @@ fn tree_column(area: Rect) -> Rect {
     columns_of(body_of(area))[0]
 }
 
+/// The terminal column's rect: the whole body once zen has hidden the tree, and
+/// the right column otherwise.
+fn terminal_area(state: &AppState, area: Rect) -> Rect {
+    if state.zen {
+        body_of(area)
+    } else {
+        terminal_column(area)
+    }
+}
+
+/// The tree's rect. Zero-sized in zen, so a click over where it used to be
+/// resolves to nothing rather than to a row that is no longer drawn.
+fn tree_area(state: &AppState, area: Rect) -> Rect {
+    if state.zen {
+        Rect::default()
+    } else {
+        tree_column(area)
+    }
+}
+
 /// Tree on the left, terminal on the right.
 ///
 /// Declared once so [`terminal_column`] and [`render`] cannot disagree about
@@ -4225,20 +4283,16 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
         .split(f.area());
 
     let columns = columns_of(outer[0]);
-    render_tree(f, state, columns[0]);
-    if state.helping {
-        render_help(f, columns[1]);
-    } else if state.browsing {
-        render_tool(f, tool, columns[1]);
-    } else if state.settings {
-        render_settings(f, state, columns[1]);
+    if state.zen {
+        // Zen hides the tree, and the terminal column takes its width too.
+        // `outer[0]` is already the body — the status line was split off above
+        // — so it is used directly rather than through `terminal_area`, which
+        // expects a whole frame.
+        render_zen_column(f, state, live, tool, outer[0]);
     } else {
-        match &state.draft {
-            Some(draft) => render_draft(f, draft, columns[1]),
-            None => render_terminal(f, state, live, columns[1]),
-        }
+        render_tree(f, state, columns[0]);
+        render_zen_column(f, state, live, tool, columns[1]);
     }
-    highlight_selection(f, state, columns[1]);
 
     if let Some(pick) = &state.picking_provider {
         render_provider_picker(f, pick, outer[0]);
@@ -4253,6 +4307,29 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
         render_timer_form(f, state, outer[0]);
     }
     render_status(f, state, outer[1]);
+}
+
+/// The right-hand column's content, shared by the normal and zen layouts.
+fn render_zen_column(
+    f: &mut Frame,
+    state: &AppState,
+    live: &[LiveTerm],
+    tool: Option<&LiveTerm>,
+    area: Rect,
+) {
+    if state.helping {
+        render_help(f, area);
+    } else if state.browsing {
+        render_tool(f, tool, area);
+    } else if state.settings {
+        render_settings(f, state, area);
+    } else {
+        match &state.draft {
+            Some(draft) => render_draft(f, draft, area),
+            None => render_terminal(f, state, live, area),
+        }
+    }
+    highlight_selection(f, state, area);
 }
 
 /// Overlay listing agents and the key that starts each one.
@@ -4566,14 +4643,14 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("Esc", "stop typing"),
         ("^↑ ^↓", "switch sessions while typing"),
         ("p", "pin this session, or let it go"),
-        ("z", "blow one pane up, or put it back"),
+        ("z / ^Z", "blow a pane up, or hide the tree"),
         ("o", "open a project from history"),
         ("O", "conversations of this project"),
         ("f", "search the conversations"),
         ("a", "start an agent here"),
         ("N", "another session for this agent"),
         ("Tab", "next session of this project"),
-        ("Y", "browse files with yazi"),
+        ("Y / ^Y", "browse files with yazi"),
         ("A", "full screen; detach comes back"),
         ("d", "kill the selected session"),
         ("/", "filter projects"),
@@ -8703,6 +8780,58 @@ mod tests {
         assert!(
             drawn(&state, 160).contains("sub $217.70 today"),
             "a notice hid the pinned quota"
+        );
+    }
+
+    #[test]
+    fn zen_hides_the_tree_and_hands_the_terminal_the_whole_body() {
+        let mut state = AppState::new(projects());
+        let frame = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 30,
+        };
+        let split = terminal_area(&state, frame);
+        assert!(
+            split.width < frame.width,
+            "the tree takes a column normally"
+        );
+        assert!(tree_area(&state, frame).width > 0);
+
+        state.toggle_zen();
+        assert!(state.zen);
+        assert_eq!(
+            terminal_area(&state, frame).width,
+            frame.width,
+            "zen should give the terminal the whole width"
+        );
+        assert_eq!(tree_area(&state, frame).width, 0, "the tree should be gone");
+        assert!(
+            matches!(state.focus, Column::Terminal),
+            "focus must follow the tree out"
+        );
+
+        state.toggle_zen();
+        assert!(!state.zen);
+        assert!(
+            tree_area(&state, frame).width > 0,
+            "the tree should come back"
+        );
+    }
+
+    #[test]
+    fn zen_draws_without_the_tree() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        assert!(
+            drawn(&state, 160).contains(" sessions "),
+            "the tree is drawn normally"
+        );
+        state.toggle_zen();
+        assert!(
+            !drawn(&state, 160).contains(" sessions "),
+            "zen should hide the tree"
         );
     }
 }
