@@ -818,13 +818,39 @@ impl AppState {
     /// the selection instead meant you could not read past what was selected
     /// without also changing which session the right-hand column was showing.
     pub fn scroll_view(&mut self, delta: isize) {
-        let rows = self.rows().len();
-        if rows == 0 {
+        if self.rows().is_empty() {
             return;
         }
         let next = self.view_offset.get() as isize + delta;
         self.view_offset
-            .set(next.clamp(0, rows as isize - 1) as usize);
+            .set(next.clamp(0, self.max_view_offset() as isize) as usize);
+    }
+
+    /// The furthest the viewport can travel: the offset at which the last row
+    /// sits at the bottom of the box.
+    ///
+    /// Not `rows - 1`. That lets the list scroll until a single row is left at
+    /// the top and the rest of the box is blank — there is nothing below the
+    /// last row to look at, so travelling there only loses the rows above.
+    /// Walked from the end because rows are not all one line high: a session
+    /// carries its description on a second one.
+    pub fn max_view_offset(&self) -> usize {
+        let rows = self.rows();
+        if rows.is_empty() {
+            return 0;
+        }
+        let height = self.view_height.get().max(1);
+        let mut used = 0u16;
+        let mut first = rows.len();
+        while first > 0 {
+            let row = self.row_height(rows[first - 1]);
+            if used + row > height {
+                break;
+            }
+            used += row;
+            first -= 1;
+        }
+        first
     }
 
     /// Bring the cursor back into view after it has moved.
@@ -861,6 +887,18 @@ impl AppState {
         if first > self.view_offset.get() {
             self.view_offset.set(first);
         }
+    }
+
+    /// The offset to draw at: the stored one, brought back into range.
+    ///
+    /// The box grows when the window does, and shrinks its own travel when a
+    /// session goes away. Either lowers [`max_view_offset`](Self::max_view_offset)
+    /// under a offset that was legal when it was set, and the list would keep
+    /// the old value — blank space under the last row until something scrolled.
+    pub fn draw_offset(&self) -> usize {
+        let offset = self.view_offset.get().min(self.max_view_offset());
+        self.view_offset.set(offset);
+        offset
     }
 
     /// The row `line` lines below the top of the drawn list, if any.
@@ -4878,7 +4916,7 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
     // With nothing selected the offset is honoured, so the highlight is painted
     // onto the cursor's own row instead.
     let mut list_state = ListState::default();
-    *list_state.offset_mut() = state.view_offset.get();
+    *list_state.offset_mut() = state.draw_offset();
 
     let (border, style) = border_for(state, Column::Tree);
     let block = Block::default()
@@ -5977,6 +6015,95 @@ mod tests {
     /// The footer holds the bottom row, and the list gives that row up.
     ///
     /// Both halves matter: a footer drawn over the last session hides a
+    /// A window that grows, or a session that goes away, must not leave the
+    /// list parked past where it can now travel.
+    #[test]
+    fn a_taller_box_pulls_the_list_back_down() {
+        let many: Vec<Project> = (0..30)
+            .map(|i| Project {
+                dir: format!("/work/p{i}"),
+                name: format!("p{i}"),
+                alias: None,
+                sessions: vec![session(&format!("cc_p{i}_1111111{}", i % 10), "cc")],
+            })
+            .collect();
+        let mut state = AppState::with_agents(many, crate::config::builtin_agents());
+        state.view_height.set(6);
+        state.scroll_view(999);
+        let small = state.view_offset.get();
+        assert!(small > 0, "the list never left the top");
+
+        // The window grows: the same offset now leaves blank space below.
+        state.view_height.set(20);
+        let drawn = state.draw_offset();
+        assert!(
+            drawn < small,
+            "the list stayed at {small} in a box that can only reach {}",
+            state.max_view_offset()
+        );
+        assert_eq!(drawn, state.max_view_offset());
+        assert_eq!(
+            state.view_offset.get(),
+            drawn,
+            "the stored offset was left out of range"
+        );
+    }
+
+    /// Scrolling stops when the last row reaches the bottom, not when it
+    /// reaches the top.
+    ///
+    /// Clamping to `rows - 1` let the wheel drag the list up until one row sat
+    /// alone at the top with most of a box of blank space under it. There is
+    /// nothing below the last row to reveal, so the extra travel only hides the
+    /// rows above.
+    #[test]
+    fn the_viewport_stops_with_the_last_row_at_the_bottom() {
+        let many: Vec<Project> = (0..30)
+            .map(|i| Project {
+                dir: format!("/work/p{i}"),
+                name: format!("p{i}"),
+                alias: None,
+                sessions: vec![session(&format!("cc_p{i}_1111111{}", i % 10), "cc")],
+            })
+            .collect();
+        let mut state = AppState::with_agents(many, crate::config::builtin_agents());
+        state.view_height.set(10);
+
+        let rows = state.rows().len();
+        assert!(rows > 10, "the test needs more rows than fit");
+
+        // Far past the end.
+        state.scroll_view(10_000);
+        let offset = state.view_offset.get();
+        assert!(
+            offset < rows - 1,
+            "scrolled to the old bound: row {offset} of {rows} left alone at the top"
+        );
+
+        // From there the rows still fill the box, with the last one included.
+        let mut used = 0u16;
+        for &row in &state.rows()[offset..] {
+            used += state.row_height(row);
+        }
+        assert!(
+            used >= state.view_height.get(),
+            "only {used} lines of a {} line box are in use",
+            state.view_height.get()
+        );
+
+        // And one line further would push the last row off the bottom.
+        assert!(
+            offset == 0 || {
+                let mut over = 0u16;
+                for &row in &state.rows()[offset + 1..] {
+                    over += state.row_height(row);
+                }
+                over < state.view_height.get()
+            },
+            "the viewport could have gone one row further and still fitted"
+        );
+    }
+
     /// session, and a list that still believes it owns the row maps a click on
     /// the footer onto whatever row the arithmetic reaches.
     #[test]
@@ -6433,9 +6560,24 @@ mod tests {
         // Back up past the top settles rather than wrapping or underflowing.
         state.scroll_view(-9);
         assert_eq!(state.view_offset.get(), 0);
-        // And past the end settles on the last row rather than emptying the box.
+        // And past the end settles with the last row at the bottom rather than
+        // alone at the top. Asserting `rows - 1` here used to pass, which is
+        // what left most of a box of blank space under the final row.
         state.scroll_view(999);
-        assert_eq!(state.view_offset.get(), state.rows().len() - 1);
+        let offset = state.view_offset.get();
+        assert!(
+            offset < state.rows().len() - 1,
+            "the last row was left alone at the top"
+        );
+        let filled: u16 = state.rows()[offset..]
+            .iter()
+            .map(|&row| state.row_height(row))
+            .sum();
+        assert!(
+            filled >= state.view_height.get(),
+            "only {filled} lines of a {} line box are in use",
+            state.view_height.get()
+        );
     }
 
     /// Moving the cursor still brings it back into view — the wheel owns the
@@ -6454,9 +6596,15 @@ mod tests {
         state.cursor = state.first_selectable();
         state.view_height.set(5);
 
-        // Scrolled far away, then the cursor moves: the viewport follows it.
-        state.scroll_view(8);
-        assert_eq!(state.view_offset.get(), 8);
+        // Scrolled as far away as the list goes, then the cursor moves: the
+        // viewport follows it. The exact offset is the list's business — what
+        // matters here is that the cursor is off screen before we start.
+        state.scroll_view(999);
+        assert_eq!(state.view_offset.get(), state.max_view_offset());
+        assert!(
+            state.view_offset.get() > state.cursor,
+            "the cursor is still on screen, so this proves nothing"
+        );
         state.ensure_cursor_visible();
         assert_eq!(state.view_offset.get(), 0, "the cursor was left off screen");
 
