@@ -3565,6 +3565,32 @@ pub(crate) fn pane_is_codex(session: &str, command: &str, title: &str) -> bool {
     command == "codex" || hay.contains("codex") || hay.contains("gpt-")
 }
 
+/// pi queues a *follow-up* on Alt+Enter; its Enter is a steering message that
+/// interrupts the remaining tools, which is not what "send" should mean here.
+/// Matched on the command only — "pi" is too short to sniff for by substring.
+pub(crate) fn pane_is_pi(session: &str, command: &str, _title: &str) -> bool {
+    if let Some(name) = session_agent_name(session) {
+        return name == "pi";
+    }
+    command == "pi"
+}
+
+/// The key that submits a message the way the pane's agent wants it.
+///
+/// codex and pi each queue on their own key rather than submitting — Tab and
+/// Alt+Enter — so a message sent while the agent is working waits its turn
+/// instead of interrupting. Claude is queued by amux itself (`api_send`) and
+/// everything else submits on Enter.
+fn submit_key_for(session: &str, command: &str, title: &str) -> &'static str {
+    if pane_is_codex(session, command, title) {
+        "Tab"
+    } else if pane_is_pi(session, command, title) {
+        "M-Enter"
+    } else {
+        "Enter"
+    }
+}
+
 /// The status `build_snapshot` last computed for a pane.
 fn cached_pane_status(pane_id: &str) -> Option<PaneStatus> {
     PANE_STATUS_CACHE
@@ -3748,14 +3774,10 @@ fn auto_deliver(pane: &Pane, text: &str, banner: Option<&str>) -> Result<(), Str
     }
     exit_tmux_copy_mode(&pane.id);
     paste_text(&pane.id, text)?;
-    // Codex submits with Tab, everything else with Enter — the same rule
-    // `api_send` applies, kept in one place so a continuation lands the way a
-    // typed message would.
-    let key = if pane_is_codex(&pane.session, &pane.command, &pane.title) {
-        "Tab"
-    } else {
-        "Enter"
-    };
+    // Each agent's own queue key: codex on Tab, pi on Alt+Enter, the rest on
+    // Enter — the same rule `api_send` applies, kept in one place so a
+    // continuation lands the way a typed message would.
+    let key = submit_key_for(&pane.session, &pane.command, &pane.title);
     send_key_parts(&pane.id, &[key])
 }
 
@@ -4486,7 +4508,7 @@ async fn api_send(
     }
 
     let requested_submit_key = match body.submit_key.as_deref() {
-        Some("Enter") | Some("Tab") => body.submit_key.as_deref(),
+        Some("Enter") | Some("Tab") | Some("M-Enter") => body.submit_key.as_deref(),
         Some(_) => {
             return json_response(
                 StatusCode::BAD_REQUEST,
@@ -4523,8 +4545,10 @@ async fn api_send(
     let submit_key = target_pane
         .as_ref()
         .and_then(|pane| {
-            if is_codex_pane(pane, "") {
+            if pane_is_codex(&pane.session, &pane.command, &pane.title) {
                 Some("Tab")
+            } else if pane_is_pi(&pane.session, &pane.command, &pane.title) {
+                Some("M-Enter")
             } else {
                 requested_submit_key
             }
@@ -4718,6 +4742,7 @@ async fn api_key(
     let allowed = [
         "Enter",
         "Tab",
+        "M-Enter",
         "C-c",
         "C-d",
         "C-[",
@@ -6424,6 +6449,19 @@ mod tests {
         );
         assert!(!pane_is_claude(&cx.session, &cx.command, &cx.title));
         assert!(is_codex_pane(&cx, ""));
+    }
+
+    /// A message sent to a busy agent must queue, not interrupt: codex and pi
+    /// each queue on their own key (Tab, Alt+Enter), so amux sends that instead
+    /// of the Enter they would read as a steering interruption.
+    #[test]
+    fn each_agent_submits_on_its_own_queue_key() {
+        assert_eq!(submit_key_for("cx_proj_1a2b3c4d", "codex", ""), "Tab");
+        assert_eq!(submit_key_for("p_proj_1a2b3c4d", "pi", ""), "M-Enter");
+        assert_eq!(submit_key_for("cc_proj_1a2b3c4d", "claude", ""), "Enter");
+        assert_eq!(submit_key_for("oc_proj_1a2b3c4d", "opencode", ""), "Enter");
+        assert!(pane_is_pi("p_proj_1a2b3c4d", "pi", ""));
+        assert!(!pane_is_pi("cx_proj_1a2b3c4d", "codex", ""));
     }
 
     /// Every configured agent must be identifiable from its session prefix, not
