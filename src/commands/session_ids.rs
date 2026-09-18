@@ -886,11 +886,20 @@ pub(crate) fn opencode_history(session: &str, cwd: &str, max_lines: usize) -> Op
         rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .ok()?;
 
-    // Prefer the session amux recorded for this amux session — that is the
-    // conversation it actually launched — and fall back to the directory's
-    // newest only when nothing was recorded (a session started outside amux).
-    let session_id = crate::store::conversation_id(session)
+    // Prefer the newest session for this directory that no *other* amux session
+    // has claimed. opencode can move to a new conversation inside one pane — a
+    // `/new`, or a restart that did not go through amux — so the id attach
+    // recorded would otherwise pin the log to a conversation the pane has left
+    // behind (the phone then shows stale messages). Reconciling here keeps the
+    // log on the live conversation and heals the record, while still keeping two
+    // opencode panes in one directory apart by their claims.
+    let recorded = crate::store::conversation_id(session);
+    let session_id = current_unclaimed_id("opencode", Path::new(cwd), session)
+        .or(recorded)
         .or_else(|| opencode_sessions(Path::new(cwd), 1).into_iter().next().map(|s| s.id))?;
+    if crate::store::conversation_id(session).as_deref() != Some(session_id.as_str()) {
+        store_id(session, &session_id);
+    }
 
     let mut stmt = conn
         .prepare(
@@ -1041,7 +1050,6 @@ pub fn recent_sessions(agent_name: &str, cwd: &Path, limit: usize) -> Vec<PastSe
 
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn builtin_providers_are_never_overridden() {
         // Codex rejects these outright: "reserved built-in provider IDs".
