@@ -254,6 +254,66 @@ fn neutralize_conflicting_auth_token(settings_config: &str) -> Result<String> {
     Ok(serde_json::to_string(&v)?)
 }
 
+/// Point a codex provider at the environment variable amux injects.
+///
+/// Codex ignores `env_key` when a provider sets `requires_openai_auth = true`
+/// and authenticates from `~/.codex/auth.json` instead (verified against codex
+/// 0.146.1). CC Switch writes every codex provider that way while handing the
+/// key to amux for env injection, so left alone the provider's own key never
+/// reaches Codex and whatever sits in `auth.json` — from some other provider —
+/// is used instead, a 401 whenever they differ. Rewrite the selected provider
+/// to read the env var. A provider carrying its own credential
+/// (`experimental_bearer_token`, e.g. CC Switch's proxy) already authenticates
+/// itself and is left untouched, as is one not using OpenAI auth. A config that
+/// will not parse passes through unchanged rather than being dropped.
+fn codex_config_for_env_auth(config_toml: &str, env_vars: &[(String, String)]) -> String {
+    if env_vars.is_empty() {
+        return config_toml.to_string();
+    }
+    let Ok(mut root) = config_toml.parse::<toml::Value>() else {
+        return config_toml.to_string();
+    };
+    let Some(id) = root
+        .get("model_provider")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return config_toml.to_string();
+    };
+    let Some(provider) = root
+        .get_mut("model_providers")
+        .and_then(|v| v.as_table_mut())
+        .and_then(|providers| providers.get_mut(&id))
+        .and_then(|v| v.as_table_mut())
+    else {
+        return config_toml.to_string();
+    };
+    let uses_openai_auth = provider
+        .get("requires_openai_auth")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !uses_openai_auth || provider.contains_key("experimental_bearer_token") {
+        return config_toml.to_string();
+    }
+    let env_name = provider
+        .get("env_key")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            env_vars
+                .iter()
+                .map(|(k, _)| k.clone())
+                .find(|k| k.as_str() == "OPENAI_API_KEY")
+        })
+        .or_else(|| env_vars.first().map(|(k, _)| k.clone()));
+    let Some(env_name) = env_name else {
+        return config_toml.to_string();
+    };
+    provider.insert("requires_openai_auth".into(), toml::Value::Boolean(false));
+    provider.insert("env_key".into(), toml::Value::String(env_name));
+    toml::to_string(&root).unwrap_or_else(|_| config_toml.to_string())
+}
+
 /// Codex: settings_config is JSON with {auth, config} →
 ///   write config TOML to ~/.codex/amux-<name>.config.toml → -p amux-<name>
 ///   extract auth env vars for injection
@@ -266,6 +326,20 @@ fn resolve_codex_settings(provider_name: &str, settings_config: &str) -> Result<
     if config_toml.is_empty() {
         bail!("codex provider {provider_name} has empty config");
     }
+
+    // Extract auth env vars. These are what amux exports into the launch, so
+    // they also decide whether the profile has to be rewritten to read them.
+    let mut env_vars = Vec::new();
+    if let Some(auth) = v["auth"].as_object() {
+        for (k, v) in auth {
+            if let Some(val) = v.as_str() {
+                if !val.is_empty() {
+                    env_vars.push((k.clone(), val.to_string()));
+                }
+            }
+        }
+    }
+    let config_toml = codex_config_for_env_auth(config_toml, &env_vars);
 
     // Write profile to ~/.codex/amux-<slug>.config.toml
     let slug: String = provider_name
@@ -280,20 +354,8 @@ fn resolve_codex_settings(provider_name: &str, settings_config: &str) -> Result<
         .join(".codex");
     let profile_path = codex_home.join(format!("{profile_name}.config.toml"));
 
-    std::fs::write(&profile_path, config_toml)
+    std::fs::write(&profile_path, &config_toml)
         .with_context(|| format!("writing {}", profile_path.display()))?;
-
-    // Extract auth env vars
-    let mut env_vars = Vec::new();
-    if let Some(auth) = v["auth"].as_object() {
-        for (k, v) in auth {
-            if let Some(val) = v.as_str() {
-                if !val.is_empty() {
-                    env_vars.push((k.clone(), val.to_string()));
-                }
-            }
-        }
-    }
 
     Ok(ProviderSettings {
         extra_argv: vec!["-p".into(), profile_name],
@@ -370,5 +432,85 @@ mod tests {
 
         // non-JSON → passed through unchanged
         assert_eq!(neutralize_conflicting_auth_token("garbage").unwrap(), "garbage");
+    }
+
+    /// CC Switch writes every codex provider as `requires_openai_auth = true`,
+    /// which makes Codex read `~/.codex/auth.json` and ignore the env var amux
+    /// injects — the wrong key whenever another provider sits in that file. The
+    /// selected provider is rewritten to read the env var, and the rest of the
+    /// config survives intact.
+    #[test]
+    fn a_codex_provider_using_openai_auth_is_pointed_at_the_env_var() {
+        let cfg = r#"model_provider = "OpenAI"
+model = "gpt-5.5"
+model_instructions_file = "./prompts/instruction2.md"
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "https://sub.iotex.me"
+wire_api = "responses"
+requires_openai_auth = true
+
+[mcp_servers.chrome-devtools]
+command = "npx"
+args = ["chrome-devtools-mcp@latest"]
+"#;
+        let out = codex_config_for_env_auth(cfg, &[("OPENAI_API_KEY".into(), "sk-x".into())]);
+        let v: toml::Value = out.parse().expect("the rewrite must still be valid TOML");
+        assert_eq!(v["model_provider"].as_str(), Some("OpenAI"));
+        assert_eq!(v["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(
+            v["model_instructions_file"].as_str(),
+            Some("./prompts/instruction2.md")
+        );
+        let provider = &v["model_providers"]["OpenAI"];
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
+        assert_eq!(provider["base_url"].as_str(), Some("https://sub.iotex.me"));
+        assert_eq!(provider["name"].as_str(), Some("OpenAI"));
+        assert_eq!(
+            v["mcp_servers"]["chrome-devtools"]["command"].as_str(),
+            Some("npx")
+        );
+    }
+
+    /// A provider carrying its own bearer token already authenticates itself;
+    /// flipping it to an env var would drop that credential.
+    #[test]
+    fn a_codex_provider_with_a_bearer_token_is_left_alone() {
+        let cfg = r#"model_provider = "crs"
+
+[model_providers.crs]
+base_url = "http://127.0.0.1:15721/v1"
+requires_openai_auth = true
+experimental_bearer_token = "PROXY_MANAGED"
+"#;
+        assert_eq!(
+            codex_config_for_env_auth(cfg, &[("OPENAI_API_KEY".into(), "sk-x".into())]),
+            cfg
+        );
+    }
+
+    /// Nothing to authenticate with, or a provider not using OpenAI auth, is a
+    /// no-op rather than a rewrite that would change the wrong thing.
+    #[test]
+    fn codex_rewrite_is_a_no_op_when_it_would_not_help() {
+        let no_openai_auth = r#"model_provider = "p"
+
+[model_providers.p]
+base_url = "http://localhost:11434/v1"
+requires_openai_auth = false
+"#;
+        assert_eq!(
+            codex_config_for_env_auth(no_openai_auth, &[("OPENAI_API_KEY".into(), "sk-x".into())]),
+            no_openai_auth
+        );
+
+        let no_auth_key = r#"model_provider = "p"
+
+[model_providers.p]
+requires_openai_auth = true
+"#;
+        assert_eq!(codex_config_for_env_auth(no_auth_key, &[]), no_auth_key);
     }
 }
