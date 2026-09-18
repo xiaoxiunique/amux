@@ -3916,14 +3916,12 @@ fn managed_names(agents: &[Agent]) -> Vec<String> {
     names
 }
 
-/// Re-read the session list, keeping `select` selected if it is still there.
 /// Kill a session's agent and start it again under the same name, resuming the
-/// conversation it was on.
+/// conversation it was on — and against the same provider, when it was launched
+/// with one.
 ///
 /// Off the event loop on purpose: `create_detached` blocks while codex answers
-/// its launch prompts. A session started with a provider (`<alias>-<provider>_
-/// …`) restarts as the plain agent — the provider is not recorded anywhere amux
-/// can read it back from.
+/// its launch prompts.
 fn restart_session(name: &str, dir: &str, alias: &str, agents: &[Agent]) -> Result<String, String> {
     let cwd = std::path::Path::new(dir)
         .canonicalize()
@@ -3932,6 +3930,11 @@ fn restart_session(name: &str, dir: &str, alias: &str, agents: &[Agent]) -> Resu
         .ok_or_else(|| format!("unknown agent '{alias}'"))?
         .clone();
 
+    // The provider is part of the session name, so a respawn can rebuild its
+    // profile and re-inject its key instead of quietly dropping back to the
+    // plain agent.
+    let provider = session_provider(name, alias);
+
     // Resume exactly the conversation this session owned when the transcript is
     // still there; otherwise the directory's newest, the same order `amux run`
     // resolves in.
@@ -3939,18 +3942,51 @@ fn restart_session(name: &str, dir: &str, alias: &str, agents: &[Agent]) -> Resu
         .filter(|id| crate::commands::session_ids::session_file_exists(&agent.name, &cwd, id))
         .or_else(|| crate::commands::session_ids::current_id(&agent.name, &cwd));
 
+    // Resolve before killing anything: a provider that no longer exists should
+    // leave the live session alone.
+    let (provider_argv, env_vars) = match &provider {
+        Some(p) => {
+            let app_type = crate::provider::agent_app_type(&agent.name);
+            let settings = crate::provider::resolve_settings(p, app_type)
+                .map_err(|error| format!("provider {p}: {error}"))?;
+            (settings.extra_argv, settings.env_vars)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+
     crate::tmux::kill_session(name).map_err(|error| error.to_string())?;
 
     let mut argv = agent.command.clone();
     if let Some(id) = &id {
-        argv.extend(crate::commands::session_ids::resume_args(&agent.name, id));
+        // A provider supplies its own `-p amux-…`; the transcript's recorded
+        // provider must not also be patched in, or the two would fight.
+        argv.extend(crate::commands::session_ids::resume_args_with(
+            &agent.name,
+            id,
+            provider.is_some(),
+        ));
     }
-    crate::commands::run::create_detached(&agent, &cwd, name, &argv, &[])
+    argv.extend(provider_argv);
+    crate::commands::run::create_detached(&agent, &cwd, name, &argv, &env_vars)
         .map_err(|error| error.to_string())?;
     if let Some(id) = &id {
         crate::commands::session_ids::store_id(name, id);
     }
     Ok(name.to_string())
+}
+
+/// The provider a session was launched against, read back from its name.
+///
+/// `amux run --provider <p>` names the session `<alias>-<p>_<slug>_<hash>`,
+/// while `amux new` puts its `-<suffix>` after the hash — so only the segment
+/// before the first `_` can name a provider. The parsed alias is checked
+/// against the one the session actually has, so a `-` inside an alias can only
+/// make this fall back to `None`, never name a different provider.
+fn session_provider(name: &str, alias: &str) -> Option<String> {
+    crate::commands::sessions::parse_session_alias(name)
+        .filter(|(parsed, _)| *parsed == alias)
+        .and_then(|(_, provider)| provider)
+        .map(str::to_string)
 }
 
 fn reload(state: &mut AppState, select: Option<String>) {
@@ -6869,6 +6905,29 @@ mod tests {
         let text = drawn(&state, 160);
         assert!(text.contains("restart"), "no restart button");
         assert!(text.contains("respawn"), "no respawn button");
+    }
+
+    /// A respawn has to find the provider the session was launched against,
+    /// which lives only in its name — and must not mistake `amux new`'s suffix
+    /// for one, or read another agent's session as this one's.
+    #[test]
+    fn a_provider_session_can_be_read_back_from_its_name() {
+        assert_eq!(
+            session_provider("cx-Iotex_cronbox_8cfe76b5", "cx").as_deref(),
+            Some("Iotex")
+        );
+        assert_eq!(
+            session_provider("cx-Iotex_cronbox_8cfe76b5-debug", "cx").as_deref(),
+            Some("Iotex"),
+            "the extra-session suffix is not the provider"
+        );
+        assert_eq!(session_provider("cx_cronbox_8cfe76b5", "cx"), None);
+        assert_eq!(session_provider("cx_cronbox_8cfe76b5-debug", "cx"), None);
+        assert_eq!(
+            session_provider("cc-glm_amux_4d8e0883", "cx"),
+            None,
+            "another agent's provider session is not this one's"
+        );
     }
 
     #[test]

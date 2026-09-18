@@ -137,7 +137,7 @@ fn default_save_path() -> Option<PathBuf> {
 
 /// Extract agent alias and optional provider from a session name.
 /// E.g. `cc-openai_myproject_1a2b3c4d` → ("cc", Some("openai"))
-fn parse_session_alias(name: &str) -> Option<(&str, Option<&str>)> {
+pub(crate) fn parse_session_alias(name: &str) -> Option<(&str, Option<&str>)> {
     // Find the first '_' which separates the alias (or alias-provider) from the slug
     let underscore = name.find('_')?;
     let prefix = &name[..underscore];
