@@ -2126,7 +2126,50 @@ fn term_size(area: Rect) -> (u16, u16) {
     )
 }
 
+/// Put the terminal back and write the panic down before the screen goes.
+///
+/// A panic in raw mode on the alternate screen prints into a buffer that is
+/// about to be thrown away, and what survives is a line with no location — which
+/// is how "the len is 78 but the index is 78" arrived with nothing to act on.
+/// The hook restores the terminal first, so the message lands on the real
+/// screen, and copies it to a file with a backtrace so it is still there later.
+fn install_panic_hook() {
+    use std::io::Write as _;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = disable_raw_mode();
+            let mut out = std::io::stdout();
+            let _ = write!(out, "{MOUSE_OFF}");
+            let _ = execute!(out, LeaveAlternateScreen, DisableBracketedPaste);
+            let where_ = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+            let note = format!(
+                "amux tui panicked at {}\n{info}\n{}\n",
+                where_.unwrap_or_else(|| "an unknown place".into()),
+                std::backtrace::Backtrace::force_capture()
+            );
+            if let Some(home) = dirs::home_dir() {
+                let path = home.join(".amux/tui-panic.log");
+                let _ = std::fs::create_dir_all(path.parent().unwrap_or(&home));
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = file.write_all(note.as_bytes());
+                    let _ = writeln!(out, "written to {}", path.display());
+                }
+            }
+            previous(info);
+        }));
+    });
+}
+
 fn event_loop(state: &mut AppState) -> Result<Outcome> {
+    install_panic_hook();
     enable_raw_mode()?;
     let mut out = stdout();
     // Bracketed paste, so a pasted block arrives as one event rather than as a
