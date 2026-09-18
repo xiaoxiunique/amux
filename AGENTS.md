@@ -57,7 +57,16 @@ by `AMUX_DB_PATH`.
   defaults to **rmux**; `AMUX_MUX=tmux` falls back to tmux.
 - `src/serve/server.rs` owns routing, snapshots/status inference, and terminal
   WebSockets; the TUI reuses its status API. The `full` feature adds macOS
-  control-center / usage / APNs routes in `src/serve/full/`.
+  control-center / usage / APNs routes in `src/serve/full/`. `build_snapshot`
+  is **not rmux-only**: it also merges agents from `src/serve/herdr.rs`
+  (`serve --herdr`) and `src/serve/dsh.rs` (auto-included whenever a `dsh web`
+  answers; dsh binds loopback, so amux relays it over its own TLS port).
+- **"cron" vs "timer" are different things.** `src/serve/cron.rs` (routes
+  `/api/cron/*`) is a read-only bridge to the external
+  [CronBox](https://github.com/xiaoxiunique/cronbox) app: reads go straight to
+  its SQLite db, writes shell out to the `cronbox` CLI. The per-session armed
+  prompt is a **timer** (`store::TimerConfig`, `/api/timer/enable`, the
+  snapshot's `timer` field) and is unrelated to CronBox.
 - **`webui/`** is a *prebuilt* Flutter web bundle embedded at compile time via
   `include_dir!` in `src/serve/server.rs`. There are no Dart sources in this
   repo — do not hand-edit it.
