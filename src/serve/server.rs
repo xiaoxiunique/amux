@@ -497,6 +497,7 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
         )
         .route("/api/cc-switch", get(api_cc_switch_status))
         .route("/api/capabilities", get(api_capabilities))
+        .route("/api/quota", get(api_quota))
         .route("/api/usb/devices", get(api_usb_devices))
         .route("/api/usb/screenshot", get(api_usb_screenshot))
         .route("/api/files/roots", get(api_files_roots))
@@ -2896,6 +2897,26 @@ fn spawn_snapshot_loop(state: AppState) {
             let _ = broadcast_snapshot(&state);
         }
     });
+}
+
+/// `GET /api/quota` — provider account quota: OpenCode Go's remaining rolling
+/// / weekly / monthly windows, and the Sub2API account's today total. Cached in
+/// `quota`, so polling it is cheap.
+async fn api_quota(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    match tokio::task::spawn_blocking(crate::quota::snapshot).await {
+        Ok(value) => json_response(StatusCode::OK, value),
+        Err(error) => json_response(
+            StatusCode::OK,
+            json!({ "ok": false, "error": error.to_string() }),
+        ),
+    }
 }
 
 pub(crate) fn is_authed(

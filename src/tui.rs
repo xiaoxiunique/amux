@@ -612,6 +612,10 @@ pub struct AppState {
     /// Sessions currently on a schedule, refreshed with the tree so a session
     /// being poked on a timer is visible without opening anything.
     pub scheduled: std::collections::BTreeSet<String>,
+    /// Provider account quota, refreshed off-thread: OpenCode Go's remaining
+    /// windows and Sub2API's today total. None until the first read lands, and
+    /// on a machine with neither provider configured.
+    pub quota: Option<serde_json::Value>,
 }
 
 impl AppState {
@@ -654,6 +658,7 @@ impl AppState {
             auto_editing: None,
             timer_editing: None,
             scheduled: std::collections::BTreeSet::new(),
+            quota: None,
         }
     }
 
@@ -2025,6 +2030,10 @@ const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 /// slow enough that the figure is readable rather than twitching.
 const USAGE_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How often the provider quota is re-read. It is a network round trip (cached
+/// behind the call), and the numbers it carries move on the scale of a day.
+const QUOTA_EVERY: Duration = Duration::from_secs(300);
+
 /// Put a pasted block into whichever of amux's own text fields is open.
 ///
 /// True when one took it. The fields are all one line — a name, a filter, a
@@ -2301,6 +2310,18 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
         std::thread::sleep(STATUS_EVERY);
     });
 
+    // Provider quota is a network read (opencode.ai, the Sub2API dashboard), so
+    // it gets its own thread: a slow or unreachable provider must never stall
+    // the loop drawing the screen. The read is cached behind the call, so
+    // polling it on this interval costs nothing until the cache expires.
+    let (quota_tx, quota_rx) = mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || loop {
+        if quota_tx.send(crate::quota::snapshot()).is_err() {
+            return;
+        }
+        std::thread::sleep(QUOTA_EVERY);
+    });
+
     // The viewport is the wheel's to place; only a cursor that has actually
     // moved gets to pull it back. Re-centring every tick would undo each scroll
     // as fast as it was made.
@@ -2449,6 +2470,18 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
         if let Some(map) = newest {
             if map != state.statuses {
                 state.statuses = map;
+                dirty = true;
+            }
+        }
+
+        // Keep only the newest quota reading, same as the status sweep.
+        let mut newest_quota = None;
+        while let Ok(value) = quota_rx.try_recv() {
+            newest_quota = Some(value);
+        }
+        if let Some(value) = newest_quota {
+            if state.quota.as_ref() != Some(&value) {
+                state.quota = Some(value);
                 dirty = true;
             }
         }
@@ -5623,7 +5656,7 @@ fn render_one_terminal(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>,
     }
 }
 
-fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
+fn render_status_line(f: &mut Frame, state: &AppState, area: Rect) {
     if state.inserting {
         let name = state.current_name().unwrap_or_default();
         let line = Line::from(vec![
@@ -5731,6 +5764,72 @@ fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
         Paragraph::new(help).style(Style::default().fg(Color::DarkGray)),
         area,
     );
+}
+
+/// The status line, with the provider quota pinned to the bottom-right corner.
+///
+/// The quota is kept out of the line's own content so it stays put whatever
+/// that content is doing — a notice, a rename prompt, insert mode — rather than
+/// appearing only when the key hints are.
+fn render_status(f: &mut Frame, state: &AppState, area: Rect) {
+    let quota = state.quota.as_ref().and_then(quota_line);
+    let (line, corner) = match &quota {
+        // Only when it fits beside the status content: a clipped reading is
+        // noise, and the content still has to be legible.
+        Some(text) if area.width > text.chars().count() as u16 + 8 => {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(text.chars().count() as u16 + 1),
+                ])
+                .split(area);
+            (split[0], Some(split[1]))
+        }
+        _ => (area, None),
+    };
+    render_status_line(f, state, line);
+    if let (Some(text), Some(corner)) = (quota, corner) {
+        f.render_widget(
+            Paragraph::new(Line::styled(text, Style::default().fg(Color::Gray)))
+                .alignment(Alignment::Right),
+            corner,
+        );
+    }
+}
+
+/// A one-line reading of the provider quota for the status bar: Sub2API's today
+/// total, and OpenCode Go's remaining rolling / weekly / monthly windows.
+///
+/// Returns None when neither provider answered, so the status bar says nothing
+/// rather than "0" — which would read as a real, empty account.
+fn quota_line(quota: &serde_json::Value) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(today) = quota
+        .get("sub2api")
+        .and_then(|s| s.get("todayCost"))
+        .and_then(serde_json::Value::as_f64)
+    {
+        parts.push(format!("sub ${today:.2} today"));
+    }
+
+    if let Some(go) = quota.get("opencodeGo").filter(|g| !g.is_null()) {
+        let remaining = |window: &str| {
+            go.get(window)
+                .and_then(|w| w.get("remainingPercent"))
+                .and_then(serde_json::Value::as_f64)
+        };
+        let windows: Vec<String> = ["rolling", "weekly", "monthly"]
+            .iter()
+            .filter_map(|w| remaining(w).map(|p| format!("{p:.0}%")))
+            .collect();
+        if !windows.is_empty() {
+            parts.push(format!("Go {} left", windows.join("/")));
+        }
+    }
+
+    (!parts.is_empty()).then(|| parts.join("  ·  "))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -8547,5 +8646,63 @@ mod tests {
         projects.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(projects[1].name, "beta");
         assert_eq!(projects[1].sessions.len(), 2);
+    }
+
+    /// The status-bar reading names Sub2API's today total and OpenCode Go's
+    /// three remaining windows, and stays silent when neither answered.
+    #[test]
+    fn the_quota_line_reads_both_providers() {
+        let quota = serde_json::json!({
+            "ok": true,
+            "sub2api": { "todayCost": 12.34 },
+            "opencodeGo": {
+                "rolling": { "remainingPercent": 89.0 },
+                "weekly": { "remainingPercent": 34.0 },
+                "monthly": { "remainingPercent": 20.0 }
+            }
+        });
+        let line = quota_line(&quota).expect("both providers should produce a line");
+        assert!(line.contains("sub $12.34 today"), "{line}");
+        assert!(line.contains("Go 89%/34%/20% left"), "{line}");
+
+        assert_eq!(quota_line(&serde_json::json!({ "ok": false })), None);
+        assert_eq!(
+            quota_line(&serde_json::json!({ "sub2api": null, "opencodeGo": null })),
+            None
+        );
+        // A provider that did not answer is left out, not zeroed.
+        let only_sub = serde_json::json!({ "sub2api": { "todayCost": 1.0 } });
+        assert_eq!(quota_line(&only_sub).as_deref(), Some("sub $1.00 today"));
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_provider_quota() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        state.quota = Some(serde_json::json!({
+            "sub2api": { "todayCost": 217.70 },
+            "opencodeGo": {
+                "rolling": { "remainingPercent": 89.0 },
+                "weekly": { "remainingPercent": 34.0 },
+                "monthly": { "remainingPercent": 20.0 }
+            }
+        }));
+        let text = drawn(&state, 160);
+        assert!(
+            text.contains("sub $217.70 today"),
+            "the status bar did not show Sub2API's today total"
+        );
+        assert!(
+            text.contains("Go 89%/34%/20% left"),
+            "the status bar did not show OpenCode Go's remaining windows"
+        );
+
+        // It is pinned to the corner, so a transient notice on the left must
+        // not push it off screen.
+        state.notice = Some("restarting cc_alpha_11111111…".into());
+        assert!(
+            drawn(&state, 160).contains("sub $217.70 today"),
+            "a notice hid the pinned quota"
+        );
     }
 }

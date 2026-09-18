@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod config;
 mod provider;
+mod quota;
 mod serve;
 mod session;
 mod state;
