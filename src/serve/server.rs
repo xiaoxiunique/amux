@@ -3687,7 +3687,25 @@ fn preview(text: &str, max: usize) -> String {
 
 /// Type one auto continuation into a pane, mirroring `api_send`'s delivery:
 /// herdr panes go through its API, rmux panes through paste + submit key.
-fn auto_deliver(pane: &Pane, text: &str) -> Result<(), String> {
+/// Put the banner on its own line above the message, or leave it alone.
+fn with_banner(text: &str, banner: Option<&str>) -> String {
+    match banner {
+        Some(banner) => format!("{banner}\n{text}"),
+        None => text.to_string(),
+    }
+}
+
+/// Type text into a pane as though it had been sent from the input box.
+///
+/// `banner`, when present, is prepended as its own line. Auto uses it to say
+/// that what follows was written by a model: delivered plain, a continuation is
+/// indistinguishable from something the user typed, and an agent downstream will
+/// act on an invented instruction exactly as it would on a real one. The timer
+/// passes `None` — that prompt is the user's own words, typed once and repeated
+/// on a clock, so calling it machine-written would be the lie.
+fn auto_deliver(pane: &Pane, text: &str, banner: Option<&str>) -> Result<(), String> {
+    let body = with_banner(text, banner);
+    let text = body.as_str();
     if crate::serve::herdr::owns(&pane.id) {
         return crate::serve::herdr::send(&pane.id, text, true);
     }
@@ -3754,7 +3772,7 @@ fn timer_tick(state: &AppState, panes: &[Pane]) {
             TimerAction::Send => {}
         }
 
-        match auto_deliver(pane, &config.prompt) {
+        match auto_deliver(pane, &config.prompt, None) {
             Ok(()) => {
                 crate::store::timer_mark_run(&pane.session);
                 let _ = state.pane_log_refreshes.send(pane.id.clone());
@@ -3806,6 +3824,29 @@ pub(crate) fn timer_is_due(last_run_at: &str, every_secs: u32) -> bool {
     };
     let elapsed = chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc));
     elapsed.num_seconds() >= every_secs.max(MIN_EVERY_SECS) as i64
+}
+
+#[cfg(test)]
+mod auto_delivery_tests {
+    use super::*;
+
+    /// Delivered plain, a continuation reads as something the user typed, and an
+    /// agent downstream acts on an invented instruction exactly as on a real
+    /// one. That has already happened once here.
+    #[test]
+    fn an_auto_continuation_says_where_it_came_from() {
+        let out = with_banner("look at CI", Some("[amux auto · turn 1/50]"));
+        let (first, rest) = out.split_once('\n').expect("the banner needs its own line");
+        assert_eq!(first, "[amux auto · turn 1/50]");
+        assert_eq!(rest, "look at CI");
+    }
+
+    /// The timer sends the user's own words on a clock. Calling those
+    /// machine-written would be the lie, so it passes no banner.
+    #[test]
+    fn a_timer_prompt_is_delivered_as_written() {
+        assert_eq!(with_banner("look at CI", None), "look at CI");
+    }
 }
 
 #[cfg(test)]
@@ -3988,7 +4029,12 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
                     if !still_stopped || pane_has_pending(&pane.id) {
                         eprintln!("[auto] {} moved on before the decision; skipping", pane.id);
                     } else {
-                        match auto_deliver(&pane, &message) {
+                        let banner = format!(
+                            "[amux auto · turn {}/{} · written by a model, not typed by a person]",
+                            config.used + 1,
+                            config.max_turns
+                        );
+                        match auto_deliver(&pane, &message, Some(&banner)) {
                             Ok(()) => {
                                 let used = crate::store::auto_bump(&pane.session);
                                 // Nudge the pane-log stream so the new turn is
