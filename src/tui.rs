@@ -779,6 +779,28 @@ impl AppState {
         true
     }
 
+    /// Whether this session has a schedule armed.
+    pub fn timer_on(&self, name: &str) -> bool {
+        self.scheduled.contains(name)
+    }
+
+    /// Turn the selected session's schedule off, or open the form to arm one.
+    ///
+    /// The pane's timer button. Turning one off is a single click; arming needs
+    /// a prompt and an interval, so it opens the same form `T` does rather than
+    /// guessing a schedule. Returns a notice to show when it turned one off.
+    pub fn toggle_timer(&mut self) -> Option<String> {
+        let name = self.current_name()?;
+        if self.timer_on(&name) {
+            crate::store::timer_disable(&name);
+            self.scheduled.remove(&name);
+            Some(format!("timer off for {name}"))
+        } else {
+            self.begin_timer();
+            None
+        }
+    }
+
     pub fn begin_auto(&mut self) -> bool {
         let Some(name) = self.current_name() else {
             return false;
@@ -1356,6 +1378,9 @@ enum PaneAction {
     /// Arm auto mode for the pane's session with the default "keep going"
     /// goal, or disarm it if already armed.
     ToggleAuto,
+    /// Turn the pane session's schedule off when it is on, or open the schedule
+    /// form to arm one when it is off.
+    ToggleTimer,
     /// Ask the model for a short title for the pane's session and set it as the
     /// session's label.
     AutoName,
@@ -1382,6 +1407,13 @@ const PANE_BUTTONS: &[PaneButton] = &[
     PaneButton {
         label: "auto",
         action: PaneAction::ToggleAuto,
+    },
+    // The other mode that types into a pane, next to auto because the store
+    // disarms one to arm the other: the pair reads as the two halves of that
+    // rule, and a lit TIMER is how an armed schedule shows itself.
+    PaneButton {
+        label: "timer",
+        action: PaneAction::ToggleTimer,
     },
     PaneButton {
         label: "name",
@@ -2523,6 +2555,18 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                             Some("auto not saved — database unavailable".into());
                                     }
                                     state.refresh_auto_sessions();
+                                }
+                            }
+                            PaneAction::ToggleTimer => {
+                                let name = live
+                                    .get(index)
+                                    .map(|term| term.session.clone())
+                                    .or_else(|| state.current_name());
+                                if let Some(name) = name {
+                                    select_session(state, &name);
+                                    if let Some(notice) = state.toggle_timer() {
+                                        state.notice = Some(notice);
+                                    }
                                 }
                             }
                             PaneAction::TogglePin => {
@@ -5509,6 +5553,14 @@ fn render_one_terminal(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>,
         let of_this_pane = live.map(|t| t.session.as_str());
         let held = of_this_pane.is_some_and(|name| state.pinned.iter().any(|p| p == name));
         let blown_up = of_this_pane.is_some_and(|name| state.zoomed.as_deref() == Some(name));
+        // Like `armed`: with no pane behind the buttons, the cursor's session
+        // is what they act on, so its schedule is the one the button shows.
+        let timed = match live {
+            Some(term) => state.timer_on(&term.session),
+            None => state
+                .current_name()
+                .is_some_and(|name| state.timer_on(&name)),
+        };
         for (rect, index) in pane_button_rects(area, title_chars) {
             let button = &PANE_BUTTONS[index];
             let (label, style) = match button.action {
@@ -5523,6 +5575,20 @@ fn render_one_terminal(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>,
                 ),
                 PaneAction::ToggleAuto => (
                     "auto".to_string(),
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                ),
+                // An armed schedule lights like auto, and one click turns it
+                // off. `LightBlue` rather than the tree marker's blue so it
+                // stays distinct from an armed ZOOM beside it.
+                PaneAction::ToggleTimer if timed => (
+                    "TIMER".to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightBlue)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                PaneAction::ToggleTimer => (
+                    "timer".to_string(),
                     Style::default().fg(Color::Black).bg(Color::DarkGray),
                 ),
                 // Held and blown up both read as lit, for the same reason as
@@ -6425,6 +6491,27 @@ mod tests {
         );
     }
 
+    /// The pane's timer button turns an armed schedule off in one click, and
+    /// opens the form when there is nothing to turn off.
+    #[test]
+    fn the_timer_button_turns_a_schedule_off() {
+        let _guard = crate::test_home::scratch_db();
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let name = state.current_name().expect("a focused session");
+
+        assert!(crate::store::timer_enable(&name, "look at CI", 900));
+        state.scheduled.insert(name.clone());
+
+        assert_eq!(state.toggle_timer(), Some(format!("timer off for {name}")));
+        assert!(!state.timer_on(&name));
+        assert!(!crate::store::timer_enabled_sessions().contains(&name));
+
+        // Nothing is armed now, so the same button opens the form instead.
+        assert!(state.toggle_timer().is_none());
+        assert!(state.timer_editing.is_some());
+    }
+
     /// Shrinking a pane onto a double-width character must not poison it.
     ///
     /// Drives the real policy, not a copy of it. Without the fresh screen this
@@ -7000,6 +7087,28 @@ mod tests {
         assert!(
             drawn(&state, 160).contains("AUTO"),
             "an armed session should light the auto button"
+        );
+    }
+
+    /// The pane carries a timer button that lights when a schedule is armed, so
+    /// an armed session is visible and one click away from being turned off.
+    #[test]
+    fn the_pane_lights_the_timer_button_when_a_schedule_is_armed() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let name = state.current_name().expect("a focused session");
+
+        let text = drawn(&state, 160);
+        assert!(text.contains("timer"), "no timer button on the pane");
+        assert!(
+            !text.contains("TIMER"),
+            "an unarmed session should not read TIMER"
+        );
+
+        state.scheduled.insert(name);
+        assert!(
+            drawn(&state, 160).contains("TIMER"),
+            "an armed schedule should light the timer button"
         );
     }
 
