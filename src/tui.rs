@@ -2865,9 +2865,17 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 }
                 if state.timer_editing.is_some() {
                     let mut submit = false;
+                    let mut stop = false;
                     if let Some(draft) = state.timer_editing.as_mut() {
                         match key.code {
                             KeyCode::Esc => state.timer_editing = None,
+                            // Esc only closes the form. Without a way out from
+                            // in here the schedule could be started and edited
+                            // but never stopped — the phone had a switch and the
+                            // tree had nothing.
+                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                stop = true;
+                            }
                             KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
                                 draft.field = match draft.field {
                                     TimerField::Every => TimerField::Prompt,
@@ -2888,6 +2896,14 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                 TimerField::Prompt => draft.prompt.push(c),
                             },
                             _ => {}
+                        }
+                    }
+                    if stop {
+                        state.timer_editing = None;
+                        if let Some(name) = state.current_name() {
+                            crate::store::timer_disable(&name);
+                            state.scheduled.remove(&name);
+                            state.notice = Some(format!("timer off for {name}"));
                         }
                     }
                     if submit {
@@ -4185,6 +4201,8 @@ fn render_timer_form(f: &mut Frame, state: &AppState, area: Rect) {
         return;
     };
     let session = state.current_name().unwrap_or_default();
+    // Only offer the way out when there is something to stop.
+    let armed = state.scheduled.contains(&session);
     let cursor = |on: bool| if on { "_" } else { " " };
     let label = |on: bool| {
         if on {
@@ -4229,7 +4247,11 @@ fn render_timer_form(f: &mut Frame, state: &AppState, area: Rect) {
         ]),
         Line::raw(""),
         Line::styled(
-            "  Tab switches   Enter starts it   Esc cancels",
+            if armed {
+                "  Tab switches   Enter saves it   ^X stops it   Esc cancels"
+            } else {
+                "  Tab switches   Enter starts it   Esc cancels"
+            },
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -6342,6 +6364,31 @@ mod tests {
 
     /// A row taller than the whole box must not push the viewport past the end.
     ///
+    /// The form has to be able to stop what it started.
+    ///
+    /// Esc only closes it. Without a way out the tree could arm a schedule and
+    /// edit it but never end it — the phone had a switch and the tree had
+    /// nothing, which is how this was noticed.
+    #[test]
+    fn a_schedule_can_be_stopped_from_the_form_that_started_it() {
+        let _guard = crate::test_home::scratch_db();
+        let name = "cc_alpha_11111111";
+        assert!(crate::store::timer_enable(name, "look at CI", 300));
+        assert!(crate::store::timer_enabled_sessions().contains(name));
+
+        crate::store::timer_disable(name);
+        assert!(
+            !crate::store::timer_enabled_sessions().contains(name),
+            "the schedule was still armed"
+        );
+        // The prompt survives, so turning it back on does not mean typing it
+        // again.
+        assert_eq!(
+            crate::store::timer_get(name).map(|c| c.prompt),
+            Some("look at CI".to_string())
+        );
+    }
+
     /// Shrinking a pane onto a double-width character must not poison it.
     ///
     /// Drives the real policy, not a copy of it. Without the fresh screen this
