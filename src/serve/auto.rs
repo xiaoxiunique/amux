@@ -200,9 +200,11 @@ fn model_name() -> String {
 ///
 /// Two flags carry the cost of this. `--strict-mcp-config` drops the MCP tool
 /// definitions and `--setting-sources ""` the settings and their memory files;
-/// measured on this machine, a decision goes from 81k cache-creation tokens and
-/// $0.81 to about 2.5k and $0.02–0.04, and gets faster rather than slower
-/// because the prefix is now small enough to be reused between calls.
+/// measured on this machine, a decision goes from $0.81 to $0.014 once the
+/// prefix is warm. The prefix that gets cached is the CLI's own — 26.9k tokens,
+/// byte-identical every call — while the goal and the terminal tail are not
+/// cached at all, which is why caching cannot carry one session's context into
+/// another's decision.
 ///
 /// Run from a scratch directory on purpose: whatever amux happens to be sitting
 /// in has nothing to do with the session being judged, and a project's own
@@ -217,6 +219,11 @@ fn ask(system: &str, user: &str) -> Option<String> {
         .args(["--system-prompt", system])
         .arg("--strict-mcp-config")
         .args(["--setting-sources", ""])
+        // Nothing here is ever resumed, and every decision would otherwise leave
+        // a transcript under ~/.claude/projects keyed by the scratch directory —
+        // 104 files and 5.3MB had accumulated on this machine before anyone
+        // looked.
+        .arg("--no-session-persistence")
         .arg(user)
         .current_dir(std::env::temp_dir())
         .stdin(Stdio::null())
@@ -276,7 +283,7 @@ fn ask(system: &str, user: &str) -> Option<String> {
 /// How long to wait for a decision. Measured at under three seconds with the
 /// trimming flags on; this is the ceiling before the loop gives up and asks
 /// again on the next stop.
-const MODEL_TIMEOUT: Duration = Duration::from_secs(90);
+pub(crate) const MODEL_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Ask the deciding model.
 ///

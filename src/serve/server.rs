@@ -3664,10 +3664,21 @@ fn flush_pending_messages(state: &AppState, panes: &[Pane]) {
 /// Per-pane cooldown so a pane that stays Idle isn't asked on every 2.5s poll.
 static AUTO_LAST_FIRE: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Panes with a decision in flight, so the next poll doesn't start a second one
-/// before the model has answered.
-static AUTO_IN_FLIGHT: LazyLock<Mutex<HashMap<String, ()>>> =
+/// Panes with a decision in flight, and when it started, so the next poll
+/// doesn't start a second one before the model has answered.
+///
+/// The start time is what makes the guard recoverable. It is cleared at the end
+/// of the spawned task, so a panic anywhere in that task would otherwise leave
+/// the entry behind and that pane would never fire again until the daemon was
+/// restarted — silently, since dropping the join handle swallows the panic.
+static AUTO_IN_FLIGHT: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long an in-flight entry can stand before it is treated as abandoned.
+/// The model is given [`MODEL_TIMEOUT`]; past that plus delivery, a live
+/// decision is no longer a plausible explanation.
+const AUTO_IN_FLIGHT_STALE: Duration =
+    Duration::from_secs(crate::serve::auto::MODEL_TIMEOUT.as_secs() + 60);
 /// Whether the missing-key warning has been printed. The condition persists
 /// until the daemon is restarted with the key, so say it once.
 static AUTO_NO_KEY_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -3693,6 +3704,11 @@ fn with_banner(text: &str, banner: Option<&str>) -> String {
         Some(banner) => format!("{banner}\n{text}"),
         None => text.to_string(),
     }
+}
+
+/// Whether an in-flight entry has stood long enough to be treated as abandoned.
+fn in_flight_is_stale(since: Instant) -> bool {
+    since.elapsed() >= AUTO_IN_FLIGHT_STALE
 }
 
 /// Type text into a pane as though it had been sent from the input box.
@@ -3847,6 +3863,28 @@ mod auto_delivery_tests {
     fn a_timer_prompt_is_delivered_as_written() {
         assert_eq!(with_banner("look at CI", None), "look at CI");
     }
+
+    /// The guard is cleared at the end of the spawned task, so a panic in that
+    /// task leaves it set. Without an age it would wedge the pane until the
+    /// daemon restarted — and the panic is swallowed, so nothing would say why.
+    #[test]
+    fn an_abandoned_decision_stops_holding_the_pane() {
+        assert!(!in_flight_is_stale(Instant::now()));
+        let fresh = Instant::now()
+            .checked_sub(AUTO_IN_FLIGHT_STALE / 2)
+            .expect("clock too young for this test");
+        assert!(
+            !in_flight_is_stale(fresh),
+            "a live decision was given up on"
+        );
+        let old = Instant::now()
+            .checked_sub(AUTO_IN_FLIGHT_STALE + Duration::from_secs(1))
+            .expect("clock too young for this test");
+        assert!(
+            in_flight_is_stale(old),
+            "an abandoned decision still held the pane"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3928,6 +3966,21 @@ mod timer_tests {
 }
 
 fn auto_tick(state: &AppState, panes: &[Pane]) {
+    // Both maps are keyed by pane id, and rmux reuses those after a restart —
+    // so an entry outliving its pane is not merely a leak, it can hand a fresh
+    // session an old pane's cooldown.
+    {
+        let live: std::collections::HashSet<&str> =
+            panes.iter().map(|pane| pane.id.as_str()).collect();
+        AUTO_LAST_FIRE
+            .lock()
+            .expect("auto cooldown mutex poisoned")
+            .retain(|id, _| live.contains(id.as_str()));
+        AUTO_IN_FLIGHT
+            .lock()
+            .expect("auto in-flight mutex poisoned")
+            .retain(|id, _| live.contains(id.as_str()));
+    }
     // `broadcast_snapshot` normally runs inside the server's tokio runtime;
     // if it is ever called outside one, skip auto rather than panic.
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -3978,11 +4031,21 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
         }
 
         {
-            let in_flight = AUTO_IN_FLIGHT
+            let mut in_flight = AUTO_IN_FLIGHT
                 .lock()
                 .expect("auto in-flight mutex poisoned");
-            if in_flight.contains_key(&pane.id) {
-                continue;
+            match in_flight.get(&pane.id) {
+                Some(since) if !in_flight_is_stale(*since) => continue,
+                Some(_) => {
+                    // Abandoned, not running. Say so — the task that left it
+                    // behind cannot have.
+                    eprintln!(
+                        "[auto] {} had a decision in flight for over {:?}; assuming it died",
+                        pane.id, AUTO_IN_FLIGHT_STALE
+                    );
+                    in_flight.remove(&pane.id);
+                }
+                None => {}
             }
         }
         if let Some(at) = AUTO_LAST_FIRE
@@ -3998,7 +4061,7 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
         AUTO_IN_FLIGHT
             .lock()
             .expect("auto in-flight mutex poisoned")
-            .insert(pane.id.clone(), ());
+            .insert(pane.id.clone(), Instant::now());
         AUTO_LAST_FIRE
             .lock()
             .expect("auto cooldown mutex poisoned")
