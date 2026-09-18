@@ -857,7 +857,10 @@ impl AppState {
             used += row;
             first -= 1;
         }
-        first
+        // A row taller than the whole box never fits, so the walk stops before
+        // taking anything and `first` is still past the end. Showing the last
+        // row clipped is the furthest there is to go.
+        first.min(rows.len() - 1)
     }
 
     /// Bring the cursor back into view after it has moved.
@@ -891,6 +894,9 @@ impl AppState {
             }
             first -= 1;
         }
+        // Same edge as `max_view_offset`: a cursor row taller than the box
+        // leaves `first` one past it.
+        let first = first.min(rows.len() - 1);
         if first > self.view_offset.get() {
             self.view_offset.set(first);
         }
@@ -6265,6 +6271,46 @@ mod tests {
             state.zoom_index().is_none(),
             "the zoom outlived the pane it was on"
         );
+    }
+
+    /// A row taller than the whole box must not push the viewport past the end.
+    ///
+    /// The walk that finds the furthest offset stops as soon as a row does not
+    /// fit — and when the very first one it tries does not fit, it has taken
+    /// nothing and still points one past the last row. Drawn, that is an index
+    /// equal to the length: "the len is 78 but the index is 78", which is how
+    /// this was found.
+    #[test]
+    fn a_row_taller_than_the_box_does_not_run_off_the_end() {
+        use ratatui::backend::TestBackend;
+        let many: Vec<Project> = (0..78)
+            .map(|i| Project {
+                dir: format!("/work/p{i}"),
+                name: format!("p{i}"),
+                alias: None,
+                sessions: vec![session(&format!("cc_p{i}_1111111{}", i % 10), "cc")],
+            })
+            .collect();
+        let mut state = AppState::with_agents(many, crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+        for p in &state.projects {
+            for s in &p.sessions {
+                state
+                    .descriptions
+                    .insert(s.name.clone(), "doing a thing".into());
+            }
+        }
+        state.view_height.set(1);
+        let rows = state.rows().len();
+        let max = state.max_view_offset();
+        assert_eq!(rows, 78, "the shape this was reported at");
+        assert!(
+            max < rows,
+            "offset {max} is past the last of {rows} rows — drawing it panics"
+        );
+        state.scroll_view(9999);
+        let mut terminal = Terminal::new(TestBackend::new(120, 4)).unwrap();
+        terminal.draw(|f| render(f, &state, &[], None)).unwrap();
     }
 
     /// A window that grows, or a session that goes away, must not leave the
