@@ -1643,7 +1643,8 @@ impl LiveTerm {
         if self.parser.screen().size() == (rows, cols) {
             return;
         }
-        self.parser.set_size(rows, cols);
+        let parser = std::mem::replace(&mut self.parser, vt100::Parser::new(rows, cols, 0));
+        self.parser = resized_parser(parser, rows, cols);
         let _ = self.master.resize(PtySize {
             rows,
             cols,
@@ -2118,6 +2119,29 @@ fn reusable<T>(spare: &[Option<T>], name: &str, session_of: impl Fn(&T) -> &str)
 }
 
 /// Size of the terminal column, in cells, for the current frame size.
+/// Resize a screen, starting a fresh one when it would get narrower.
+///
+/// `vt100::Parser::set_size` truncates every row's cells to the new width
+/// without looking at what it cuts. A double-width character straddling the new
+/// edge keeps its "wide" flag while the continuation cell it points at is gone,
+/// and the next write to that row reaches past the end — `row.rs:89`, "the len
+/// is 78 but the index is 78". Reproduced against vt100 directly: shrink onto a
+/// wide character and the following write panics. 0.16.2 has the same code.
+///
+/// A new screen cannot hold that state. Nothing is lost that is not coming
+/// back: the multiplexer repaints the pane when its pty changes size, so the
+/// contents arrive again a frame later. Growing is safe — cells are appended,
+/// nothing is cut — and keeps what is on screen until then.
+fn resized_parser(parser: vt100::Parser, rows: u16, cols: u16) -> vt100::Parser {
+    let (_, was_cols) = parser.screen().size();
+    if cols < was_cols {
+        return vt100::Parser::new(rows, cols, 0);
+    }
+    let mut parser = parser;
+    parser.set_size(rows, cols);
+    parser
+}
+
 fn term_size(area: Rect) -> (u16, u16) {
     // Minus the border on each side.
     (
@@ -6318,6 +6342,39 @@ mod tests {
 
     /// A row taller than the whole box must not push the viewport past the end.
     ///
+    /// Shrinking a pane onto a double-width character must not poison it.
+    ///
+    /// Drives the real policy, not a copy of it. Without the fresh screen this
+    /// panics inside vt100 rather than failing an assertion — which is the
+    /// crash it stands for.
+    #[test]
+    fn a_narrower_pane_does_not_keep_half_a_wide_character() {
+        let mut parser = vt100::Parser::new(4, 80, 0);
+        // A double-width character ending on the column that is about to go.
+        parser.process(b"\x1b[1;78H");
+        parser.process("\u{4e2d}".as_bytes());
+
+        let parser = resized_parser(parser, 4, 78);
+        assert_eq!(parser.screen().size(), (4, 78));
+
+        // Writing over where it straddled the edge is what used to reach past
+        // the end of the row.
+        let mut parser = parser;
+        parser.process(b"\x1b[1;78H");
+        parser.process(b"x");
+        parser.process(b"\x1b[1;1H\x1b[2K");
+
+        // Growing keeps what is on screen — there is nothing to cut.
+        let mut wider = vt100::Parser::new(4, 40, 0);
+        wider.process(b"hello");
+        let wider = resized_parser(wider, 4, 90);
+        assert_eq!(wider.screen().size(), (4, 90));
+        assert!(
+            wider.screen().contents().contains("hello"),
+            "growing threw the screen away"
+        );
+    }
+
     /// The walk that finds the furthest offset stops as soon as a row does not
     /// fit — and when the very first one it tries does not fit, it has taken
     /// nothing and still points one past the last row. Drawn, that is an index
