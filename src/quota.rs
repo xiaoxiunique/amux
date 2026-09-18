@@ -30,7 +30,7 @@ const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
 const OPENCODE_USAGE_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
 /// The numbers move slowly and each read is a network round trip.
-const CACHE_TTL: Duration = Duration::from_secs(300);
+const CACHE_TTL: Duration = Duration::from_secs(600);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 static CACHE: LazyLock<Mutex<Option<(Instant, serde_json::Value)>>> =

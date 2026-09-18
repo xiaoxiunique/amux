@@ -2032,7 +2032,7 @@ const USAGE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// How often the provider quota is re-read. It is a network round trip (cached
 /// behind the call), and the numbers it carries move on the scale of a day.
-const QUOTA_EVERY: Duration = Duration::from_secs(300);
+const QUOTA_EVERY: Duration = Duration::from_secs(600);
 
 /// Put a pasted block into whichever of amux's own text fields is open.
 ///
