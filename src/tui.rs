@@ -573,6 +573,12 @@ pub struct AppState {
     /// browse others at the same time. Capped at three — a fourth would leave
     /// every pane too narrow to read, and rmux reflows to the pane width.
     pub pinned: Vec<String>,
+    /// The session blown up to fill the terminal column, if any.
+    ///
+    /// Held by name, not index: a session that goes away, or stops being shown,
+    /// simply stops being zoomed rather than leaving the layout pointing at a
+    /// pane that is no longer there.
+    pub zoomed: Option<String>,
     /// A file browser running in the terminal column.
     ///
     /// Kept apart from the session terminal rather than replacing it, so
@@ -634,6 +640,7 @@ impl AppState {
             browsing: false,
             pending_g: false,
             pinned: Vec::new(),
+            zoomed: None,
             browsing_session: None,
             selection: None,
             usage: None,
@@ -1048,6 +1055,41 @@ impl AppState {
         self.visible_sessions().len() > self.pinned.len()
     }
 
+    /// Which visible pane is blown up, if any.
+    pub fn zoom_index(&self) -> Option<usize> {
+        let name = self.zoomed.as_ref()?;
+        self.visible_sessions().iter().position(|s| s == name)
+    }
+
+    /// Blow one pane up to fill the column, or put it back.
+    ///
+    /// Zooming does not change which sessions are attached — the others keep
+    /// their pane and their size and are simply not drawn. Tearing them down
+    /// would mean a process, a pty and a repaint each on the way back.
+    pub fn toggle_zoom(&mut self, name: &str) {
+        if self.zoomed.as_deref() == Some(name) {
+            self.zoomed = None;
+        } else {
+            self.zoomed = Some(name.to_string());
+        }
+    }
+
+    /// Hold `name`, or let go of it.
+    pub fn toggle_pin_named(&mut self, name: &str) -> Result<(), String> {
+        if let Some(at) = self.pinned.iter().position(|p| p == name) {
+            self.pinned.remove(at);
+            return Ok(());
+        }
+        if self.pinned.len() >= Self::MAX_PINNED {
+            return Err(format!(
+                "already holding {} — unpin one first",
+                Self::MAX_PINNED
+            ));
+        }
+        self.pinned.push(name.to_string());
+        Ok(())
+    }
+
     /// Hold the session under the cursor, or let go of it.
     pub fn toggle_pin(&mut self) -> Result<(), String> {
         let Some(name) = self.current_name() else {
@@ -1311,6 +1353,10 @@ enum PaneAction {
     /// Ask the model for a short title for the pane's session and set it as the
     /// session's label.
     AutoName,
+    /// Hold this pane's session in the column, or let go of it.
+    TogglePin,
+    /// Blow this pane up to fill the column, or put it back.
+    ToggleZoom,
 }
 
 /// A control drawn on a pane's top border.
@@ -1344,12 +1390,12 @@ const PANE_BUTTONS: &[PaneButton] = &[
         action: PaneAction::Key(KeyCode::Char('c'), KeyModifiers::CONTROL),
     },
     PaneButton {
-        label: "tab",
-        action: PaneAction::Key(KeyCode::Tab, KeyModifiers::NONE),
+        label: "pin",
+        action: PaneAction::TogglePin,
     },
     PaneButton {
-        label: "enter",
-        action: PaneAction::Key(KeyCode::Enter, KeyModifiers::NONE),
+        label: "zoom",
+        action: PaneAction::ToggleZoom,
     },
 ];
 
@@ -1816,13 +1862,24 @@ fn status_marker(status: Option<&crate::serve::server::SessionStatus>) -> (&'sta
 /// position into a cell in *that* pane's grid — the whole column's origin is
 /// only the right answer when there is a single pane, which is how forwarded
 /// clicks used to land in the wrong place once anything was pinned.
+/// Whether a point falls inside a rectangle.
+fn within(r: Rect, column: u16, row: u16) -> bool {
+    column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
 fn pane_hit(
     area: Rect,
     pinned: usize,
     browse: bool,
+    zoom: Option<usize>,
     column: u16,
     row: u16,
 ) -> Option<(usize, Rect)> {
+    // Zoomed, only one pane is on screen — and it covers the rectangles the
+    // others would have had, so a plain search would match whichever came first.
+    if let Some(index) = zoom {
+        return within(area, column, row).then_some((index, area));
+    }
     let rects = pane_rects(area, pinned, browse);
     let rects = if rects.is_empty() { vec![area] } else { rects };
     let index = rects.iter().position(|r| {
@@ -1855,6 +1912,7 @@ fn pane_at(
     area: Rect,
     pinned: usize,
     browse: bool,
+    zoom: Option<usize>,
     column: u16,
     row: u16,
 ) -> Option<String> {
@@ -1865,6 +1923,11 @@ fn pane_at(
     // the height by the pane count and ignored the column entirely — which was
     // right for the equal stack it was written for, and wrong for every pinned
     // arrangement, so a click in one quadrant typed into another.
+    if let Some(index) = zoom {
+        return within(area, column, row)
+            .then(|| live.get(index).map(|t| t.session.clone()))
+            .flatten();
+    }
     let rects = pane_rects(area, pinned, browse);
     let index = rects.iter().position(|r| {
         column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
@@ -2149,10 +2212,11 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
 
         // Attach to whatever is in view, and drop terminals that no longer are.
         let wanted = state.visible_sessions();
-        let rects = pane_rects(
+        let rects = pane_rects_zoomed(
             terminal_column(terminal.get_frame().area()),
             state.pinned.len(),
             state.has_browse_pane(),
+            state.zoom_index(),
         );
         if live.iter().map(|t| &t.session).ne(wanted.iter()) {
             // Keep the clients that are still wanted rather than tearing the
@@ -2388,6 +2452,31 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                     state.refresh_auto_sessions();
                                 }
                             }
+                            PaneAction::TogglePin => {
+                                let name = live
+                                    .get(index)
+                                    .map(|term| term.session.clone())
+                                    .or_else(|| state.current_name());
+                                if let Some(name) = name {
+                                    match state.toggle_pin_named(&name) {
+                                        Ok(()) => {
+                                            // A pane that is no longer shown
+                                            // cannot stay blown up.
+                                            if state.zoom_index().is_none() {
+                                                state.zoomed = None;
+                                            }
+                                            state.save_arrangement();
+                                        }
+                                        Err(why) => state.notice = Some(why),
+                                    }
+                                }
+                            }
+                            PaneAction::ToggleZoom => {
+                                if let Some(term) = live.get(index) {
+                                    let name = term.session.clone();
+                                    state.toggle_zoom(&name);
+                                }
+                            }
                             // Name the session from what it is doing, so the
                             // tree says something useful. Off-thread: the model
                             // takes seconds, and a frame must not wait on it.
@@ -2444,6 +2533,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     area,
                     state.pinned.len(),
                     state.has_browse_pane(),
+                    state.zoom_index(),
                     column,
                     row,
                 );
@@ -2517,6 +2607,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             area,
                             state.pinned.len(),
                             state.has_browse_pane(),
+                            state.zoom_index(),
                             column,
                             row,
                         ) {
@@ -3269,6 +3360,26 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     KeyCode::Char('p') => {
                         if let Err(why) = state.toggle_pin() {
                             state.notice = Some(why);
+                        }
+                        // A session that is no longer shown cannot stay blown up.
+                        if state.zoom_index().is_none() {
+                            state.zoomed = None;
+                        }
+                    }
+                    // Blow one pane up to read it, then put it back. The others
+                    // stay attached behind it, so this costs a redraw and not a
+                    // reconnect.
+                    KeyCode::Char('z') => {
+                        let name = focused_term(&mut live, state)
+                            .map(|term| term.session.clone())
+                            .or_else(|| state.current_name());
+                        match name {
+                            Some(name) if state.visible_sessions().contains(&name) => {
+                                state.toggle_zoom(&name);
+                            }
+                            Some(_) | None => {
+                                state.notice = Some("nothing on screen to zoom".into());
+                            }
                         }
                     }
                     // Name the selected session. Starts from whatever it is
@@ -4247,6 +4358,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("Esc", "stop typing"),
         ("^↑ ^↓", "switch sessions while typing"),
         ("p", "pin this session, or let it go"),
+        ("z", "blow one pane up, or put it back"),
         ("o", "open a project from history"),
         ("O", "conversations of this project"),
         ("f", "search the conversations"),
@@ -5002,6 +5114,21 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
 /// │       │   │    │    │   │pin2│se  │   │pin2│brow│
 /// └───────┘   └────┴────┘   └────┴────┘   └────┴────┘
 /// ```
+/// [`pane_rects`], with one pane blown up to the whole column.
+///
+/// The others keep the rectangle they would have had. They are not drawn while
+/// a pane is zoomed, but they stay attached at their own size, so coming back
+/// out costs nothing and nothing reflows.
+fn pane_rects_zoomed(area: Rect, pinned: usize, browse: bool, zoom: Option<usize>) -> Vec<Rect> {
+    let mut rects = pane_rects(area, pinned, browse);
+    if let Some(index) = zoom {
+        if let Some(slot) = rects.get_mut(index) {
+            *slot = area;
+        }
+    }
+    rects
+}
+
 fn pane_rects(area: Rect, pinned: usize, browse: bool) -> Vec<Rect> {
     if pinned == 0 {
         return if browse { vec![area] } else { Vec::new() };
@@ -5103,9 +5230,17 @@ fn pane_button_hit(
     column: u16,
     row: u16,
 ) -> Option<(usize, usize)> {
-    let rects = pane_rects(area, state.pinned.len(), state.has_browse_pane());
+    let rects = pane_rects_zoomed(
+        area,
+        state.pinned.len(),
+        state.has_browse_pane(),
+        state.zoom_index(),
+    );
     let rects = if rects.is_empty() { vec![area] } else { rects };
     for (index, pane) in rects.iter().enumerate() {
+        if state.zoom_index().is_some_and(|z| z != index) {
+            continue;
+        }
         let term = live.get(index);
         // Buttons are drawn only on the focused pane, so only that pane's
         // buttons may be clicked — otherwise an invisible button would still
@@ -5125,6 +5260,12 @@ fn pane_button_hit(
 
 /// The terminal column: the pinned sessions, and whatever the cursor is on.
 fn render_terminal(f: &mut Frame, state: &AppState, live: &[LiveTerm], area: Rect) {
+    // Zoomed: one pane owns the column and the rest are simply not drawn. They
+    // stay attached behind it, which is what makes coming back out free.
+    if let Some(index) = state.zoom_index() {
+        render_one_terminal(f, state, live.get(index), area);
+        return;
+    }
     let rects = pane_rects(area, state.pinned.len(), state.has_browse_pane());
     if rects.len() <= 1 {
         render_one_terminal(
@@ -5152,7 +5293,12 @@ fn highlight_selection(f: &mut Frame, state: &AppState, area: Rect) {
     if selection.is_click() {
         return;
     }
-    let rects = pane_rects(area, state.pinned.len(), state.has_browse_pane());
+    let rects = pane_rects_zoomed(
+        area,
+        state.pinned.len(),
+        state.has_browse_pane(),
+        state.zoom_index(),
+    );
     let rect = match rects.get(selection.pane) {
         Some(r) => *r,
         None if selection.pane == 0 => area,
@@ -5229,6 +5375,9 @@ fn render_one_terminal(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>,
                 .current_name()
                 .is_some_and(|name| state.auto_on(&name)),
         };
+        let of_this_pane = live.map(|t| t.session.as_str());
+        let held = of_this_pane.is_some_and(|name| state.pinned.iter().any(|p| p == name));
+        let blown_up = of_this_pane.is_some_and(|name| state.zoomed.as_deref() == Some(name));
         for (rect, index) in pane_button_rects(area, title_chars) {
             let button = &PANE_BUTTONS[index];
             let (label, style) = match button.action {
@@ -5245,7 +5394,26 @@ fn render_one_terminal(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>,
                     "auto".to_string(),
                     Style::default().fg(Color::Black).bg(Color::DarkGray),
                 ),
-                PaneAction::Key(..) | PaneAction::AutoName => (
+                // Held and blown up both read as lit, for the same reason as
+                // auto: the pane says what it is without being opened.
+                PaneAction::TogglePin if held => (
+                    "PIN".to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                PaneAction::ToggleZoom if blown_up => (
+                    "ZOOM".to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                PaneAction::Key(..)
+                | PaneAction::AutoName
+                | PaneAction::TogglePin
+                | PaneAction::ToggleZoom => (
                     button.label.to_string(),
                     Style::default().fg(Color::Black).bg(Color::Cyan),
                 ),
@@ -6015,6 +6183,90 @@ mod tests {
     /// The footer holds the bottom row, and the list gives that row up.
     ///
     /// Both halves matter: a footer drawn over the last session hides a
+    /// Zooming changes what is drawn, not what is attached.
+    ///
+    /// The point of holding panes is that they stay connected; if blowing one up
+    /// dropped the others, coming back out would cost a process, a pty and a
+    /// repaint each — which is the same bill that made switching slow.
+    #[test]
+    fn a_zoomed_pane_takes_the_column_without_dropping_the_others() {
+        let mut state = AppState::with_agents(projects(), crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+        let names: Vec<String> = state
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter().map(|s| s.name.clone()))
+            .take(2)
+            .collect();
+        assert_eq!(names.len(), 2, "the test needs two sessions");
+        for name in &names {
+            state.toggle_pin_named(name).expect("could not hold it");
+        }
+        let visible = state.visible_sessions();
+        assert!(visible.len() >= 2, "both should be on screen");
+
+        let area = Rect::new(0, 0, 100, 40);
+        let plain = pane_rects(area, state.pinned.len(), state.has_browse_pane());
+
+        state.toggle_zoom(&names[1]);
+        let at = state.zoom_index().expect("the zoomed pane went missing");
+        assert_eq!(visible[at], names[1]);
+
+        // Still attached to everything: zoom is a drawing decision.
+        assert_eq!(
+            state.visible_sessions(),
+            visible,
+            "zooming changed which sessions are attached"
+        );
+
+        let zoomed = pane_rects_zoomed(area, state.pinned.len(), state.has_browse_pane(), Some(at));
+        assert_eq!(zoomed[at], area, "the zoomed pane did not take the column");
+        for (i, rect) in zoomed.iter().enumerate() {
+            if i != at {
+                assert_eq!(
+                    *rect, plain[i],
+                    "pane {i} was resized behind the zoomed one, so it will reflow"
+                );
+            }
+        }
+
+        // And back.
+        state.toggle_zoom(&names[1]);
+        assert!(state.zoom_index().is_none(), "it stayed blown up");
+    }
+
+    /// Letting go of a session that is blown up must not leave the layout
+    /// pointing at a pane that is no longer drawn.
+    #[test]
+    fn unpinning_the_zoomed_session_ends_the_zoom() {
+        let mut state = AppState::with_agents(projects(), crate::config::builtin_agents());
+        state.cursor = state.first_selectable();
+        let names: Vec<String> = state
+            .projects
+            .iter()
+            .flat_map(|p| p.sessions.iter().map(|s| s.name.clone()))
+            .take(2)
+            .collect();
+        for name in &names {
+            state.toggle_pin_named(name).expect("could not hold it");
+        }
+        // Zoom the one the cursor is not on, so dropping it cannot be rescued by
+        // the following pane picking it back up.
+        let away = names
+            .iter()
+            .find(|n| Some(n.as_str()) != state.current_name().as_deref())
+            .expect("both sessions are under the cursor")
+            .clone();
+        state.toggle_zoom(&away);
+        assert!(state.zoom_index().is_some());
+
+        state.toggle_pin_named(&away).expect("could not let go");
+        assert!(
+            state.zoom_index().is_none(),
+            "the zoom outlived the pane it was on"
+        );
+    }
+
     /// A window that grows, or a session that goes away, must not leave the
     /// list parked past where it can now travel.
     #[test]
@@ -6312,11 +6564,11 @@ mod tests {
             height: 40,
         };
         // Three pinned plus a browser: four quadrants.
-        let (pane, inner) = pane_hit(area, 3, true, 55, 3).expect("top-left quadrant");
+        let (pane, inner) = pane_hit(area, 3, true, None, 55, 3).expect("top-left quadrant");
         assert_eq!(pane, 0);
         assert_eq!(cell_in(inner, 55, 3), Some((2, 4)));
 
-        let (pane, inner) = pane_hit(area, 3, true, 145, 35).expect("bottom-right quadrant");
+        let (pane, inner) = pane_hit(area, 3, true, None, 145, 35).expect("bottom-right quadrant");
         assert_eq!(pane, 3, "a press in the last quadrant named the first");
         // Well inside that quadrant, so small and not near a hundred-odd.
         let (row, col) = cell_in(inner, 145, 35).expect("inside its border");
