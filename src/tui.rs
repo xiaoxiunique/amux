@@ -416,6 +416,9 @@ pub struct AutoDraft {
 pub enum TimerField {
     Every,
     Prompt,
+    /// The on/off switch. Turning it off and pressing Enter stops a schedule
+    /// that is currently on — a visible way out, alongside `^X`.
+    Enabled,
 }
 
 /// The schedule form: how often, and what to send.
@@ -429,6 +432,8 @@ pub struct TimerDraft {
     pub every: String,
     pub prompt: String,
     pub field: TimerField,
+    /// The switch, opened in whatever state the session is in.
+    pub enabled: bool,
 }
 
 /// Parse `30m` / `2h` / `90s` / a bare number of minutes into seconds, or say
@@ -778,6 +783,7 @@ impl AppState {
             return false;
         };
         let existing = crate::store::timer_get(&name);
+        let enabled = self.scheduled.contains(&name);
         self.timer_editing = Some(TimerDraft {
             every: existing
                 .as_ref()
@@ -785,6 +791,7 @@ impl AppState {
                 .unwrap_or_else(|| "30m".to_string()),
             prompt: existing.map(|c| c.prompt).unwrap_or_default(),
             field: TimerField::Prompt,
+            enabled,
         });
         true
     }
@@ -2994,8 +3001,17 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
                                 draft.field = match draft.field {
                                     TimerField::Every => TimerField::Prompt,
-                                    TimerField::Prompt => TimerField::Every,
+                                    TimerField::Prompt => TimerField::Enabled,
+                                    TimerField::Enabled => TimerField::Every,
                                 };
+                            }
+                            // The switch: space (or an arrow) flips it once the
+                            // cursor is on it, so a schedule can be stopped from
+                            // the form without the ^X that was easy to miss.
+                            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                                if draft.field == TimerField::Enabled =>
+                            {
+                                draft.enabled = !draft.enabled;
                             }
                             KeyCode::Backspace => match draft.field {
                                 TimerField::Every => {
@@ -3004,11 +3020,13 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                 TimerField::Prompt => {
                                     draft.prompt.pop();
                                 }
+                                TimerField::Enabled => {}
                             },
                             KeyCode::Enter => submit = true,
                             KeyCode::Char(c) => match draft.field {
                                 TimerField::Every => draft.every.push(c),
                                 TimerField::Prompt => draft.prompt.push(c),
+                                TimerField::Enabled => {}
                             },
                             _ => {}
                         }
@@ -3024,38 +3042,47 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     if submit {
                         let draft = state.timer_editing.take();
                         if let (Some(draft), Some(name)) = (draft, state.current_name()) {
-                            let prompt = draft.prompt.trim().to_string();
-                            // Both refusals put the form back rather than
-                            // dropping what was typed, and neither arms
-                            // anything: a schedule types at a session while
-                            // nobody is watching, so a half-meant one is worse
-                            // than none.
-                            match (prompt.is_empty(), timer_parse_every(&draft.every)) {
-                                (true, _) => {
-                                    state.notice = Some("a schedule needs a prompt".into());
-                                    state.timer_editing = Some(draft);
-                                }
-                                (_, None) => {
-                                    state.notice = Some("that interval does not read".into());
-                                    state.timer_editing = Some(draft);
-                                }
-                                (false, Some(every)) => {
-                                    if crate::store::timer_enable(&name, &prompt, every) {
-                                        state.scheduled.insert(name.clone());
-                                        // The store turns auto off to keep the
-                                        // two from typing over each other.
-                                        // Re-read it rather than assume: the
-                                        // badge prefers auto, so a stale entry
-                                        // would name the wrong one until the
-                                        // next reload.
-                                        state.refresh_auto_sessions();
-                                        state.notice = Some(format!(
-                                            "{name} every {} — {}",
-                                            timer_every_label(every),
-                                            truncate(&prompt, 40)
-                                        ));
-                                    } else {
-                                        state.notice = Some("could not store the schedule".into());
+                            // The switch turned off on a session that is on is
+                            // a stop; otherwise Enter arms (or re-arms) it.
+                            if !draft.enabled && state.scheduled.contains(&name) {
+                                crate::store::timer_disable(&name);
+                                state.scheduled.remove(&name);
+                                state.notice = Some(format!("timer off for {name}"));
+                            } else {
+                                let prompt = draft.prompt.trim().to_string();
+                                // Both refusals put the form back rather than
+                                // dropping what was typed, and neither arms
+                                // anything: a schedule types at a session while
+                                // nobody is watching, so a half-meant one is worse
+                                // than none.
+                                match (prompt.is_empty(), timer_parse_every(&draft.every)) {
+                                    (true, _) => {
+                                        state.notice = Some("a schedule needs a prompt".into());
+                                        state.timer_editing = Some(draft);
+                                    }
+                                    (_, None) => {
+                                        state.notice = Some("that interval does not read".into());
+                                        state.timer_editing = Some(draft);
+                                    }
+                                    (false, Some(every)) => {
+                                        if crate::store::timer_enable(&name, &prompt, every) {
+                                            state.scheduled.insert(name.clone());
+                                            // The store turns auto off to keep the
+                                            // two from typing over each other.
+                                            // Re-read it rather than assume: the
+                                            // badge prefers auto, so a stale entry
+                                            // would name the wrong one until the
+                                            // next reload.
+                                            state.refresh_auto_sessions();
+                                            state.notice = Some(format!(
+                                                "{name} every {} — {}",
+                                                timer_every_label(every),
+                                                truncate(&prompt, 40)
+                                            ));
+                                        } else {
+                                            state.notice =
+                                                Some("could not store the schedule".into());
+                                        }
                                     }
                                 }
                             }
@@ -4404,6 +4431,7 @@ fn render_timer_form(f: &mut Frame, state: &AppState, area: Rect) {
         }
     };
     let every_on = draft.field == TimerField::Every;
+    let enabled_on = draft.field == TimerField::Enabled;
     let parsed = timer_parse_every(&draft.every);
 
     let rows = vec![
@@ -4435,12 +4463,31 @@ fn render_timer_form(f: &mut Frame, state: &AppState, area: Rect) {
             )),
             Span::styled(cursor(!every_on), Style::default().fg(Color::DarkGray)),
         ]),
+        Line::from(vec![
+            Span::styled("  schedule", label(enabled_on)),
+            Span::raw("  "),
+            Span::styled(
+                if draft.enabled { " on " } else { " off " },
+                if draft.enabled {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Black).bg(Color::DarkGray)
+                },
+            ),
+            Span::styled(
+                if enabled_on { "   space flips it" } else { "" },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
         Line::raw(""),
         Line::styled(
             if armed {
-                "  Tab switches   Enter saves it   ^X stops it   Esc cancels"
+                "  Tab moves · space flips it · Enter applies · Esc cancels"
             } else {
-                "  Tab switches   Enter starts it   Esc cancels"
+                "  Tab moves · Enter starts it · Esc cancels"
             },
             Style::default().fg(Color::DarkGray),
         ),
@@ -8832,6 +8879,37 @@ mod tests {
         assert!(
             !drawn(&state, 160).contains(" sessions "),
             "zen should hide the tree"
+        );
+    }
+
+    /// A schedule is stopped from a visible switch on the form, not only the
+    /// `^X` that was easy to miss.
+    #[test]
+    fn the_timer_form_shows_a_switch_to_stop_it() {
+        let mut state = AppState::new(projects());
+        state.cursor = state.first_selectable();
+        let name = state.current_name().expect("a focused session");
+        state.scheduled.insert(name);
+        state.timer_editing = Some(TimerDraft {
+            every: "30m".into(),
+            prompt: "look at CI".into(),
+            field: TimerField::Enabled,
+            enabled: true,
+        });
+        let text = drawn(&state, 160);
+        assert!(text.contains("schedule"), "no switch on the form");
+        assert!(text.contains(" on "), "the switch should read on");
+        assert!(
+            text.contains("space flips it"),
+            "the switch is undiscoverable"
+        );
+
+        if let Some(draft) = state.timer_editing.as_mut() {
+            draft.enabled = false;
+        }
+        assert!(
+            drawn(&state, 160).contains(" off "),
+            "the switch should read off once flipped"
         );
     }
 }
