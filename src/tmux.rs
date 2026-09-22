@@ -140,6 +140,18 @@ pub fn capture_pane(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Recent scrollback from a session's active pane.
+pub fn capture_pane_history(name: &str, lines: usize) -> String {
+    let start = format!("-{}", lines.max(1));
+    Command::new(mux_bin())
+        .args(["capture-pane", "-p", "-S", &start, "-t", name])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_else(|| capture_pane(name))
+}
+
 /// Send literal text (no trailing Enter) to a session's active pane.
 pub fn send_text(name: &str, text: &str) -> Result<()> {
     Command::new(mux_bin())
@@ -210,6 +222,20 @@ pub fn session_cwd(name: &str) -> Result<String> {
         bail!("failed to get cwd for session '{name}'");
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Current multiplexer session name, when the caller is running inside one.
+pub fn current_session_name() -> Option<String> {
+    if !in_tmux() && std::env::var("RMUX").map(|v| v.is_empty()).unwrap_or(true) {
+        return None;
+    }
+    Command::new(mux_bin())
+        .args(["display-message", "-p", "#{session_name}"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 /// When each live session was created, as seconds since the Unix epoch.

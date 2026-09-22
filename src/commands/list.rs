@@ -22,7 +22,9 @@ pub fn list_sessions(limit: Option<usize>) -> Result<()> {
         ("claude", "Claude Code"),
         ("codex", "Codex"),
         ("opencode", "opencode"),
+        ("opencode2", "opencode v2"),
         ("pi", "pi"),
+        ("dsh", "dsh"),
     ] {
         let sessions = recent_sessions(agent, &cwd, limit);
         println!();

@@ -341,6 +341,19 @@ fn resolve_codex_settings(provider_name: &str, settings_config: &str) -> Result<
     }
     let config_toml = codex_config_for_env_auth(config_toml, &env_vars);
 
+    let codex_home = dirs::home_dir()
+        .context("cannot determine home directory")?
+        .join(".codex");
+
+    // A Codex `-p` profile is a whole config, not a layer on top of
+    // `config.toml`, so whatever MCP servers the main config carries — the amux
+    // relay, say — are otherwise lost. Worse, CC Switch stores the user's whole
+    // config in the provider, so the profile's own stale `[mcp_servers]` would
+    // win and spawn one local server per session for every entry. Keep the
+    // provider's model settings; take the MCP servers from the real config.
+    let main_config = std::fs::read_to_string(codex_home.join("config.toml")).unwrap_or_default();
+    let config_toml = codex_profile_config(&config_toml, &main_config);
+
     // Write profile to ~/.codex/amux-<slug>.config.toml
     let slug: String = provider_name
         .to_lowercase()
@@ -349,9 +362,6 @@ fn resolve_codex_settings(provider_name: &str, settings_config: &str) -> Result<
         .collect();
     let profile_name = format!("amux-{slug}");
 
-    let codex_home = dirs::home_dir()
-        .context("cannot determine home directory")?
-        .join(".codex");
     let profile_path = codex_home.join(format!("{profile_name}.config.toml"));
 
     std::fs::write(&profile_path, &config_toml)
@@ -361,6 +371,24 @@ fn resolve_codex_settings(provider_name: &str, settings_config: &str) -> Result<
         extra_argv: vec!["-p".into(), profile_name],
         env_vars,
     })
+}
+
+/// Build a Codex profile body: the provider's own settings without its copy of
+/// the MCP servers, plus the servers the user actually configured.
+fn codex_profile_config(provider_config: &str, main_config: &str) -> String {
+    let Ok(mut provider) = provider_config.parse::<toml::Value>() else {
+        return provider_config.to_string();
+    };
+    let Some(table) = provider.as_table_mut() else {
+        return provider_config.to_string();
+    };
+    table.remove("mcp_servers");
+    if let Ok(main) = main_config.parse::<toml::Value>() {
+        if let Some(mcp) = main.get("mcp_servers") {
+            table.insert("mcp_servers".into(), mcp.clone());
+        }
+    }
+    toml::to_string(&provider).unwrap_or_else(|_| provider_config.to_string())
 }
 
 #[cfg(test)]
@@ -472,6 +500,39 @@ args = ["chrome-devtools-mcp@latest"]
             v["mcp_servers"]["chrome-devtools"]["command"].as_str(),
             Some("npx")
         );
+    }
+
+    /// A profile must not resurrect the provider's stale MCP servers, and must
+    /// keep the ones the user actually configured — otherwise naming a provider
+    /// silently drags every local MCP server back per session.
+    #[test]
+    fn a_codex_profile_takes_mcp_servers_from_the_main_config() {
+        let provider = r#"model = "gpt-5.5"
+
+[mcp_servers.chrome-devtools]
+command = "npx"
+args = ["chrome-devtools-mcp@latest"]
+"#;
+        let main = r#"[mcp_servers.amux]
+url = "http://127.0.0.1:8787/mcp"
+"#;
+        let v: toml::Value = codex_profile_config(provider, main).parse().expect("valid TOML");
+        assert_eq!(v["model"].as_str(), Some("gpt-5.5"));
+        assert!(
+            v["mcp_servers"].get("chrome-devtools").is_none(),
+            "the provider's stale MCP server leaked into the profile"
+        );
+        assert_eq!(
+            v["mcp_servers"]["amux"]["url"].as_str(),
+            Some("http://127.0.0.1:8787/mcp")
+        );
+    }
+
+    #[test]
+    fn a_codex_profile_without_a_main_config_has_no_mcp_servers() {
+        let provider = "[mcp_servers.x]\ncommand = \"npx\"\n";
+        let v: toml::Value = codex_profile_config(provider, "").parse().unwrap();
+        assert!(v.get("mcp_servers").is_none());
     }
 
     /// A provider carrying its own bearer token already authenticates itself;

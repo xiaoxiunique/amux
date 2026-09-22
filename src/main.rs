@@ -153,7 +153,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Ls) => commands::sessions::list(&agents),
-        Some(Command::Kill { name }) => commands::sessions::kill(&name),
+        Some(Command::Kill { name }) => commands::sessions::kill(&name, &agents),
         Some(Command::Config) => {
             if let Some(p) = config::config_path() {
                 println!("config path: {}", p.display());
@@ -243,6 +243,9 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("unknown agent '{agent_name}'"))?
                 .clone();
             commands::new::new_session(&a, suffix, &agents)
+        }
+        Some(Command::Fork { source, name }) => {
+            commands::fork::fork(source.as_deref(), name.as_deref(), &agents)
         }
         Some(Command::Sessions { limit }) => commands::list::list_sessions(limit),
         Some(Command::Save { file }) => {

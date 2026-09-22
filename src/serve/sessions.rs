@@ -112,6 +112,7 @@ pub fn resume(
     // Remember the id, so a later plain `cc`/`cx` in this suffixed session
     // resumes the same conversation rather than the directory's newest.
     session_ids::store_id(&name, session_id);
+    crate::commands::sessions::auto_save(&agents);
 
     Ok(name)
 }

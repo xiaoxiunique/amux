@@ -49,6 +49,18 @@ pub fn builtin_agents() -> Vec<Agent> {
             command: vec!["opencode".into(), "--auto".into()],
         },
         Agent {
+            // opencode v2 is the same CLI, renamed binary (`opencode2`), a
+            // different session store (`session_v2`) and its own TUI as a thin
+            // client of a shared background service. A separate entry rather
+            // than an override so a directory can run v1 and v2 side by side —
+            // `oc_amux_…` and `oc2_amux_…` are distinct sessions. Its history
+            // does not carry over from v1 (different message schema), which is
+            // why both exist at once.
+            name: "opencode2".into(),
+            alias: "oc2".into(),
+            command: vec!["opencode2".into(), "--auto".into()],
+        },
+        Agent {
             name: "pi".into(),
             alias: "p".into(),
             // No auto-approve flag here, because pi has no approval gate to
@@ -63,6 +75,24 @@ pub fn builtin_agents() -> Vec<Agent> {
             // so `session_ids` pins the exact conversation the way it does for
             // claude and codex, instead of the blunt `--continue` opencode needs.
             command: vec!["pi".into()],
+        },
+        Agent {
+            name: "commandcode".into(),
+            alias: "cmd".into(),
+            // Use the full binary name rather than `cmd`: on Windows `cmd` is
+            // the shell, while Command Code documents `command-code` as the
+            // cross-platform entrypoint. `--trust` skips its per-project trust
+            // prompt and `--yolo` is its unattended/bypass permission mode.
+            command: vec!["command-code".into(), "--trust".into(), "--yolo".into()],
+        },
+        Agent {
+            // DeepSeek Harness (`dsh`) booted with its TUI profile. A profile
+            // is a plugin-bundle stack, so the profile name is part of the
+            // command — the user's own `dsh-tui` profile, not the shipped
+            // `tui` one (which here carries a broken manifest).
+            name: "dsh".into(),
+            alias: "dsh".into(),
+            command: vec!["dsh".into(), "--profile".into(), "dsh-tui".into()],
         },
     ]
 }
@@ -195,18 +225,31 @@ mod tests {
         assert!(oc.command.contains(&"--auto".to_string()));
         // Resuming is amux's job (`--session <id>`), not a blanket --continue.
         assert!(!oc.command.contains(&"--continue".to_string()));
+        let oc2 = by_alias("oc2").expect("opencode v2 ships as a builtin");
+        assert_eq!(oc2.name, "opencode2");
+        assert_eq!(oc2.command, vec!["opencode2", "--auto"]);
         let pi = by_alias("p").expect("pi ships as a builtin");
         assert_eq!(pi.name, "pi");
         // pi runs its tools without an approval gate, so the command carries no
         // auto-approve flag — and no `--continue`, because `session_ids` pins
         // the exact conversation instead.
         assert_eq!(pi.command, vec!["pi"]);
+        let cmd = by_alias("cmd").expect("Command Code ships as a builtin");
+        assert_eq!(cmd.name, "commandcode");
+        assert_eq!(cmd.command, vec!["command-code", "--trust", "--yolo"]);
+        let dsh = by_alias("dsh").expect("dsh ships as a builtin");
+        assert_eq!(dsh.name, "dsh");
+        assert_eq!(dsh.command, vec!["dsh", "--profile", "dsh-tui"]);
         validate(&b).unwrap();
         // find() resolves an agent by either name or alias.
         assert_eq!(find(&b, "oc").unwrap().name, "opencode");
         assert_eq!(find(&b, "opencode").unwrap().alias, "oc");
+        assert_eq!(find(&b, "oc2").unwrap().name, "opencode2");
+        assert_eq!(find(&b, "opencode2").unwrap().alias, "oc2");
         assert_eq!(find(&b, "p").unwrap().name, "pi");
         assert_eq!(find(&b, "pi").unwrap().alias, "p");
+        assert_eq!(find(&b, "cmd").unwrap().name, "commandcode");
+        assert_eq!(find(&b, "commandcode").unwrap().alias, "cmd");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod fork;
 pub mod init;
 pub mod install;
 pub mod list;

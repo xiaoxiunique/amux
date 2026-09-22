@@ -62,8 +62,9 @@ pub fn list(agents: &[Agent]) -> Result<()> {
     Ok(())
 }
 
-pub fn kill(name: &str) -> Result<()> {
+pub fn kill(name: &str, agents: &[Agent]) -> Result<()> {
     tmux::kill_session(name)?;
+    auto_save(agents);
     println!("killed {name}");
     Ok(())
 }
@@ -125,10 +126,34 @@ pub fn goto(query: &str, agents: &[Agent]) -> Result<()> {
 /// Parsed info from a session name: the agent alias and optional provider.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SessionEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     agent: String,
     directory: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
+}
+
+impl SessionEntry {
+    fn restore_name(&self, agent: &Agent, cwd: &std::path::Path) -> String {
+        if let Some(name) = &self.name {
+            return name.clone();
+        }
+
+        let alias = match &self.provider {
+            Some(p) => format!("{}-{}", agent.alias, p),
+            None => agent.alias.clone(),
+        };
+        crate::session::session_name(&alias, cwd)
+    }
+
+    fn effective_provider(&self) -> Option<&str> {
+        self.provider.as_deref().or_else(|| {
+            self.name
+                .as_deref()
+                .and_then(|name| parse_session_alias(name).and_then(|(_, provider)| provider))
+        })
+    }
 }
 
 fn default_save_path() -> Option<PathBuf> {
@@ -175,17 +200,21 @@ fn save_silent(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<usize
     let all = tmux::list_session_names()?;
     let managed = managed_sessions(&all, agents);
 
-    if managed.is_empty() {
-        return Ok(0);
-    }
-
     let mut entries = Vec::new();
     for s in &managed {
-        let cwd = tmux::session_cwd(&s.name)?;
+        // One unreadable session must not cost the whole save: a `session_cwd`
+        // that fails (a dying pane, a multiplexer hiccup) would otherwise abort
+        // the write and leave the snapshot stale — or, for `auto_save`, leave
+        // the previous file in place and silently stop recording.
+        let Ok(cwd) = tmux::session_cwd(&s.name) else {
+            eprintln!("  skip {}: could not read its working directory", s.name);
+            continue;
+        };
         let (alias, provider) = parse_session_alias(&s.name)
             .unwrap_or((&s.alias, None));
         let agent_name = alias_to_name(agents, alias).unwrap_or(alias);
         entries.push(SessionEntry {
+            name: Some(s.name.clone()),
             agent: agent_name.to_string(),
             directory: cwd,
             provider: provider.map(|p| p.to_string()),
@@ -194,6 +223,18 @@ fn save_silent(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<usize
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+    // Never destroy a fuller saved list silently. A partial restore — or a
+    // multiplexer that is still coming up — leaves fewer sessions alive than
+    // the snapshot holds, and overwriting it with those few is how a machine
+    // that went down with 33 sessions comes back with 9 and no way to get the
+    // rest. Keep the previous file one `.bak` away before shrinking it.
+    if path.exists() {
+        if let Ok(previous) = read_saved_entries(&path) {
+            if previous.len() > entries.len() {
+                let _ = std::fs::copy(&path, path.with_extension("json.bak"));
+            }
+        }
     }
     let json = serde_json::to_string_pretty(&entries)?;
     std::fs::write(&path, &json)
@@ -224,22 +265,85 @@ pub fn restore(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?,
     };
 
-    let json = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let entries: Vec<SessionEntry> = serde_json::from_str(&json)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let entries = read_saved_entries(&path)?;
 
     if entries.is_empty() {
         println!("No sessions in {}.", path.display());
         return Ok(());
     }
 
+    let summary = restore_entries(&entries, agents)?;
+    println!(
+        "Restored: {} created, {} already running, {} errors",
+        summary.created, summary.skipped, summary.errors
+    );
+    if let Some(name) = summary.attach_to {
+        tmux::attach_or_switch(&name)?;
+    }
+    Ok(())
+}
+
+/// If the multiplexer is empty after a reboot, rebuild saved sessions without
+/// taking over the caller's terminal. A deliberate "kill everything" writes an
+/// empty save file, so this does not resurrect sessions the user removed.
+pub fn auto_restore_if_empty(agents: &[Agent]) -> bool {
+    let Ok(all) = tmux::list_session_names() else {
+        return false;
+    };
+    if !managed_sessions(&all, agents).is_empty() {
+        return false;
+    }
+
+    let Some(path) = default_save_path() else {
+        return false;
+    };
+    let Ok(entries) = read_saved_entries(&path) else {
+        return false;
+    };
+    if entries.is_empty() {
+        return false;
+    }
+
+    match restore_entries(&entries, agents) {
+        Ok(summary) => {
+            if summary.created > 0 {
+                eprintln!(
+                    "Restored {} saved session(s) from {}",
+                    summary.created,
+                    path.display()
+                );
+            }
+            summary.created > 0
+        }
+        Err(error) => {
+            eprintln!("auto-restore skipped: {error}");
+            false
+        }
+    }
+}
+
+fn read_saved_entries(path: &std::path::Path) -> Result<Vec<SessionEntry>> {
+    let json = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    serde_json::from_str(&json)
+        .with_context(|| format!("parsing {}", path.display()))
+}
+
+#[derive(Default)]
+struct RestoreSummary {
+    created: usize,
+    skipped: usize,
+    errors: usize,
+    attach_to: Option<String>,
+}
+
+fn restore_entries(entries: &[SessionEntry], agents: &[Agent]) -> Result<RestoreSummary> {
     let mut created = 0;
     let mut skipped = 0;
     let mut errors = 0;
     let mut attach_to: Option<String> = None;
 
-    for entry in &entries {
+    for entry in entries {
         let agent = match agents.iter().find(|a| a.name == entry.agent) {
             Some(a) => a,
             None => {
@@ -256,12 +360,7 @@ pub fn restore(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<()> {
             continue;
         }
 
-        // Build alias (same logic as run.rs)
-        let alias = match &entry.provider {
-            Some(p) => format!("{}-{}", agent.alias, p),
-            None => agent.alias.clone(),
-        };
-        let name = crate::session::session_name(&alias, &cwd);
+        let name = entry.restore_name(agent, &cwd);
 
         if tmux::has_session(&name) {
             skipped += 1;
@@ -279,54 +378,64 @@ pub fn restore(file: Option<&std::path::Path>, agents: &[Agent]) -> Result<()> {
                 super::session_ids::resume_args_with(
                     &agent.name,
                     &id,
-                    entry.provider.is_some(),
+                    entry.effective_provider().is_some(),
                 )
             })
             .unwrap_or_default();
 
-        // Resolve provider settings if needed
-        let mut argv = agent.command.clone();
-        argv.extend(resume);
-        let mut env_vars: Vec<(String, String)> = Vec::new();
-        if let Some(p) = &entry.provider {
-            let app_type = crate::provider::agent_app_type(&agent.name);
-            let settings = crate::provider::resolve_settings(p, app_type)?;
-            argv.extend(settings.extra_argv);
-            env_vars = settings.env_vars;
-        }
+        // Resolve provider settings if needed. Every per-entry failure is
+        // counted and skipped rather than propagated: one stale provider or a
+        // transient multiplexer error must not abandon the other thirty
+        // sessions — that is exactly the partial restore that then gets
+        // written over the save file.
+        let launched = (|| -> Result<()> {
+            let mut argv = agent.command.clone();
+            argv.extend(resume);
+            let mut env_vars: Vec<(String, String)> = Vec::new();
+            if let Some(p) = entry.effective_provider() {
+                let app_type = crate::provider::agent_app_type(&agent.name);
+                let settings = crate::provider::resolve_settings(p, app_type)?;
+                argv.extend(settings.extra_argv);
+                env_vars = settings.env_vars;
+            }
 
-        tmux::new_session_detached(&name, &cwd.to_string_lossy())?;
-        let shell_cmd = if env_vars.is_empty() {
-            tmux::shell_launch(&argv)
-        } else {
-            let env_prefix: String = env_vars
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, tmux::shell_quote(v)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("{} {}", env_prefix, tmux::shell_launch(&argv))
-        };
-        tmux::send_command(&name, &shell_cmd)?;
-        // Same prompts `run` handles. Without this a restored codex session
-        // sits on "Update available" forever and never opens its conversation
-        // — which reads as "restore didn't bring my work back", because the
-        // resume argument was there but codex never got past the prompt.
-        if agent.name == "codex" {
-            super::run::dismiss_codex_prompts(&name);
-        }
-        created += 1;
-        if attach_to.is_none() {
-            attach_to = Some(name.clone());
+            tmux::new_session_detached(&name, &cwd.to_string_lossy())?;
+            let shell_cmd = if env_vars.is_empty() {
+                tmux::shell_launch(&argv)
+            } else {
+                let env_prefix: String = env_vars
+                    .iter()
+                    .map(|(k, v)| format!("{}={}", k, tmux::shell_quote(v)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                format!("{} {}", env_prefix, tmux::shell_launch(&argv))
+            };
+            tmux::send_command(&name, &shell_cmd)?;
+            // Same prompts `run` handles. Without this a restored codex session
+            // sits on "Update available" forever and never opens its conversation
+            // — which reads as "restore didn't bring my work back", because the
+            // resume argument was there but codex never got past the prompt.
+            if agent.name == "codex" {
+                super::run::dismiss_codex_prompts(&name);
+            }
+            Ok(())
+        })();
+
+        match launched {
+            Ok(()) => {
+                created += 1;
+                if attach_to.is_none() {
+                    attach_to = Some(name.clone());
+                }
+            }
+            Err(error) => {
+                eprintln!("  skip {}: {error}", entry.agent);
+                errors += 1;
+            }
         }
     }
 
-    println!("Restored: {created} created, {skipped} already running, {errors} errors");
-
-    // Attach to the first newly created session
-    if let Some(name) = attach_to {
-        tmux::attach_or_switch(&name)?;
-    }
-    Ok(())
+    Ok(RestoreSummary { created, skipped, errors, attach_to })
 }
 
 #[cfg(test)]
@@ -432,5 +541,70 @@ mod tests {
         assert!(names.contains(&"cc-openai_myproject_1a2b3c4d"));
         assert!(names.contains(&"cx-anthropic_api_deadbeef"));
         assert!(names.contains(&"cc_myproject_1a2b3c4d"));
+    }
+
+    #[test]
+    fn saved_entry_keeps_full_session_name() {
+        let entry = SessionEntry {
+            name: Some("cx_reverse_bb8c2d50-01a08e46".into()),
+            agent: "codex".into(),
+            directory: "/tmp/reverse".into(),
+            provider: None,
+        };
+
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"name\":\"cx_reverse_bb8c2d50-01a08e46\""));
+    }
+
+    #[test]
+    fn restore_prefers_saved_name_over_recomputed_name() {
+        let agents = agents();
+        let agent = &agents[1];
+        let cwd = PathBuf::from("/tmp/reverse");
+        let entry = SessionEntry {
+            name: Some("cx_reverse_bb8c2d50-01a08e46".into()),
+            agent: "codex".into(),
+            directory: cwd.to_string_lossy().into_owned(),
+            provider: None,
+        };
+
+        assert_eq!(entry.restore_name(agent, &cwd), "cx_reverse_bb8c2d50-01a08e46");
+    }
+
+    #[test]
+    fn legacy_entry_still_restores_by_directory() {
+        let agents = agents();
+        let agent = &agents[1];
+        let cwd = PathBuf::from("/tmp/reverse");
+        let entry: SessionEntry = serde_json::from_str(
+            r#"{"agent":"codex","directory":"/tmp/reverse"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(entry.restore_name(agent, &cwd), crate::session::session_name("cx", &cwd));
+    }
+
+    #[test]
+    fn duplicate_directory_entries_stay_distinct_when_names_are_saved() {
+        let agents = agents();
+        let agent = &agents[1];
+        let cwd = PathBuf::from("/tmp/reverse");
+        let entries = [
+            SessionEntry {
+                name: Some("cx_reverse_bb8c2d50".into()),
+                agent: "codex".into(),
+                directory: cwd.to_string_lossy().into_owned(),
+                provider: None,
+            },
+            SessionEntry {
+                name: Some("cx_reverse_bb8c2d50-01a08e46".into()),
+                agent: "codex".into(),
+                directory: cwd.to_string_lossy().into_owned(),
+                provider: None,
+            },
+        ];
+        let names: Vec<_> = entries.iter().map(|entry| entry.restore_name(agent, &cwd)).collect();
+
+        assert_eq!(names, vec!["cx_reverse_bb8c2d50", "cx_reverse_bb8c2d50-01a08e46"]);
     }
 }

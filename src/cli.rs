@@ -45,6 +45,14 @@ pub enum Command {
         /// Name for the new session, when the first argument is an agent.
         second: Option<String>,
     },
+    /// Fork an existing session into a new independent session with copied context.
+    Fork {
+        /// Source session name, or the fork name when run inside a session.
+        source: Option<String>,
+        /// Name suffix for the forked session.
+        #[arg(long, short)]
+        name: Option<String>,
+    },
     /// List recent Claude Code and Codex conversations for this directory.
     Sessions {
         /// How many per agent (default 5).

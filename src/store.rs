@@ -115,7 +115,20 @@ fn open(path: &std::path::Path) -> Option<Connection> {
             skipped     INTEGER NOT NULL DEFAULT 0,
             enabled     INTEGER NOT NULL DEFAULT 0,
             updated_at  TEXT NOT NULL DEFAULT ''
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS activity (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            source     TEXT NOT NULL,
+            session    TEXT NOT NULL,
+            project    TEXT NOT NULL DEFAULT '',
+            kind       TEXT NOT NULL,
+            turn       INTEGER,
+            max_turns  INTEGER,
+            message    TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS activity_session_time
+            ON activity (source, session, id DESC);",
     )
     .ok()?;
     // Only the database at its real location may import — and rename — the
@@ -623,6 +636,108 @@ pub fn auto_bump(session: &str) -> u32 {
     .unwrap_or(0)
 }
 
+// ------------------------------------------------------------------ activity
+
+/// One line of run history: what auto mode or a schedule did to a session.
+///
+/// Kept in the database rather than only on the daemon's stderr, because that
+/// log is truncated on every restart and cannot be filtered or audited per
+/// project. The daemon still prints the same lines for live watching.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEntry {
+    pub id: i64,
+    /// `auto` or `timer`.
+    pub source: String,
+    pub session: String,
+    /// The pane's working directory, so history can be grouped by project.
+    pub project: String,
+    /// `continued` | `stopped` | `unavailable` | `disabled` | `failed` |
+    /// `sent` | `skipped`.
+    pub kind: String,
+    /// Continuations sent so far, when the source counts them.
+    pub turn: Option<u32>,
+    pub max_turns: Option<u32>,
+    pub message: String,
+    pub created_at: String,
+}
+
+/// Rows kept per (source, session).
+///
+/// The old stderr log grew without bound — 1545 lines of the same model failure
+/// in one night — so the database caps what it keeps rather than trusting every
+/// caller to.
+const ACTIVITY_KEEP_PER_SESSION: usize = 500;
+
+/// Record one run-history line, trimming that session's older rows.
+pub fn activity_append(
+    source: &str,
+    session: &str,
+    project: &str,
+    kind: &str,
+    turn: Option<u32>,
+    max_turns: Option<u32>,
+    message: &str,
+) {
+    with_db(|conn| {
+        conn.execute(
+            "INSERT INTO activity
+                (source, session, project, kind, turn, max_turns, message, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![source, session, project, kind, turn, max_turns, message, now()],
+        )?;
+        // Trim on write, keyed on id rather than created_at: rows written in
+        // the same millisecond order the same either way.
+        conn.execute(
+            "DELETE FROM activity
+             WHERE source = ?1 AND session = ?2
+               AND id NOT IN (
+                   SELECT id FROM activity WHERE source = ?1 AND session = ?2
+                   ORDER BY id DESC LIMIT ?3
+               )",
+            rusqlite::params![source, session, ACTIVITY_KEEP_PER_SESSION as i64],
+        )?;
+        Ok(())
+    });
+}
+
+/// Recent run history, newest first.
+///
+/// `source` and `session` narrow the result when given; otherwise the whole
+/// table is fair game, which is what the per-project audit view wants.
+pub fn activity_list(
+    source: Option<&str>,
+    session: Option<&str>,
+    limit: usize,
+) -> Vec<ActivityEntry> {
+    let limit = limit.clamp(1, 1000) as i64;
+    with_db(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, source, session, project, kind, turn, max_turns, message, created_at
+             FROM activity
+             WHERE (?1 IS NULL OR source = ?1)
+               AND (?2 IS NULL OR session = ?2)
+             ORDER BY id DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![source, session, limit], |row| {
+            Ok(ActivityEntry {
+                id: row.get(0)?,
+                source: row.get(1)?,
+                session: row.get(2)?,
+                project: row.get(3)?,
+                kind: row.get(4)?,
+                turn: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u32),
+                max_turns: row.get::<_, Option<i64>>(6)?.map(|v| v.max(0) as u32),
+                message: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        rows.collect()
+    })
+    .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------- migration
 
 /// Import the three JSON stores this database replaces, once.
@@ -1113,6 +1228,62 @@ mod tests {
         // "No summary" is itself worth caching — recomputing it costs a full scan.
         put_summary("/t/b.jsonl", "codex", None, 5.0);
         assert_eq!(cached_summary("/t/b.jsonl", 5.0), Some(None));
+
+        std::env::remove_var("AMUX_DB_PATH");
+    }
+
+    /// Run history survives the log being truncated and can be narrowed to a
+    /// source or a session — the two things the old stderr log could not do.
+    #[test]
+    fn activity_round_trips_and_filters() {
+        let _guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        scratch(tmp.path());
+
+        activity_append("auto", "cc_a_11111111", "/p/a", "continued", Some(1), Some(50), "keep going");
+        activity_append("auto", "cc_a_11111111", "/p/a", "stopped", Some(2), Some(50), "goal met");
+        activity_append("timer", "cc_a_11111111", "/p/a", "sent", None, None, "看一下 CI");
+        activity_append("auto", "cx_b_22222222", "/p/b", "unavailable", Some(0), Some(50), "boom");
+
+        // Newest first.
+        let all = activity_list(None, None, 10);
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].kind, "unavailable");
+        assert_eq!(all[3].message, "keep going");
+
+        assert_eq!(activity_list(Some("auto"), None, 10).len(), 3);
+        assert_eq!(activity_list(Some("timer"), None, 10).len(), 1);
+        assert_eq!(activity_list(None, Some("cc_a_11111111"), 10).len(), 3);
+
+        let one = activity_list(Some("timer"), Some("cc_a_11111111"), 10);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].message, "看一下 CI");
+        assert_eq!(one[0].project, "/p/a");
+
+        std::env::remove_var("AMUX_DB_PATH");
+    }
+
+    /// The cap is what keeps a retry loop from growing the table forever, the
+    /// way the stderr log grew to 1545 lines in one night.
+    #[test]
+    fn activity_is_capped_per_session() {
+        let _guard = crate::test_home::lock();
+        let tmp = tempfile::tempdir().unwrap();
+        scratch(tmp.path());
+
+        let session = "cc_busy_33333333";
+        for i in 0..ACTIVITY_KEEP_PER_SESSION + 2 {
+            activity_append("auto", session, "/p/x", "unavailable", None, None, &format!("failure {i}"));
+        }
+        let rows = activity_list(Some("auto"), Some(session), 1000);
+        assert_eq!(rows.len(), ACTIVITY_KEEP_PER_SESSION);
+        // The two oldest are gone; the newest is kept.
+        assert_eq!(rows[0].message, format!("failure {}", ACTIVITY_KEEP_PER_SESSION + 1));
+        assert!(!rows.iter().any(|r| r.message == "failure 0"));
+
+        // Another session's history is untouched by that trim.
+        activity_append("auto", "cc_other_44444444", "/p/y", "continued", None, None, "hi");
+        assert_eq!(activity_list(None, Some("cc_other_44444444"), 10).len(), 1);
 
         std::env::remove_var("AMUX_DB_PATH");
     }

@@ -2,7 +2,7 @@ use crate::commands::sessions::{managed_sessions, ManagedSession};
 use crate::config::Agent;
 use crate::tmux;
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -10,6 +10,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use pinyin::ToPinyin;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
@@ -184,6 +185,165 @@ pub struct SessionPicker {
     /// Whether keystrokes go to the query. `j`/`k` have to mean the letters
     /// while typing, so this cannot be inferred from the query being non-empty.
     pub filtering: bool,
+}
+
+/// One live session in the quick-jump dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JumpEntry {
+    pub name: String,
+    pub project: String,
+    pub dir: String,
+    pub agent: String,
+    pub summary: Option<String>,
+}
+
+/// Searchable picker over currently running amux sessions.
+#[derive(Debug, Clone, Default)]
+pub struct JumpPicker {
+    pub query: String,
+    pub cursor: usize,
+    pub entries: Vec<JumpEntry>,
+}
+
+fn jump_entry_matches(entry: &JumpEntry, query: &str) -> bool {
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .map(search_key)
+        .filter(|q| !q.is_empty())
+        .collect();
+    if terms.is_empty() {
+        return true;
+    }
+
+    let fields = [
+        entry.name.as_str(),
+        entry.project.as_str(),
+        entry.dir.as_str(),
+        entry.agent.as_str(),
+        entry.summary.as_deref().unwrap_or_default(),
+    ];
+    terms
+        .iter()
+        .all(|term| fields.iter().any(|field| text_matches_query(field, term)))
+}
+
+fn text_matches_query(text: &str, query: &str) -> bool {
+    let raw = text.to_lowercase();
+    if raw.contains(query) {
+        return true;
+    }
+
+    let index = pinyin_index(text);
+    index.full.contains(query)
+        || index.initials.contains(query)
+        || index.tokens.iter().any(|token| token.starts_with(query))
+}
+
+fn search_key(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct PinyinIndex {
+    full: String,
+    initials: String,
+    tokens: Vec<String>,
+}
+
+fn pinyin_index(text: &str) -> PinyinIndex {
+    let mut index = PinyinIndex::default();
+    let mut ascii = String::new();
+
+    fn flush_ascii(index: &mut PinyinIndex, ascii: &mut String) {
+        if ascii.is_empty() {
+            return;
+        }
+        index.full.push_str(ascii);
+        if let Some(first) = ascii.chars().next() {
+            index.initials.push(first);
+        }
+        index.tokens.push(std::mem::take(ascii));
+    }
+
+    for ch in text.chars() {
+        if let Some(py) = ch.to_pinyin() {
+            flush_ascii(&mut index, &mut ascii);
+            let plain = py.plain();
+            index.full.push_str(plain);
+            if let Some(first) = plain.chars().next() {
+                index.initials.push(first);
+            }
+            index.tokens.push(plain.to_string());
+        } else if ch.is_ascii_alphanumeric() {
+            ascii.extend(ch.to_lowercase());
+        } else if ch.is_alphanumeric() {
+            flush_ascii(&mut index, &mut ascii);
+            let token: String = ch.to_lowercase().collect();
+            index.full.push_str(&token);
+            index.initials.push_str(&token);
+            index.tokens.push(token);
+        } else {
+            flush_ascii(&mut index, &mut ascii);
+        }
+    }
+    flush_ascii(&mut index, &mut ascii);
+
+    index
+}
+
+impl JumpPicker {
+    pub fn from_state(state: &AppState) -> Self {
+        let mut entries = Vec::new();
+        for project in &state.projects {
+            let project_name = project.display_name().to_string();
+            for session in &project.sessions {
+                entries.push(JumpEntry {
+                    name: session.name.clone(),
+                    project: project_name.clone(),
+                    dir: project.dir.clone(),
+                    agent: agent_name(&state.agents, &session.alias).to_string(),
+                    summary: state.descriptions.get(&session.name).cloned(),
+                });
+            }
+        }
+        Self {
+            query: String::new(),
+            cursor: 0,
+            entries,
+        }
+    }
+
+    pub fn matches(&self) -> Vec<&JumpEntry> {
+        self.entries
+            .iter()
+            .filter(|e| jump_entry_matches(e, &self.query))
+            .collect()
+    }
+
+    pub fn selected(&self) -> Option<&JumpEntry> {
+        self.matches().get(self.cursor).copied()
+    }
+
+    pub fn clamp(&mut self) {
+        let len = self.matches().len();
+        self.cursor = if len == 0 {
+            0
+        } else {
+            self.cursor.min(len - 1)
+        };
+    }
+
+    pub fn move_by(&mut self, delta: isize) {
+        let len = self.matches().len();
+        if len == 0 {
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
+    }
 }
 
 impl SessionPicker {
@@ -363,6 +523,8 @@ pub enum Draft {
     Project(ProjectPicker),
     /// Directory settled; which conversation, or a fresh one.
     Session(SessionPicker),
+    /// A name for a fork of an existing live session.
+    Fork(ForkDraft),
     /// Settled; the session is being created on a background thread.
     Starting { label: String },
 }
@@ -373,9 +535,17 @@ impl Draft {
         match self {
             Draft::Project(_) => "new session…".to_string(),
             Draft::Session(p) => format!("{}…", p.label),
+            Draft::Fork(f) => format!("fork {}…", f.source),
             Draft::Starting { label } => format!("{label} — starting…"),
         }
     }
+}
+
+/// Name being typed for a fork of `source`.
+#[derive(Debug, Clone)]
+pub struct ForkDraft {
+    pub source: String,
+    pub name: String,
 }
 
 /// The agent chosen, waiting on which provider to run it against.
@@ -385,6 +555,14 @@ pub struct ProviderPick {
     pub choices: Vec<crate::provider::ProviderChoice>,
     /// Start an extra session alongside the existing ones, as `N` does.
     pub force_extra: bool,
+}
+
+/// The agent picker can target either the selected tree row, or a directory
+/// chosen from the project/session picker that may not have a live row yet.
+#[derive(Debug, Clone)]
+pub struct AgentPickTarget {
+    pub dir: String,
+    pub label: String,
 }
 
 /// Which field of the auto form has the keyboard.
@@ -519,9 +697,10 @@ pub struct AppState {
     /// and turns `j`/`k` into scrolling.
     pub focus_before_insert: Option<Column>,
     /// `a` opens a picker over the terminal column; the next key is an agent
-    /// alias. Shown rather than prompting on stdout, which would mean leaving
+    /// number. Shown rather than prompting on stdout, which would mean leaving
     /// the screen for the one thing that should be fastest.
     pub picking_agent: bool,
+    pub picking_agent_for: Option<AgentPickTarget>,
     /// Which provider to launch the just-chosen agent against.
     ///
     /// A second step rather than a longer first one: the common case is the
@@ -541,6 +720,12 @@ pub struct AppState {
     pub cursor_before_draft: Option<usize>,
     /// The settings view, open while `,` has been pressed.
     pub settings: bool,
+    /// The MCP relay panel, open while `M` has been pressed: every configured
+    /// server with its on/off switch, so the long tail can be armed only when
+    /// it is wanted instead of running for every session.
+    pub mcp: bool,
+    pub mcp_servers: Vec<McpServerRow>,
+    pub mcp_cursor: usize,
     /// Naming the selected session: the text typed so far.
     ///
     /// Labels beat summaries in the description line, so this is the most
@@ -596,6 +781,8 @@ pub struct AppState {
     /// terminal column shows the choice being made, so the decision happens in
     /// the slot the session will occupy rather than in a window over the top.
     pub draft: Option<Draft>,
+    /// Searchable popup over currently running sessions.
+    pub jumping: Option<JumpPicker>,
     /// What each session is about, by session name. Empty until the first
     /// sweep; a session missing from it simply draws no description line.
     pub descriptions: std::collections::BTreeMap<String, String>,
@@ -605,6 +792,12 @@ pub struct AppState {
     /// simply draws no marker — the tree must not wait on status to be useful,
     /// and a sweep costs one terminal capture per pane.
     pub statuses: std::collections::BTreeMap<String, crate::serve::server::SessionStatus>,
+    /// Last status enum seen for each session, used to notice a task finishing
+    /// while the session was off-screen.
+    pub previous_statuses:
+        std::collections::BTreeMap<String, crate::serve::server::PaneStatus>,
+    /// Sessions that completed since the user last looked at them.
+    pub unseen_completed: std::collections::BTreeSet<String>,
     /// Sessions with auto mode armed, by name — the tree marks them and the
     /// form prefills from them. Re-read on the reload tick, so a budget the
     /// daemon exhausted, or a goal armed from the phone, shows up without
@@ -643,11 +836,15 @@ impl AppState {
             inserting: false,
             focus_before_insert: None,
             picking_agent: false,
+            picking_agent_for: None,
             picking_provider: None,
             confirming_kill: None,
             agents,
             notice: None,
             settings: false,
+            mcp: false,
+            mcp_servers: Vec::new(),
+            mcp_cursor: 0,
             helping: false,
             renaming: None,
             browsing: false,
@@ -660,9 +857,12 @@ impl AppState {
             view_offset: std::cell::Cell::new(0),
             view_height: std::cell::Cell::new(20),
             draft: None,
+            jumping: None,
             cursor_before_draft: None,
             descriptions: std::collections::BTreeMap::new(),
             statuses: std::collections::BTreeMap::new(),
+            previous_statuses: std::collections::BTreeMap::new(),
+            unseen_completed: std::collections::BTreeSet::new(),
             auto_sessions: std::collections::BTreeMap::new(),
             auto_editing: None,
             timer_editing: None,
@@ -799,6 +999,49 @@ impl AppState {
     /// Whether this session has a schedule armed.
     pub fn timer_on(&self, name: &str) -> bool {
         self.scheduled.contains(name)
+    }
+
+    fn apply_statuses(
+        &mut self,
+        statuses: std::collections::BTreeMap<String, crate::serve::server::SessionStatus>,
+    ) -> bool {
+        use crate::serve::server::PaneStatus;
+
+        let visible: std::collections::BTreeSet<String> =
+            self.visible_sessions().into_iter().collect();
+        for (name, status) in &statuses {
+            let was_active = self.previous_statuses.get(name).is_some_and(|s| {
+                matches!(s, PaneStatus::Running | PaneStatus::Waiting)
+            });
+            let finished = matches!(
+                status.status,
+                PaneStatus::Done | PaneStatus::Idle | PaneStatus::Failed
+            );
+            if was_active && finished && !visible.contains(name) {
+                self.unseen_completed.insert(name.clone());
+            }
+            if matches!(status.status, PaneStatus::Running | PaneStatus::Waiting) {
+                self.unseen_completed.remove(name);
+            }
+        }
+        self.unseen_completed
+            .retain(|name| statuses.contains_key(name));
+        self.previous_statuses = statuses
+            .iter()
+            .map(|(name, status)| (name.clone(), status.status.clone()))
+            .collect();
+
+        let changed = self.statuses != statuses;
+        self.statuses = statuses;
+        changed
+    }
+
+    fn mark_visible_seen(&mut self) -> bool {
+        let before = self.unseen_completed.len();
+        for name in self.visible_sessions() {
+            self.unseen_completed.remove(&name);
+        }
+        self.unseen_completed.len() != before
     }
 
     /// Turn the selected session's schedule off, or open the form to arm one.
@@ -1175,6 +1418,14 @@ impl AppState {
             .collect()
     }
 
+    pub fn aliases_in_dir(&self, dir: &str) -> Vec<String> {
+        self.projects
+            .iter()
+            .find(|p| p.dir == dir)
+            .map(|p| p.sessions.iter().map(|s| s.alias.clone()).collect())
+            .unwrap_or_default()
+    }
+
     /// Whether the cursor may rest on a row.
     ///
     /// An open project with several sessions is a heading: every one of its
@@ -1414,6 +1665,8 @@ enum PaneAction {
     /// Ask the model for a short title for the pane's session and set it as the
     /// session's label.
     AutoName,
+    /// Open the fork-name prompt for this pane's session.
+    Fork,
     /// Hold this pane's session in the column, or let go of it.
     TogglePin,
     /// Blow this pane up to fill the column, or put it back.
@@ -1448,6 +1701,10 @@ const PANE_BUTTONS: &[PaneButton] = &[
     PaneButton {
         label: "name",
         action: PaneAction::AutoName,
+    },
+    PaneButton {
+        label: "fork",
+        action: PaneAction::Fork,
     },
     PaneButton {
         label: "esc",
@@ -1761,6 +2018,57 @@ fn daemon_statuses(
     parse_statuses(&value)
 }
 
+/// One row of the MCP relay panel, as the daemon reports it.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct McpServerRow {
+    pub name: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub running: bool,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+/// The relay's configured servers, or `None` when the daemon is not answering.
+fn daemon_mcp_servers() -> Option<Vec<McpServerRow>> {
+    let port = crate::serve::daemon_port();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .ok()?;
+    let value: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/api/mcp/servers"))
+        .send()
+        .ok()?
+        .json()
+        .ok()?;
+    serde_json::from_value(value.get("items")?.clone()).ok()
+}
+
+/// Flip one relay server and persist it through the daemon, which owns the
+/// running state — editing `mcp.json` behind its back would leave a server
+/// advertised that it is not managing.
+fn daemon_mcp_toggle(name: &str, enabled: bool) -> Result<(), String> {
+    let port = crate::serve::daemon_port();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/api/mcp/enable"))
+        .json(&serde_json::json!({ "name": name, "enabled": enabled }))
+        .send()
+        .map_err(|error| error.to_string())?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("daemon said {}", response.status()))
+    }
+}
+
 /// Map a `/api/statuses` body onto session statuses.
 ///
 /// Split from the request so the wire shape is testable without a server.
@@ -1778,7 +2086,21 @@ fn parse_statuses(
     Some(out)
 }
 
+/// Bring the monitor up as part of normal use.
+///
+/// The MCP relay lives in the daemon, so every agent's tools vanish whenever it
+/// is down — which used to mean running `amux serve` by hand and remembering
+/// to. Start it on the way in instead; `start_quiet` refuses to start a second
+/// one, so this is a no-op when it is already up.
+fn ensure_daemon() {
+    if crate::serve::daemon_pid().is_none() {
+        let _ = crate::serve::start_quiet();
+    }
+}
+
 pub fn run_tui(agents: &[Agent]) -> Result<()> {
+    crate::commands::sessions::auto_restore_if_empty(agents);
+    ensure_daemon();
     let all = tmux::list_session_names()?;
     let sessions = managed_sessions(&all, agents);
     let mut state = AppState::with_agents(group_by_project(sessions), agents.to_vec());
@@ -1809,6 +2131,7 @@ pub fn run_tui(agents: &[Agent]) -> Result<()> {
         }
         Outcome::Kill(name) => {
             tmux::kill_session(&name)?;
+            crate::commands::sessions::auto_save(agents);
             // re-enter the TUI with refreshed list
             run_tui(agents)
         }
@@ -2025,6 +2348,17 @@ fn select_session(state: &mut AppState, name: &str) {
     }
 }
 
+fn begin_fork_prompt(state: &mut AppState, source: String) {
+    select_session(state, &source);
+    state.cursor_before_draft = Some(state.cursor);
+    state.draft = Some(Draft::Fork(ForkDraft {
+        source,
+        name: String::new(),
+    }));
+    state.cursor = state.rows().len().saturating_sub(1);
+    state.notice = Some("type a fork name, Enter to create".into());
+}
+
 /// The pane the keyboard belongs to: the one the tree's cursor is on.
 ///
 /// With several stacked, "the terminal" is ambiguous — typing has to land in
@@ -2078,6 +2412,11 @@ fn paste_into_field(state: &mut AppState, text: &str) -> bool {
         state.filter.push_str(&flat);
         return true;
     }
+    if let Some(picker) = state.jumping.as_mut() {
+        picker.query.push_str(&flat);
+        picker.clamp();
+        return true;
+    }
     match state.draft.as_mut() {
         // The project list searches as you type, so it is always taking text.
         Some(Draft::Project(picker)) => {
@@ -2090,8 +2429,26 @@ fn paste_into_field(state: &mut AppState, text: &str) -> bool {
             picker.clamp();
             true
         }
+        Some(Draft::Fork(draft)) => {
+            draft.name.push_str(&flat);
+            true
+        }
         _ => false,
     }
+}
+
+fn tui_text_input_active(state: &AppState) -> bool {
+    state.renaming.is_some()
+        || state.filtering
+        || state.jumping.is_some()
+        || state.auto_editing.is_some()
+        || state.timer_editing.is_some()
+        || matches!(
+            state.draft,
+            Some(Draft::Project(_))
+                | Some(Draft::Fork(_))
+                | Some(Draft::Session(SessionPicker { filtering: true, .. }))
+        )
 }
 
 /// The text a drag covers, read off the pane's own screen.
@@ -2286,6 +2643,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
     let mut last_usage = Instant::now() - USAGE_INTERVAL;
     // What was in use before insert mode switched to ASCII.
     let mut saved_ime: Option<String> = None;
+    let mut tui_input_was_active = false;
     ime::learn_current();
     let mut dirty = true;
 
@@ -2431,6 +2789,10 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             }
         }
 
+        if state.mark_visible_seen() {
+            dirty = true;
+        }
+
         if dirty && last_draw.elapsed() >= REDRAW_FLOOR {
             terminal.draw(|f| render(f, state, &live, tool.as_ref()))?;
             last_draw = Instant::now();
@@ -2493,8 +2855,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
             newest = Some(map);
         }
         if let Some(map) = newest {
-            if map != state.statuses {
-                state.statuses = map;
+            if state.apply_statuses(map) {
                 dirty = true;
             }
         }
@@ -2555,6 +2916,16 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 let _ = tx.send(describe_sessions(&projects, &agents));
             });
         }
+
+        let tui_input_active = !state.inserting && tui_text_input_active(state);
+        if tui_input_active && !tui_input_was_active {
+            ime::resume_typing(saved_ime.take());
+        } else if !tui_input_active && tui_input_was_active {
+            // Back to ASCII once the popup/filter/name field is gone, so hjkl
+            // are navigation again.
+            saved_ime = ime::drop_to_ascii();
+        }
+        tui_input_was_active = tui_input_active;
 
         // A short poll rather than a blocking read: output arrives on its own
         // schedule and has to be drained between keystrokes.
@@ -2652,6 +3023,15 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                     state.toggle_zoom(&name);
                                 }
                             }
+                            PaneAction::Fork => {
+                                let name = live
+                                    .get(index)
+                                    .map(|term| term.session.clone())
+                                    .or_else(|| state.current_name());
+                                if let Some(name) = name {
+                                    begin_fork_prompt(state, name);
+                                }
+                            }
                             // Name the session from what it is doing, so the
                             // tree says something useful. Off-thread: the model
                             // takes seconds, and a frame must not wait on it.
@@ -2670,6 +3050,23 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                         .unwrap_or_default();
                                     let tx = name_tx.clone();
                                     let session = name.clone();
+                                    // Which opencode family, if any: v1 and v2
+                                    // keep their transcripts in different
+                                    // tables of the same database.
+                                    let agent = {
+                                        let prefix =
+                                            name.split_once('_').map(|(p, _)| p).unwrap_or(&name);
+                                        let alias = prefix
+                                            .split_once('-')
+                                            .map(|(a, _)| a)
+                                            .unwrap_or(prefix);
+                                        state
+                                            .agents
+                                            .iter()
+                                            .find(|a| a.alias == alias)
+                                            .map(|a| a.name.clone())
+                                            .unwrap_or_else(|| "opencode".to_string())
+                                    };
                                     state.notice = Some(format!("naming {name}…"));
                                     std::thread::spawn(move || {
                                         // opencode leaves no scrollback in the
@@ -2678,7 +3075,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                         // agent's history is the pane itself.
                                         let context =
                                             crate::commands::session_ids::opencode_history(
-                                                &session, &cwd, 120,
+                                                &agent, &session, &cwd, 120,
                                             )
                                             .unwrap_or_else(|| {
                                                 crate::serve::server::capture_session(&session, 120)
@@ -2917,6 +3314,66 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         break Outcome::Kill(target);
                     }
                     state.notice = Some("kill cancelled".into());
+                    continue;
+                }
+
+                if is_jump_shortcut(key) {
+                    begin_jump_picker(state);
+                    dirty = true;
+                    continue;
+                }
+
+                if state.jumping.is_some() {
+                    let mut picked: Option<String> = None;
+                    let mut close = false;
+                    if let Some(picker) = state.jumping.as_mut() {
+                        match key.code {
+                            KeyCode::Esc => close = true,
+                            KeyCode::Enter => {
+                                picked = picker.selected().map(|e| e.name.clone());
+                                close = true;
+                            }
+                            KeyCode::Backspace => {
+                                picker.query.pop();
+                                picker.clamp();
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => picker.move_by(1),
+                            KeyCode::Up | KeyCode::Char('k') => picker.move_by(-1),
+                            KeyCode::Char('n')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                picker.move_by(1)
+                            }
+                            KeyCode::Char('p')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                picker.move_by(-1)
+                            }
+                            KeyCode::Char(c)
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL
+                                        | KeyModifiers::ALT
+                                        | KeyModifiers::SUPER
+                                        | KeyModifiers::META
+                                        | KeyModifiers::HYPER,
+                                ) =>
+                            {
+                                picker.query.push(c);
+                                picker.clamp();
+                            }
+                            _ => {}
+                        }
+                    }
+                    if close {
+                        state.jumping = None;
+                    }
+                    if let Some(name) = picked {
+                        if !jump_to_session(state, &name) {
+                            reload(state, Some(name));
+                        }
+                        live.clear();
+                    }
+                    dirty = true;
                     continue;
                 }
 
@@ -3180,6 +3637,46 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     dirty = true;
                     continue;
                 }
+                if state.mcp {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('M') | KeyCode::Char('q') => state.mcp = false,
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !state.mcp_servers.is_empty() {
+                                state.mcp_cursor =
+                                    (state.mcp_cursor + 1).min(state.mcp_servers.len() - 1);
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            state.mcp_cursor = state.mcp_cursor.saturating_sub(1);
+                        }
+                        KeyCode::Char(' ') | KeyCode::Enter => {
+                            if let Some(row) = state.mcp_servers.get(state.mcp_cursor).cloned() {
+                                let wanted = !row.enabled;
+                                match daemon_mcp_toggle(&row.name, wanted) {
+                                    Ok(()) => {
+                                        state.notice = Some(format!(
+                                            "{} {}",
+                                            row.name,
+                                            if wanted { "enabled" } else { "disabled" }
+                                        ));
+                                        state.mcp_servers =
+                                            daemon_mcp_servers().unwrap_or_else(|| state.mcp_servers.clone());
+                                    }
+                                    Err(error) => {
+                                        state.notice = Some(format!("could not toggle: {error}"))
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            state.mcp_servers = daemon_mcp_servers().unwrap_or_default();
+                            state.notice = Some("mcp servers refreshed".into());
+                        }
+                        _ => {}
+                    }
+                    dirty = true;
+                    continue;
+                }
                 if state.settings {
                     match key.code {
                         KeyCode::Esc | KeyCode::Char(',') => state.settings = false,
@@ -3313,15 +3810,14 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                             KeyCode::Char('f') => picker.filtering = true,
                             KeyCode::Char('n') => {
                                 // A fresh conversation rather than a recorded
-                                // one. Not `force_extra`: a project reached this
-                                // way usually has no live session at all, and
-                                // forcing the suffix named the first one `…-2`.
+                                // one. Ask which agent to start; defaulting to
+                                // the first configured agent made agents later
+                                // in the list (like Command Code) impossible to
+                                // create from this picker.
                                 let dir = picker.dir.clone();
                                 let label = picker.label.clone();
-                                state.draft = Some(Draft::Starting { label });
-                                if let Some(agent) = state.agents.first().cloned() {
-                                    spawn_agent_in(state, &spawn_tx, &agent, &dir, false);
-                                }
+                                state.picking_agent_for = Some(AgentPickTarget { dir, label });
+                                state.picking_agent = true;
                             }
                             KeyCode::Enter => {
                                 let chosen = picker.selected().cloned();
@@ -3338,6 +3834,38 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                         live.clear();
                                     }
                                 }
+                            }
+                            _ => {}
+                        },
+                        Some(Draft::Fork(draft)) => match key.code {
+                            KeyCode::Esc => {
+                                state.draft = None;
+                                if let Some(previous) = state.cursor_before_draft.take() {
+                                    state.cursor = previous;
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                draft.name.pop();
+                            }
+                            KeyCode::Enter => {
+                                let source = draft.source.clone();
+                                let name = draft.name.trim().to_string();
+                                if name.is_empty() {
+                                    state.notice = Some("fork name required".into());
+                                } else {
+                                    state.draft = Some(Draft::Starting {
+                                        label: format!("fork {source}"),
+                                    });
+                                    fork_off_thread(
+                                        spawn_tx.clone(),
+                                        source,
+                                        name,
+                                        state.agents.clone(),
+                                    );
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                draft.name.push(c);
                             }
                             _ => {}
                         },
@@ -3390,11 +3918,26 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                 if state.picking_agent {
                     state.picking_agent = false;
                     if key.code == KeyCode::Esc {
+                        state.picking_agent_for = None;
                         continue;
                     }
                     if let KeyCode::Char(c) = key.code {
                         match picked_agent(&state.agents, c).cloned() {
                             Some(agent) => {
+                                if let Some(target) = state.picking_agent_for.take() {
+                                    state.draft = Some(Draft::Starting {
+                                        label: target.label,
+                                    });
+                                    spawn_agent_in(
+                                        state,
+                                        &spawn_tx,
+                                        &agent,
+                                        &target.dir,
+                                        false,
+                                    );
+                                    dirty = true;
+                                    continue;
+                                }
                                 // Offer the provider step only where it means
                                 // something; the others go straight to launch.
                                 let choices = if crate::provider::selectable(&agent.name) {
@@ -3415,10 +3958,13 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                                 }
                             }
                             None => {
+                                state.picking_agent_for = None;
                                 state.notice =
                                     Some(format!("'{c}' is not one of the listed numbers"));
                             }
                         }
+                    } else {
+                        state.picking_agent_for = None;
                     }
                     dirty = true;
                     continue;
@@ -3552,6 +4098,11 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         state.filtering = true;
                         state.filter.clear();
                     }
+                    // Stable session switcher entry. Command-key reporting
+                    // differs across terminals, but a plain key is reliable.
+                    KeyCode::Char('s') if is_plain_key(key) => {
+                        begin_jump_picker(state);
+                    }
                     // Browse the selected project without leaving for another
                     // window: the column is free while you are reading, and
                     // this is what it is for.
@@ -3582,6 +4133,13 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     }
                     KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         state.move_by(state.page())
+                    }
+                    KeyCode::Char('f') => {
+                        if let Some(name) = state.current_name() {
+                            begin_fork_prompt(state, name);
+                        } else {
+                            state.notice = Some("select a session first".into());
+                        }
                     }
                     KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         state.move_by(-state.page())
@@ -3644,7 +4202,12 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                         state.settings = true;
                         state.refresh_auto_sessions();
                     }
-                    KeyCode::Char('o') => {
+                    KeyCode::Char('M') => {
+                        state.mcp = true;
+                        state.mcp_cursor = 0;
+                        state.mcp_servers = daemon_mcp_servers().unwrap_or_default();
+                    }
+                    KeyCode::Char('o') if is_plain_key(key) => {
                         state.draft =
                             Some(Draft::Project(ProjectPicker::new(crate::store::projects())));
                         // Land on the placeholder: the right column is showing
@@ -3656,7 +4219,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     // Same flow, but for the project already under the cursor:
                     // skip choosing a directory and go straight to its
                     // conversations. `o` is for somewhere else, `O` is for here.
-                    KeyCode::Char('O') => {
+                    KeyCode::Char('O') if is_plain_key(key) => {
                         let here = state
                             .current_project()
                             .map(|p| (p.dir.clone(), p.display_name().to_string()));
@@ -3681,6 +4244,7 @@ fn event_loop(state: &mut AppState) -> Result<Outcome> {
                     }
                     KeyCode::Char('a') => {
                         if state.current_dir().is_some() {
+                            state.picking_agent_for = None;
                             state.picking_agent = true;
                         }
                     }
@@ -3881,6 +4445,97 @@ pub fn picked_index(key: char, len: usize) -> Option<usize> {
     (index >= 1 && index <= len).then(|| index - 1)
 }
 
+fn is_plain_key(key: KeyEvent) -> bool {
+    key.modifiers.is_empty()
+}
+
+fn has_command_like_modifier(key: KeyEvent) -> bool {
+    key.modifiers.intersects(
+        KeyModifiers::SUPER
+            | KeyModifiers::META
+            | KeyModifiers::HYPER
+            | KeyModifiers::ALT,
+    )
+}
+
+fn is_jump_shortcut(key: KeyEvent) -> bool {
+    match key.code {
+        // Reliable terminal fallbacks. Command is often swallowed by macOS
+        // terminals before a TUI can see it.
+        KeyCode::F(3) => true,
+        KeyCode::Char('o') if key.modifiers == KeyModifiers::CONTROL => true,
+        KeyCode::Char('O') | KeyCode::Char('o') if has_command_like_modifier(key) => {
+            key.code == KeyCode::Char('O') || key.modifiers.contains(KeyModifiers::SHIFT)
+        }
+        _ => false,
+    }
+}
+
+fn begin_jump_picker(state: &mut AppState) {
+    state.jumping = Some(JumpPicker::from_state(state));
+    state.notice = None;
+    state.helping = false;
+    state.settings = false;
+    state.draft = None;
+    state.auto_editing = None;
+    state.timer_editing = None;
+    state.picking_agent = false;
+    state.picking_agent_for = None;
+    state.picking_provider = None;
+}
+
+fn jump_to_session(state: &mut AppState, name: &str) -> bool {
+    let Some(dir) = state
+        .projects
+        .iter()
+        .find(|p| p.sessions.iter().any(|s| s.name == name))
+        .map(|p| p.dir.clone())
+    else {
+        return false;
+    };
+
+    let focused_pin = (state.inserting || state.focus == Column::Terminal)
+        .then(|| state.current_name())
+        .flatten()
+        .and_then(|current| {
+            state
+                .pinned
+                .iter()
+                .position(|p| p == &current)
+                .map(|slot| (slot, current))
+        });
+
+    state.filter.clear();
+    state.filtering = false;
+    state.collapsed.remove(&dir);
+
+    if let Some((mut slot, previous)) = focused_pin {
+        if let Some(existing) = state.pinned.iter().position(|p| p == name) {
+            if existing != slot {
+                state.pinned.remove(existing);
+                if existing < slot {
+                    slot -= 1;
+                }
+            }
+        }
+        if let Some(pin) = state.pinned.get_mut(slot) {
+            *pin = name.to_string();
+        }
+        if state.zoomed.as_deref() == Some(previous.as_str()) {
+            state.zoomed = Some(name.to_string());
+        }
+        state.save_arrangement();
+        select_session(state, name);
+        state.focus = Column::Terminal;
+        return state.current_name().as_deref() == Some(name)
+            && state.pinned.get(slot).is_some_and(|p| p == name);
+    }
+
+    state.focus = Column::Tree;
+    select_session(state, name);
+    state.current_name().as_deref() == Some(name)
+}
+
 /// Start `agent` in the selected project's directory, without leaving the TUI.
 ///
 /// Two shapes, which is the distinction the keys expose:
@@ -4013,6 +4668,19 @@ fn launch_off_thread(
         let result = crate::commands::run::create_detached(&agent, &cwd, &name, &argv, &env_vars)
             .map(|()| name)
             .map_err(|e| format!("could not start {}: {e}", agent.name));
+        let _ = tx.send(result);
+    });
+}
+
+fn fork_off_thread(
+    tx: mpsc::Sender<Result<String, String>>,
+    source: String,
+    suffix: String,
+    agents: Vec<Agent>,
+) {
+    std::thread::spawn(move || {
+        let result = crate::commands::fork::fork_detached(&source, &suffix, &agents)
+            .map_err(|e| format!("could not fork {source}: {e}"));
         let _ = tx.send(result);
     });
 }
@@ -4333,6 +5001,9 @@ fn render(f: &mut Frame, state: &AppState, live: &[LiveTerm], tool: Option<&Live
     if state.timer_editing.is_some() {
         render_timer_form(f, state, outer[0]);
     }
+    if let Some(picker) = &state.jumping {
+        render_jump_picker(f, picker, outer[0]);
+    }
     render_status(f, state, outer[1]);
 }
 
@@ -4350,6 +5021,8 @@ fn render_zen_column(
         render_tool(f, tool, area);
     } else if state.settings {
         render_settings(f, state, area);
+    } else if state.mcp {
+        render_mcp(f, state, area);
     } else {
         match &state.draft {
             Some(draft) => render_draft(f, draft, area),
@@ -4365,7 +5038,11 @@ fn render_zen_column(
 /// extra session rather than a first, and seeing that before pressing beats
 /// finding out afterwards.
 fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
-    let here = state.aliases_here();
+    let here = state
+        .picking_agent_for
+        .as_ref()
+        .map(|target| state.aliases_in_dir(&target.dir))
+        .unwrap_or_else(|| state.aliases_here());
     let rows: Vec<Line> = state
         .agents
         .iter()
@@ -4403,6 +5080,79 @@ fn render_agent_picker(f: &mut Frame, state: &AppState, area: Rect) {
                 .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" start which agent here? press a number, Esc cancels "),
+        ),
+        popup,
+    );
+}
+
+fn render_jump_picker(f: &mut Frame, picker: &JumpPicker, area: Rect) {
+    let matches = picker.matches();
+    let width = area.width.min(92).max(40);
+    let height = area.height.min(18).max(8);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let inner_height = height.saturating_sub(4) as usize;
+    let first = picker.cursor.saturating_sub(inner_height.saturating_sub(1));
+
+    let mut rows = vec![
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(picker.query.clone()),
+            Span::styled("_", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::raw(""),
+    ];
+
+    if picker.entries.is_empty() {
+        rows.push(Line::styled(
+            "  no running sessions",
+            Style::default().fg(Color::DarkGray),
+        ));
+    } else if matches.is_empty() {
+        rows.push(Line::styled(
+            format!("  nothing matches \"{}\"", picker.query.trim()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    for (i, entry) in matches.iter().enumerate().skip(first).take(inner_height) {
+        let selected = i == picker.cursor;
+        let style = if selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let left_width = 28usize;
+        let project = truncate(&entry.project, 15);
+        let agent = truncate(&entry.agent, 10);
+        let summary_width = width.saturating_sub(36) as usize;
+        let summary = entry
+            .summary
+            .as_deref()
+            .map(|s| truncate(s, summary_width))
+            .unwrap_or_else(|| elide_front(&entry.name, summary_width));
+        rows.push(Line::from(vec![
+            Span::styled(if selected { "> " } else { "  " }, style),
+            Span::styled(format!("{project:<15} "), style),
+            Span::styled(format!("{agent:<10} "), Style::default().fg(Color::DarkGray)),
+            Span::raw(truncate(&summary, width.saturating_sub(left_width as u16) as usize)),
+        ]));
+    }
+
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" jump to session — type to search, Enter jumps, Esc cancels "),
         ),
         popup,
     );
@@ -4685,15 +5435,18 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("^u ^d ^b ^f", "half and whole pages"),
         ("JK", "scroll the pane's history"),
         ("drag", "select in a pane, copies on release"),
-        ("click", "pane auto/name/esc; tree restart/respawn"),
+        ("●", "completed while unseen"),
+        ("click", "pane auto/name/fork; tree restart"),
         ("Enter / i", "type into the selected session"),
         ("Esc", "stop typing"),
         ("^↑ ^↓", "switch sessions while typing"),
         ("p", "pin this session, or let it go"),
         ("z / ^Z", "blow a pane up, or hide the tree"),
+        ("s / F3 / ^O", "jump to a session"),
         ("o", "open a project from history"),
         ("O", "conversations of this project"),
-        ("f", "search the conversations"),
+        ("f", "fork selected session"),
+        ("O then f", "search conversations"),
         ("a", "start an agent here"),
         ("N", "another session for this agent"),
         ("Tab", "next session of this project"),
@@ -4703,6 +5456,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("/", "filter projects"),
         ("t", "auto mode: keep it going"),
         (",", "settings"),
+        ("M", "MCP servers"),
         ("T", "send a prompt on a timer"),
         ("r", "name this session"),
         ("~", "this list"),
@@ -4852,6 +5606,42 @@ fn render_settings(f: &mut Frame, state: &AppState, area: Rect) {
         )),
     }
 
+    // Run history survives the daemon's stderr log being truncated, so show the
+    // last few lines for the selected session right where the goal lives.
+    if let Some(name) = state.current_name() {
+        let recent = crate::store::activity_list(None, Some(&name), 5);
+        if !recent.is_empty() {
+            rows.push(Line::raw(""));
+            rows.push(Line::styled(
+                "  recent",
+                Style::default().fg(Color::DarkGray),
+            ));
+            let width = (area.width as usize).saturating_sub(28);
+            for entry in recent {
+                let color = match entry.kind.as_str() {
+                    "continued" | "sent" => Color::Green,
+                    "stopped" | "disabled" | "skipped" => Color::Yellow,
+                    "failed" | "unavailable" => Color::Red,
+                    _ => Color::Gray,
+                };
+                rows.push(Line::from(vec![
+                    Span::styled(
+                        format!("    {:<10} ", truncate(&entry.kind, 10)),
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(
+                        format!("{} ", short_stamp(&entry.created_at)),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        truncate(&entry.message.replace('\n', " "), width),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+    }
+
     rows.push(Line::raw(""));
     rows.push(Line::styled(
         match pid {
@@ -4868,6 +5658,78 @@ fn render_settings(f: &mut Frame, state: &AppState, area: Rect) {
                 .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" settings "),
+        ),
+        area,
+    );
+}
+
+/// Every server the relay knows, with its switch.
+///
+/// The relay is what keeps the MCP long tail from running once per session, so
+/// the panel's job is the opposite of the tree's: show what is *off* and make
+/// turning it on one keypress, rather than hiding it the way a disabled tool
+/// would otherwise be hidden.
+fn render_mcp(f: &mut Frame, state: &AppState, area: Rect) {
+    let mut rows: Vec<Line> = vec![
+        Line::raw(""),
+        Line::styled(
+            "  space arms/disarms   j/k move   r refresh   Esc closes",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Line::raw(""),
+    ];
+
+    if state.mcp_servers.is_empty() {
+        rows.push(Line::styled(
+            "  no servers — is the monitor running? start it in settings (,)",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+
+    for (index, server) in state.mcp_servers.iter().enumerate() {
+        let here = index == state.mcp_cursor;
+        let switch = if server.enabled { "[x]" } else { "[ ]" };
+        let dot = if server.running { "●" } else { "○" };
+        let detail = server
+            .description
+            .clone()
+            .unwrap_or_else(|| server.command.clone());
+        let width = (area.width as usize).saturating_sub(34);
+        rows.push(Line::from(vec![
+            Span::styled(
+                if here { " ▶ " } else { "   " },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                format!("{switch} "),
+                Style::default().fg(if server.enabled { Color::Green } else { Color::DarkGray }),
+            ),
+            Span::styled(
+                format!("{dot} "),
+                Style::default().fg(if server.running { Color::Green } else { Color::DarkGray }),
+            ),
+            Span::styled(
+                format!("{:<16} ", truncate(&server.name, 16)),
+                if here {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::styled(
+                truncate(&detail, width),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+
+    f.render_widget(
+        Paragraph::new(rows).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Thick)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" MCP relay "),
         ),
         area,
     );
@@ -5003,6 +5865,21 @@ fn render_draft(f: &mut Frame, draft: &Draft, area: Rect) {
             };
             (title, rows)
         }
+        Draft::Fork(draft) => (
+            format!(" fork {} ", truncate(&draft.source, width.saturating_sub(8) as usize)),
+            vec![
+                Line::from(vec![
+                    Span::styled("  name: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(draft.name.clone()),
+                    Span::styled("_", Style::default().fg(Color::DarkGray)),
+                ]),
+                Line::raw(""),
+                Line::styled(
+                    "  Enter creates an independent fork   Esc cancels",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ],
+        ),
         Draft::Starting { label } => (
             format!(" {label} "),
             vec![Line::styled(
@@ -5030,6 +5907,14 @@ fn shorten_home(path: &str) -> String {
         Some(rest) => format!("~{rest}"),
         None => path.to_string(),
     }
+}
+
+/// A stored timestamp for a one-line list: short local date and time, falling
+/// back to the raw string when it does not parse.
+fn short_stamp(rfc3339: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|t| t.format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| rfc3339.chars().take(16).collect())
 }
 
 /// How wide the tree column should be for a terminal of `total` columns.
@@ -5190,6 +6075,19 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                     .first()
                     .filter(|_| !expandable)
                     .and_then(|s| state.pin_index(&s.name));
+                let unseen = if !expandable {
+                    project
+                        .sessions
+                        .first()
+                        .is_some_and(|s| state.unseen_completed.contains(&s.name))
+                } else if state.collapsed.contains(&project.dir) {
+                    project
+                        .sessions
+                        .iter()
+                        .any(|s| state.unseen_completed.contains(&s.name))
+                } else {
+                    false
+                };
                 let mut lines = vec![Line::from(vec![
                     match pin {
                         Some(n) => Span::styled(
@@ -5200,6 +6098,12 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                         ),
                         None => Span::raw(format!("{marker} ")),
                     },
+                    Span::styled(
+                        if unseen { "● " } else { "  " },
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         // Twelve keeps the duration on screen at 100 columns:
                         // the status word alone is eight cells, and anything
@@ -5272,6 +6176,7 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                 // other fields, and the tree is capped precisely so it cannot
                 // try.
                 let pin = state.pin_index(&session.name);
+                let unseen = state.unseen_completed.contains(&session.name);
                 let mut lines = vec![Line::from(vec![
                     match pin {
                         Some(n) => Span::styled(
@@ -5282,6 +6187,12 @@ fn render_tree(f: &mut Frame, state: &AppState, area: Rect) {
                         ),
                         None => Span::raw("  ├ "),
                     },
+                    Span::styled(
+                        if unseen { "● " } else { "  " },
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         format!("{:<9}", agent_name(&state.agents, &session.alias)),
                         Style::default().fg(Color::Cyan),
@@ -5766,6 +6677,7 @@ fn render_one_terminal(f: &mut Frame, state: &AppState, live: Option<&LiveTerm>,
                 ),
                 PaneAction::Key(..)
                 | PaneAction::AutoName
+                | PaneAction::Fork
                 | PaneAction::TogglePin
                 | PaneAction::ToggleZoom => (
                     button.label.to_string(),
@@ -5876,10 +6788,10 @@ fn render_status_line(f: &mut Frame, state: &AppState, area: Rect) {
         // listing both and leaving the reader to guess.
         match state.focus {
             Column::Terminal => {
-                format!("{filter}hjkl move  JK scroll  Enter/i type here  ~ keys  q quit")
+                format!("{filter}hjkl move  JK scroll  s/F3/^O jump  Enter/i type here  ~ keys  q quit")
             }
             Column::Tree => format!(
-                "{filter}hjkl move  JK scroll  Enter/i open  p pin  o project  \
+                "{filter}hjkl move  JK scroll  s/F3/^O jump  Enter/i open  p pin  o project  O here  \
                  a agent  d kill  / filter  ~ keys  q quit"
             ),
         }
@@ -6031,6 +6943,16 @@ mod tests {
                 command: vec!["pi".into()],
             },
         ]
+    }
+
+    fn agents_with_commandcode() -> Vec<Agent> {
+        let mut agents = agents();
+        agents.push(Agent {
+            name: "commandcode".into(),
+            alias: "cmd".into(),
+            command: vec!["command-code".into()],
+        });
+        agents
     }
 
     #[test]
@@ -6190,8 +7112,12 @@ mod tests {
 
     #[test]
     fn out_of_range_and_non_digits_select_nothing() {
-        let agents = agents(); // three of them
-        assert!(picked_agent(&agents, '4').is_none());
+        let agents = agents_with_commandcode(); // four of them
+        assert_eq!(
+            picked_agent(&agents, '4').map(|a| a.name.as_str()),
+            Some("commandcode")
+        );
+        assert!(picked_agent(&agents, '5').is_none());
         assert!(
             picked_agent(&agents, '0').is_none(),
             "numbering starts at 1"
@@ -6204,7 +7130,7 @@ mod tests {
     fn the_picker_lists_every_configured_agent() {
         use ratatui::backend::TestBackend;
 
-        let mut state = AppState::with_agents(projects(), agents());
+        let mut state = AppState::with_agents(projects(), agents_with_commandcode());
         state.cursor = 1;
         state.picking_agent = true;
 
@@ -6218,9 +7144,10 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
 
-        for agent in ["claude", "codex", "pi"] {
+        for agent in ["claude", "codex", "pi", "commandcode"] {
             assert!(text.contains(agent), "{agent} missing from the picker");
         }
+        assert!(text.contains("cmd"), "commandcode alias missing from the picker");
         // The two cx sessions already here are called out, so choosing cx is
         // visibly "open another" rather than "open one".
         assert!(
@@ -6228,6 +7155,156 @@ mod tests {
             "no indication of existing sessions"
         );
         assert!(text.contains("Esc"), "no way out documented");
+    }
+
+    #[test]
+    fn jump_picker_searches_live_sessions() {
+        let mut state = AppState::with_agents(projects(), agents());
+        state.descriptions.insert(
+            "cx_beta_22222222-grok".into(),
+            "grok migration work".into(),
+        );
+        state
+            .descriptions
+            .insert("cc_alpha_11111111".into(), "最右的 X 窗口".into());
+
+        let mut picker = JumpPicker::from_state(&state);
+        assert_eq!(picker.entries.len(), 3);
+        assert_eq!(
+            picker.selected().map(|e| e.name.as_str()),
+            Some("cc_alpha_11111111")
+        );
+
+        picker.query = "grok migration".into();
+        picker.clamp();
+        let matches = picker.matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "cx_beta_22222222-grok");
+
+        picker.query = "/work/beta".into();
+        picker.clamp();
+        assert_eq!(picker.matches().len(), 2);
+
+        picker.query = "zuiyou".into();
+        picker.clamp();
+        let matches = picker.matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "cc_alpha_11111111");
+
+        picker.query = "zydx".into();
+        picker.clamp();
+        let matches = picker.matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "cc_alpha_11111111");
+
+        picker.query = "zy".into();
+        picker.clamp();
+        let matches = picker.matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "cc_alpha_11111111");
+
+        picker.query = "you chuang".into();
+        picker.clamp();
+        let matches = picker.matches();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].name, "cc_alpha_11111111");
+    }
+
+    #[test]
+    fn jump_to_session_switches_the_tree_selection() {
+        let mut state = AppState::with_agents(projects(), agents());
+        state.filter = "alpha".into();
+        state.filtering = true;
+        state.collapsed.insert("/work/beta".into());
+        state.focus = Column::Terminal;
+
+        assert!(jump_to_session(&mut state, "cx_beta_22222222-grok"));
+
+        assert!(state.filter.is_empty());
+        assert!(!state.filtering);
+        assert!(!state.collapsed.contains("/work/beta"));
+        assert_eq!(state.focus, Column::Tree);
+        assert_eq!(
+            state.current_name().as_deref(),
+            Some("cx_beta_22222222-grok")
+        );
+    }
+
+    #[test]
+    fn jump_from_a_focused_pinned_pane_replaces_that_pin() {
+        let mut state = AppState::with_agents(projects(), agents());
+        state.pinned = vec!["cc_alpha_11111111".into()];
+        select_session(&mut state, "cc_alpha_11111111");
+        state.focus = Column::Terminal;
+
+        assert!(jump_to_session(&mut state, "cx_beta_22222222-grok"));
+
+        assert_eq!(state.pinned, vec!["cx_beta_22222222-grok"]);
+        assert_eq!(
+            state.current_name().as_deref(),
+            Some("cx_beta_22222222-grok")
+        );
+        assert_eq!(state.focus, Column::Terminal);
+    }
+
+    #[test]
+    fn jump_from_the_tree_does_not_replace_a_pin() {
+        let mut state = AppState::with_agents(projects(), agents());
+        state.pinned = vec!["cc_alpha_11111111".into()];
+        select_session(&mut state, "cc_alpha_11111111");
+        state.focus = Column::Tree;
+
+        assert!(jump_to_session(&mut state, "cx_beta_22222222-grok"));
+
+        assert_eq!(state.pinned, vec!["cc_alpha_11111111"]);
+        assert_eq!(
+            state.current_name().as_deref(),
+            Some("cx_beta_22222222-grok")
+        );
+        assert_eq!(state.focus, Column::Tree);
+    }
+
+    #[test]
+    fn jump_shortcut_accepts_command_or_control_o() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert!(is_jump_shortcut(key(
+            KeyCode::Char('O'),
+            KeyModifiers::SUPER
+        )));
+        assert!(is_jump_shortcut(key(
+            KeyCode::Char('o'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        )));
+        assert!(is_jump_shortcut(key(
+            KeyCode::Char('O'),
+            KeyModifiers::META
+        )));
+        assert!(is_jump_shortcut(key(
+            KeyCode::Char('O'),
+            KeyModifiers::ALT
+        )));
+        assert!(is_jump_shortcut(key(
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_jump_shortcut(key(KeyCode::F(3), KeyModifiers::NONE)));
+        assert!(!is_jump_shortcut(key(
+            KeyCode::Char('O'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_jump_shortcut(key(
+            KeyCode::Char('o'),
+            KeyModifiers::SUPER
+        )));
+        assert!(!is_plain_key(key(
+            KeyCode::Char('O'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_plain_key(key(
+            KeyCode::Char('O'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT
+        )));
+        assert!(is_plain_key(key(KeyCode::Char('O'), KeyModifiers::NONE)));
     }
 
     #[test]
@@ -6412,7 +7489,7 @@ mod tests {
                 .collect()
         };
 
-        let mut state = AppState::new(projects());
+        let mut state = AppState::with_agents(projects(), agents());
         state.cursor = state.first_selectable();
         // beta has two sessions; only the second is blocked.
         let now = chrono::Utc::now().timestamp();
@@ -6429,7 +7506,7 @@ mod tests {
 
         // Nothing known yet must stay blank rather than claim idle.
         assert_eq!(
-            waitings(&AppState::new(projects())),
+            waitings(&AppState::with_agents(projects(), agents())),
             0,
             "status drawn without data"
         );
@@ -6719,7 +7796,7 @@ mod tests {
     #[test]
     fn the_timer_button_turns_a_schedule_off() {
         let _guard = crate::test_home::scratch_db();
-        let mut state = AppState::new(projects());
+        let mut state = AppState::with_agents(projects(), agents());
         state.cursor = state.first_selectable();
         let name = state.current_name().expect("a focused session");
 
@@ -6996,6 +8073,13 @@ mod tests {
         assert_eq!(state.filter, "rev");
         state.filtering = false;
 
+        // The jump picker takes text too; on macOS CJK IMEs often arrive
+        // through the same paste/commit path rather than as simple chars.
+        state.jumping = Some(JumpPicker::from_state(&state));
+        assert!(paste_into_field(&mut state, "中文 session"));
+        assert_eq!(state.jumping.as_ref().unwrap().query, "中文 session");
+        state.jumping = None;
+
         // The project list, which searches as you type.
         state.draft = Some(Draft::Project(ProjectPicker::default()));
         assert!(paste_into_field(&mut state, "sitin"));
@@ -7135,6 +8219,9 @@ mod tests {
         // The auto toggle is rightmost, so it is the first to fit.
         assert_eq!(rects[0].1, 0);
         assert!(matches!(PANE_BUTTONS[0].action, PaneAction::ToggleAuto));
+        assert!(PANE_BUTTONS
+            .iter()
+            .any(|button| matches!(button.action, PaneAction::Fork)));
 
         let mut previous = pane.x + pane.width;
         for (rect, _) in &rects {
@@ -7160,6 +8247,79 @@ mod tests {
             14
         )
         .is_empty());
+    }
+
+    #[test]
+    fn fork_prompt_targets_the_selected_session() {
+        let session = ManagedSession {
+            name: "cx_proj_deadbeef".into(),
+            alias: "cx".into(),
+        };
+        let project = Project {
+            dir: "/tmp/proj".into(),
+            name: "proj".into(),
+            alias: None,
+            sessions: vec![session],
+        };
+        let mut state = AppState::with_agents(vec![project], Vec::new());
+
+        begin_fork_prompt(&mut state, "cx_proj_deadbeef".into());
+
+        assert!(matches!(
+            state.draft,
+            Some(Draft::Fork(ForkDraft { ref source, .. })) if source == "cx_proj_deadbeef"
+        ));
+        assert_eq!(state.current_row(), Some(Row::Draft));
+    }
+
+    #[test]
+    fn completed_offscreen_session_gets_unseen_marker_until_viewed() {
+        use crate::serve::server::{PaneStatus, SessionStatus};
+
+        let project = Project {
+            dir: "/tmp/proj".into(),
+            name: "proj".into(),
+            alias: None,
+            sessions: vec![
+                ManagedSession {
+                    name: "cx_proj_deadbeef".into(),
+                    alias: "cx".into(),
+                },
+                ManagedSession {
+                    name: "cc_proj_deadbeef".into(),
+                    alias: "cc".into(),
+                },
+            ],
+        };
+        let mut state = AppState::with_agents(vec![project], Vec::new());
+        // Focus the first child; the second session is in the tree but not in
+        // the terminal column, so finishing there should leave a marker.
+        state.cursor = 1;
+
+        let mut running = std::collections::BTreeMap::new();
+        running.insert(
+            "cc_proj_deadbeef".to_string(),
+            SessionStatus {
+                status: PaneStatus::Running,
+                since: None,
+            },
+        );
+        state.apply_statuses(running);
+
+        let mut done = std::collections::BTreeMap::new();
+        done.insert(
+            "cc_proj_deadbeef".to_string(),
+            SessionStatus {
+                status: PaneStatus::Done,
+                since: None,
+            },
+        );
+        state.apply_statuses(done);
+        assert!(state.unseen_completed.contains("cc_proj_deadbeef"));
+
+        state.cursor = 2;
+        assert!(state.mark_visible_seen());
+        assert!(!state.unseen_completed.contains("cc_proj_deadbeef"));
     }
 
     /// The tree's top-border buttons sit right-aligned on the border, keep off
@@ -7210,7 +8370,7 @@ mod tests {
 
     #[test]
     fn the_tree_draws_a_restart_button() {
-        let mut state = AppState::new(projects());
+        let mut state = AppState::with_agents(projects(), agents());
         state.cursor = state.first_selectable();
         let text = drawn(&state, 160);
         assert!(text.contains("restart"), "no restart button");
@@ -8116,6 +9276,38 @@ mod tests {
             text.contains("s starts it"),
             "a stopped daemon must offer start"
         );
+    }
+
+    /// The MCP panel is the relay's switchboard, so it must show what is *off*
+    /// too — a panel that only listed enabled servers could not turn anything on.
+    #[test]
+    fn the_mcp_panel_shows_every_server_and_its_switch() {
+        let mut state = AppState::new(projects());
+        state.mcp = true;
+        state.mcp_servers = vec![
+            McpServerRow {
+                name: "chrome-devtools".into(),
+                command: "chrome-devtools-mcp".into(),
+                enabled: true,
+                running: true,
+                description: None,
+            },
+            McpServerRow {
+                name: "charles".into(),
+                command: "charles-mcp".into(),
+                enabled: false,
+                running: false,
+                description: Some("proxy control".into()),
+            },
+        ];
+
+        let text = drawn(&state, 140);
+        assert!(text.contains("MCP relay"), "the panel is not titled");
+        assert!(text.contains("chrome-devtools"), "an enabled server is missing");
+        assert!(text.contains("[x]"), "an enabled server is not marked on");
+        assert!(text.contains("[ ]"), "a disabled server is not marked off");
+        assert!(text.contains("charles"), "a disabled server is hidden");
+        assert!(text.contains("proxy control"), "the description is not shown");
     }
 
     /// Arming auto is a goal, not a bare switch, so the settings panel has to

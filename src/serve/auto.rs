@@ -26,7 +26,8 @@ pub(crate) enum Decision {
     /// We could not get a usable answer — no key, timeout, HTTP error, or a
     /// reply that broke the contract. Distinct from `Stop` on purpose: a
     /// transient failure or a missing key must not silently turn auto off.
-    Unavailable,
+    /// Carries the reason so the run history can say *why*, not just "failed".
+    Unavailable(String),
 }
 
 /// A continuation longer than this is a sign the model ignored the contract,
@@ -134,7 +135,7 @@ pub(crate) fn parse_decision(raw: &str) -> Decision {
     };
 
     let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) else {
-        return Decision::Unavailable;
+        return Decision::Unavailable("the reply was not JSON".to_string());
     };
     // An explicit false is the model deciding the goal is done / a human is
     // needed — the one case that disarms. Keep its reason for the log.
@@ -150,15 +151,21 @@ pub(crate) fn parse_decision(raw: &str) -> Decision {
         return Decision::Stop(reason);
     }
     if value.get("continue").and_then(|v| v.as_bool()) != Some(true) {
-        return Decision::Unavailable;
+        return Decision::Unavailable("the reply had no continue flag".to_string());
     }
     let message = value
         .get("message")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .unwrap_or("");
-    if message.is_empty() || message.chars().count() > MAX_MESSAGE_CHARS {
-        return Decision::Unavailable;
+    if message.is_empty() {
+        return Decision::Unavailable("the instruction was empty".to_string());
+    }
+    if message.chars().count() > MAX_MESSAGE_CHARS {
+        return Decision::Unavailable(format!(
+            "the instruction was {} chars, over the {MAX_MESSAGE_CHARS} cap",
+            message.chars().count()
+        ));
     }
     Decision::Continue(message.to_string())
 }
@@ -194,22 +201,23 @@ fn model_name() -> String {
 
 /// Ask the local Claude Code for one answer, with no session and no tools.
 ///
-/// `None` on anything that stops an answer coming back — the CLI missing, a
+/// `Err` on anything that stops an answer coming back — the CLI missing, a
 /// non-zero exit, a timeout, output that is not the JSON envelope. Callers turn
 /// that into "ask again later" rather than into a decision.
 ///
-/// Two flags carry the cost of this. `--strict-mcp-config` drops the MCP tool
-/// definitions and `--setting-sources ""` the settings and their memory files;
-/// measured on this machine, a decision goes from $0.81 to $0.014 once the
-/// prefix is warm. The prefix that gets cached is the CLI's own — 26.9k tokens,
-/// byte-identical every call — while the goal and the terminal tail are not
-/// cached at all, which is why caching cannot carry one session's context into
-/// another's decision.
+/// `--strict-mcp-config` keeps MCP tools out of the supervisor call without
+/// hiding Claude Code's own login/config. The prefix that gets cached is the
+/// CLI's own — byte-identical every call — while the goal and the terminal tail
+/// are not cached at all, which is why caching cannot carry one session's
+/// context into another's decision.
 ///
 /// Run from a scratch directory on purpose: whatever amux happens to be sitting
 /// in has nothing to do with the session being judged, and a project's own
 /// instructions are not addressed to a supervisor.
-fn ask(system: &str, user: &str) -> Option<String> {
+///
+/// The `Err` is the reason no instruction came back, phrased for the run
+/// history. It is still printed here so the daemon's log stays a live view.
+fn ask(system: &str, user: &str) -> Result<String, String> {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
 
@@ -218,7 +226,6 @@ fn ask(system: &str, user: &str) -> Option<String> {
         .args(["--model", &model_name()])
         .args(["--system-prompt", system])
         .arg("--strict-mcp-config")
-        .args(["--setting-sources", ""])
         // Nothing here is ever resumed, and every decision would otherwise leave
         // a transcript under ~/.claude/projects keyed by the scratch directory —
         // 104 files and 5.3MB had accumulated on this machine before anyone
@@ -230,8 +237,11 @@ fn ask(system: &str, user: &str) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| eprintln!("[auto] cannot run {}: {error}", model_cli()))
-        .ok()?;
+        .map_err(|error| {
+            let reason = format!("cannot run {}: {error}", model_cli());
+            eprintln!("[auto] {reason}");
+            reason
+        })?;
 
     // Collected on a thread so the wait cannot deadlock against a full pipe,
     // and so a model that never answers does not wedge the loop that asked.
@@ -242,12 +252,14 @@ fn ask(system: &str, user: &str) -> Option<String> {
     let output = match rx.recv_timeout(MODEL_TIMEOUT) {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
-            eprintln!("[auto] {} failed: {error}", model_cli());
-            return None;
+            let reason = format!("{} failed: {error}", model_cli());
+            eprintln!("[auto] {reason}");
+            return Err(reason);
         }
         Err(_) => {
-            eprintln!("[auto] {} did not answer within {MODEL_TIMEOUT:?}", model_cli());
-            return None;
+            let reason = format!("{} did not answer within {MODEL_TIMEOUT:?}", model_cli());
+            eprintln!("[auto] {reason}");
+            return Err(reason);
         }
     };
     let _ = handle.join();
@@ -256,28 +268,53 @@ fn ask(system: &str, user: &str) -> Option<String> {
         // Both streams: the CLI reports its own failures as JSON on stdout and
         // leaves stderr empty, so logging stderr alone says only "it failed".
         let tail = |bytes: &[u8]| {
-            String::from_utf8_lossy(bytes).trim().chars().take(300).collect::<String>()
+            String::from_utf8_lossy(bytes).trim().chars().take(1200).collect::<String>()
         };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = serde_json::from_str::<serde_json::Value>(&stdout)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| value.get("error").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| tail(&output.stdout));
         eprintln!(
-            "[auto] {} exited {} — stderr: {} — stdout: {}",
+            "[auto] {} exited {} — stderr: {} — detail: {}",
             model_cli(),
             output.status,
             tail(&output.stderr),
-            tail(&output.stdout)
+            detail
         );
-        return None;
+        return Err(detail);
     }
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| eprintln!("[auto] {} returned invalid JSON: {error}", model_cli()))
-        .ok()?;
+    let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            let reason = format!("{} returned invalid JSON: {error}", model_cli());
+            eprintln!("[auto] {reason}");
+            return Err(reason);
+        }
+    };
     if value.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
-        eprintln!("[auto] {} reported an error turn", model_cli());
-        return None;
+        let detail = value
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("error turn");
+        eprintln!("[auto] {} reported an error turn: {detail}", model_cli());
+        return Err(detail.to_string());
     }
     value
         .get("result")
         .and_then(|v| v.as_str())
         .map(str::to_string)
+        .ok_or_else(|| {
+            let reason = format!("{} returned no result", model_cli());
+            eprintln!("[auto] {reason}");
+            reason
+        })
 }
 
 /// How long to wait for a decision. Measured at under three seconds with the
@@ -291,11 +328,12 @@ pub(crate) const MODEL_TIMEOUT: Duration = Duration::from_secs(90);
 /// a bad reply — is `Unavailable`, so the caller can leave auto armed and try
 /// again instead of disarming on a failure.
 pub(crate) fn decide(goal: &str, tail: &str, used: u32, max_turns: u32, waiting: bool) -> Decision {
-    let Some(reply) = ask(
+    let reply = match ask(
         &system_prompt(),
         &build_prompt(goal, tail, used, max_turns, waiting),
-    ) else {
-        return Decision::Unavailable;
+    ) {
+        Ok(reply) => reply,
+        Err(reason) => return Decision::Unavailable(reason),
     };
     parse_decision(&reply)
 }
@@ -339,7 +377,7 @@ pub(crate) fn suggest_label(context: &str) -> Option<String> {
         .rev()
         .collect();
 
-    let reply = ask(LABEL_SYSTEM_PROMPT, &format!("RECENT OUTPUT:\n{recent}"))?;
+    let reply = ask(LABEL_SYSTEM_PROMPT, &format!("RECENT OUTPUT:\n{recent}")).ok()?;
     parse_label(&reply)
 }
 
@@ -418,20 +456,36 @@ mod tests {
             Decision::Stop(String::new())
         );
         // Missing field.
-        assert_eq!(parse_decision(r#"{"message": "keep going"}"#), Decision::Unavailable);
+        assert!(matches!(
+            parse_decision(r#"{"message": "keep going"}"#),
+            Decision::Unavailable(_)
+        ));
         // Empty instruction.
-        assert_eq!(
+        assert!(matches!(
             parse_decision(r#"{"continue": true, "message": "  "}"#),
-            Decision::Unavailable
-        );
+            Decision::Unavailable(_)
+        ));
         // Not JSON at all.
-        assert_eq!(parse_decision("sure, keep going!"), Decision::Unavailable);
+        assert!(matches!(
+            parse_decision("sure, keep going!"),
+            Decision::Unavailable(_)
+        ));
         // Overlong instruction.
         let long = "x".repeat(MAX_MESSAGE_CHARS + 1);
-        assert_eq!(
+        assert!(matches!(
             parse_decision(&format!(r#"{{"continue": true, "message": "{long}"}}"#)),
-            Decision::Unavailable
-        );
+            Decision::Unavailable(_)
+        ));
+    }
+
+    /// The reason travels with the decision, so the run history can say what
+    /// went wrong instead of a bare "unavailable".
+    #[test]
+    fn an_unavailable_decision_carries_a_reason() {
+        match parse_decision("not json") {
+            Decision::Unavailable(reason) => assert!(reason.contains("not JSON")),
+            other => panic!("expected unavailable, got {other:?}"),
+        }
     }
 
     /// Models sometimes wrap the object in prose or a fenced block even when

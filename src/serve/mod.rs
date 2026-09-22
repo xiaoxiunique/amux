@@ -11,6 +11,7 @@ pub mod cron;
 pub mod dsh;
 pub mod files;
 pub mod herdr;
+pub mod mcp;
 pub mod sessions;
 pub mod usb;
 pub mod server;
@@ -24,6 +25,8 @@ use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 const DEFAULT_HOST: &str = "0.0.0.0";
 const DEFAULT_PORT: u16 = 8787;
@@ -162,9 +165,20 @@ pub fn serve(
     if foreground {
         // Run directly in this process with a tokio runtime
         herdr::set_enabled(with_herdr);
+        let agents =
+            crate::config::resolve_agents().unwrap_or_else(|_| crate::config::builtin_agents());
+        crate::commands::sessions::auto_restore_if_empty(&agents);
         if with_herdr {
             println!("herdr bridge enabled");
         }
+        // Record the pid here too, not only in `spawn_daemon`: a foreground
+        // serve is how a launchd job runs it, and anything that asks
+        // `daemon_pid()` — the TUI starting its own, `amux stop` — has to find
+        // that process or it will start a second one on the same port.
+        let pf = pid_file()?;
+        fs::write(&pf, std::process::id().to_string())
+            .with_context(|| format!("writing {}", pf.display()))?;
+        crate::store::set_setting("serve.port", &port.to_string());
         if open {
             open_browser(port);
         }
@@ -181,6 +195,7 @@ pub fn serve(
             }
             server::run_server(host, port, token).await
         });
+        let _ = fs::remove_file(&pf);
         return Ok(());
     }
 
@@ -234,6 +249,15 @@ fn spawn_daemon(
     // Same reason as --herdr: the daemon is a re-exec, so the flag must travel.
     if let Some(p) = dsh_port {
         cmd.arg("--dsh-port").arg(p.to_string());
+    }
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 
     let child = cmd

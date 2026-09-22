@@ -30,11 +30,19 @@ fn base_url() -> String {
 /// True when a `dsh web` server answered the probe.
 pub fn available() -> bool {
     if !PROBED.load(Ordering::Relaxed) {
-        let ok = probe();
+        let ok = probe_outside_tokio_runtime();
         AVAILABLE.store(ok, Ordering::Relaxed);
         PROBED.store(true, Ordering::Relaxed);
     }
     AVAILABLE.load(Ordering::Relaxed)
+}
+
+fn probe_outside_tokio_runtime() -> bool {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(probe).join().unwrap_or(false)
+    } else {
+        probe()
+    }
 }
 
 /// Ask the host to describe itself — the cheapest call that proves the server

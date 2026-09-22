@@ -19,10 +19,11 @@ use axum::{
     },
     http::{header, HeaderMap, Response, StatusCode, Uri},
     response::IntoResponse,
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream, SinkExt, StreamExt};
 use include_dir::{include_dir, Dir};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,11 @@ const FIELD_SEPARATOR: &str = "\t";
 /// "actively working" (poll cadence is 2.5s; small enough to flip to idle
 /// promptly, large enough not to flap across brief think/tool gaps).
 const RUNNING_WINDOW_SECS: f64 = 8.0;
+/// A start/running hook is useful before the first screen/file update lands,
+/// but it must not pin a pane as Running forever when a completion hook is
+/// missing. After this grace period, live inference wins if it no longer sees
+/// work.
+const RUNNING_HOOK_GRACE_SECS: i64 = 45;
 
 static BUFFER_COUNTER: AtomicU64 = AtomicU64::new(0);
 static PANE_ACTIVITY: LazyLock<Mutex<HashMap<String, PaneActivity>>> =
@@ -511,9 +517,20 @@ pub async fn run_server(host: &str, port: u16, token: &str) {
             get(api_session_labels).post(api_session_label_set),
         )
         .route("/api/auto/status", get(api_auto_status))
+        .route("/api/auto/log", get(api_auto_log))
         .route("/api/auto/enable", post(api_auto_enable))
         .route("/api/timer/enable", post(api_timer_enable))
+        .route("/api/timer/log", get(api_timer_log))
         .route("/api/auto/disable", post(api_auto_disable))
+        // The MCP relay agents connect to. Deliberately unauthenticated: MCP
+        // clients carry no amux token, and the relay is only reachable from
+        // whatever can reach this daemon.
+        .route("/api/mcp/servers", get(api_mcp_servers))
+        .route("/api/mcp/enable", post(api_mcp_enable))
+        .route(
+            "/mcp",
+            get(api_mcp_sse).post(api_mcp_post).delete(api_mcp_delete),
+        )
         .route("/api/cron/schedules", get(api_cron_schedules))
         .route("/api/cron/jobs", get(api_cron_jobs))
         .route("/api/cron/jobs/running", get(api_cron_running))
@@ -1284,6 +1301,16 @@ fn hook_status_for_pane(pane: &BasePane) -> Option<(PaneStatus, String, Option<i
     Some((status, reason, since))
 }
 
+fn running_hook_is_stale(hooked_since: Option<i64>, inferred_status: &PaneStatus) -> bool {
+    if *inferred_status == PaneStatus::Running {
+        return false;
+    }
+    let Some(since) = hooked_since else {
+        return true;
+    };
+    chrono::Utc::now().timestamp().saturating_sub(since) > RUNNING_HOOK_GRACE_SECS
+}
+
 /// Seconds since the pane's agent session file (codex rollout / claude jsonl)
 /// was last written. `None` when no matching file is found. A small value means
 /// the agent is actively appending output → working.
@@ -1378,9 +1405,14 @@ fn agent_actively_working(tail: &str) -> bool {
     // "· ↓" arrow but has no "… (" and no closing paren, so it must not count as
     // live work. After a turn ends the spinner becomes "✻ Churned for 1m 23s",
     // which matches neither marker.
-    recent
-        .lines()
-        .any(|l| l.contains("… (") && l.contains("tokens)"))
+    recent.lines().any(|line| {
+        let l = line.trim_start();
+        let spinner = matches!(
+            l.chars().next(),
+            Some('✶' | '✽' | '✻' | '✢' | '✳' | '✷' | '✸' | '✹' | '✺')
+        );
+        spinner && l.contains("… (") && l.contains("tokens)")
+    })
 }
 
 /// Claude Code at its end-of-turn idle input prompt — the agent has finished and
@@ -1392,6 +1424,36 @@ fn agent_actively_working(tail: &str) -> bool {
 /// and not while a y-n choice is on screen. (An earlier version keyed off the
 /// `/clear to save … tokens` hint, but Claude only prints that once context use
 /// is high, so quiet panes were missed.)
+fn codex_ready_prompt_present(tail: &str) -> bool {
+    let low = recent_lower(tail, 18);
+    let has_prompt = low.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('›') || trimmed.starts_with('>')
+    });
+    let has_model_footer = low.lines().any(|line| {
+        let l = line.trim();
+        (l.contains("gpt-") || l.contains("codex")) && l.contains(" · ")
+    });
+    has_prompt && has_model_footer
+}
+
+fn codex_title_is_spinning(title: &str) -> bool {
+    title
+        .trim_start()
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(ch, '\u{2800}'..='\u{28ff}'))
+}
+
+fn pane_actively_working(pane: &BasePane, tail: &str, changed_recently: bool) -> bool {
+    if is_codex_pane(pane, tail) && codex_ready_prompt_present(tail) {
+        return codex_title_is_spinning(&pane.title)
+            && changed_recently
+            && agent_actively_working(tail);
+    }
+    agent_actively_working(tail)
+}
+
 fn claude_idle_ready(tail: &str) -> bool {
     // The composer and any y-n choice both render at the bottom of the screen.
     let low = recent_lower(tail, 24);
@@ -1447,7 +1509,7 @@ fn infer_status(
     // those lines on screen indefinitely. A real confirmation prompt replaces
     // the spinner rather than sitting beside it, so nothing that genuinely
     // needs input gets masked by this.
-    if agent_like && agent_actively_working(tail) {
+    if agent_like && pane_actively_working(pane, tail, changed_recently) {
         return (PaneStatus::Running, "agent reports active work".to_string());
     }
 
@@ -1496,6 +1558,16 @@ fn infer_status(
         ],
     ) {
         return (PaneStatus::Waiting, "looks like it needs input".to_string());
+    }
+
+    // Codex's idle composer is a stronger stop signal than a freshly touched
+    // rollout file: the file can be written right as the turn ends, but the
+    // visible `›` prompt means the agent is ready for the next message.
+    if is_codex_pane(pane, tail) && codex_ready_prompt_present(tail) {
+        return (
+            PaneStatus::Idle,
+            "codex prompt is ready — waiting for you".to_string(),
+        );
     }
 
     // Liveness: an agent actively writing its session file is Running. When no
@@ -2495,7 +2567,16 @@ fn build_snapshot() -> Snapshot {
                 // Idle/Waiting at turn-end, but the agent may have started a new
                 // turn since. If the pane is live-working right now, trust that
                 // over the stale hook so a running task isn't shown as done.
-                Some(_) if agent_actively_working(&tail) => {
+                Some(_) if pane_actively_working(&pane, &tail, changed_recently) => {
+                    (inferred_status, inferred_reason, None)
+                }
+                // A start/running hook can be stranded when codex-notify (or a
+                // custom hook) misses the matching completion event. Once the
+                // pane has had time to show real activity, a non-running
+                // inference is stronger than the stale Running latch.
+                Some((PaneStatus::Running, _, hooked_since))
+                    if running_hook_is_stale(hooked_since, &inferred_status) =>
+                {
                     (inferred_status, inferred_reason, None)
                 }
                 // Stale claude-notification: Claude finished its turn and is back
@@ -3720,6 +3801,10 @@ static AUTO_LAST_FIRE: LazyLock<Mutex<HashMap<String, Instant>>> =
 /// restarted — silently, since dropping the join handle swallows the panic.
 static AUTO_IN_FLIGHT: LazyLock<Mutex<HashMap<String, Instant>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Consecutive decision-model failures per session. A persistent model-side
+/// refusal or outage should not keep burning requests every cooldown forever.
+static AUTO_FAILURES: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// How long an in-flight entry can stand before it is treated as abandoned.
 /// The model is given [`MODEL_TIMEOUT`]; past that plus delivery, a live
@@ -3732,6 +3817,8 @@ static AUTO_NO_KEY_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// How long to leave a pane alone after one continuation.
 const AUTO_COOLDOWN: Duration = Duration::from_secs(20);
+/// Disable auto after this many consecutive unavailable decisions.
+const AUTO_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 /// A single-line, length-capped preview for the auto log.
 fn preview(text: &str, max: usize) -> String {
@@ -3756,6 +3843,22 @@ fn with_banner(text: &str, banner: Option<&str>) -> String {
 /// Whether an in-flight entry has stood long enough to be treated as abandoned.
 fn in_flight_is_stale(since: Instant) -> bool {
     since.elapsed() >= AUTO_IN_FLIGHT_STALE
+}
+
+fn auto_reset_failures(session: &str) {
+    AUTO_FAILURES
+        .lock()
+        .expect("auto failure mutex poisoned")
+        .remove(session);
+}
+
+fn auto_record_failure(session: &str) -> u32 {
+    let mut failures = AUTO_FAILURES
+        .lock()
+        .expect("auto failure mutex poisoned");
+    let count = failures.entry(session.to_string()).or_insert(0);
+    *count += 1;
+    *count
 }
 
 /// Type text into a pane as though it had been sent from the input box.
@@ -3826,6 +3929,15 @@ fn timer_tick(state: &AppState, panes: &[Pane]) {
             TimerAction::Skip(why) => {
                 crate::store::timer_mark_skipped(&pane.session);
                 eprintln!("[cron] {} — {why}; this run is skipped", pane.session);
+                crate::store::activity_append(
+                    "timer",
+                    &pane.session,
+                    &pane.path,
+                    "skipped",
+                    None,
+                    None,
+                    why,
+                );
                 continue;
             }
             TimerAction::Send => {}
@@ -3840,10 +3952,30 @@ fn timer_tick(state: &AppState, panes: &[Pane]) {
                     pane.session,
                     preview(&config.prompt, 160)
                 );
+                crate::store::activity_append(
+                    "timer",
+                    &pane.session,
+                    &pane.path,
+                    "sent",
+                    None,
+                    None,
+                    &config.prompt,
+                );
             }
             // Not marked as run: a send that did not land should be tried again
             // on the next poll rather than waiting out another interval.
-            Err(error) => eprintln!("[cron] could not send to {}: {error}", pane.session),
+            Err(error) => {
+                eprintln!("[cron] could not send to {}: {error}", pane.session);
+                crate::store::activity_append(
+                    "timer",
+                    &pane.session,
+                    &pane.path,
+                    "failed",
+                    None,
+                    None,
+                    &error,
+                );
+            }
         }
     }
 }
@@ -3871,6 +4003,14 @@ pub(crate) fn timer_action(status: &PaneStatus, has_pending: bool) -> TimerActio
         return TimerAction::Skip("something is already queued in that pane");
     }
     TimerAction::Send
+}
+
+fn auto_stopped_status(status: &PaneStatus, allow_waiting: bool) -> Option<PaneStatus> {
+    match status {
+        PaneStatus::Idle | PaneStatus::Done => Some(status.clone()),
+        PaneStatus::Waiting if allow_waiting => Some(PaneStatus::Waiting),
+        _ => None,
+    }
 }
 
 /// Whether `every_secs` have passed since `last_run_at`.
@@ -3987,6 +4127,42 @@ mod timer_tests {
         ));
     }
 
+    #[test]
+    fn auto_judges_both_idle_and_done_turns() {
+        assert_eq!(
+            auto_stopped_status(&PaneStatus::Idle, false),
+            Some(PaneStatus::Idle)
+        );
+        assert_eq!(
+            auto_stopped_status(&PaneStatus::Done, false),
+            Some(PaneStatus::Done)
+        );
+        assert_eq!(auto_stopped_status(&PaneStatus::Waiting, false), None);
+        assert_eq!(
+            auto_stopped_status(&PaneStatus::Waiting, true),
+            Some(PaneStatus::Waiting)
+        );
+        assert_eq!(auto_stopped_status(&PaneStatus::Running, true), None);
+        assert_eq!(auto_stopped_status(&PaneStatus::Failed, true), None);
+    }
+
+    #[test]
+    fn auto_model_failures_are_counted_consecutively() {
+        let session = format!("auto_failure_test_{}", std::process::id());
+        auto_reset_failures(&session);
+
+        assert_eq!(auto_record_failure(&session), 1);
+        assert_eq!(auto_record_failure(&session), 2);
+        assert_eq!(
+            auto_record_failure(&session),
+            AUTO_MAX_CONSECUTIVE_FAILURES
+        );
+
+        auto_reset_failures(&session);
+        assert_eq!(auto_record_failure(&session), 1);
+        auto_reset_failures(&session);
+    }
+
     /// Nothing finer than a minute, whatever the row says.
     ///
     /// The poll this rides on is 2.5s, so a shorter interval is approximate at
@@ -4023,6 +4199,12 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
             .lock()
             .expect("auto in-flight mutex poisoned")
             .retain(|id, _| live.contains(id.as_str()));
+        let live_sessions: std::collections::HashSet<&str> =
+            panes.iter().map(|pane| pane.session.as_str()).collect();
+        AUTO_FAILURES
+            .lock()
+            .expect("auto failure mutex poisoned")
+            .retain(|session, _| live_sessions.contains(session.as_str()));
     }
     // `broadcast_snapshot` normally runs inside the server's tokio runtime;
     // if it is ever called outside one, skip auto rather than panic.
@@ -4054,18 +4236,14 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
             crate::store::auto_disable(&pane.session);
             continue;
         }
-        let waiting = match pane.status {
-            PaneStatus::Idle => false,
-            PaneStatus::Waiting => {
-                // Answering a y/n or permission prompt on the user's behalf is
-                // only ever done when they explicitly asked for it.
-                if !config.allow_waiting {
-                    continue;
-                }
-                true
-            }
-            _ => continue,
+        // Answering a y/n or permission prompt on the user's behalf is only
+        // ever done when explicitly allowed. A finished turn may be reported as
+        // either Idle (prompt is ready) or Done (recent output says complete);
+        // both are stopped states auto should judge.
+        let Some(stopped_status) = auto_stopped_status(&pane.status, config.allow_waiting) else {
+            continue;
         };
+        let waiting = stopped_status == PaneStatus::Waiting;
 
         // A queued user message is the user's own turn, delivered by
         // `flush_pending_messages`; never race it with an automatic one.
@@ -4124,16 +4302,21 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
             );
             match decision {
                 crate::serve::auto::Decision::Continue(message) => {
+                    auto_reset_failures(&pane.session);
                     // The user may have taken over while the model was thinking
                     // (started typing, or queued a message). Their turn wins.
-                    let still_stopped = cached_pane_status(&pane.id)
-                        == Some(if waiting {
-                            PaneStatus::Waiting
-                        } else {
-                            PaneStatus::Idle
-                        });
+                    let still_stopped = cached_pane_status(&pane.id) == Some(stopped_status.clone());
                     if !still_stopped || pane_has_pending(&pane.id) {
                         eprintln!("[auto] {} moved on before the decision; skipping", pane.id);
+                        crate::store::activity_append(
+                            "auto",
+                            &pane.session,
+                            &pane.path,
+                            "skipped",
+                            Some(config.used),
+                            Some(config.max_turns),
+                            "moved on before the decision",
+                        );
                     } else {
                         let banner = format!(
                             "[amux auto · turn {}/{} · written by a model, not typed by a person]",
@@ -4146,11 +4329,29 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
                                 // Nudge the pane-log stream so the new turn is
                                 // visible without waiting for the next poll.
                                 let _ = state.pane_log_refreshes.send(pane.id.clone());
+                                crate::store::activity_append(
+                                    "auto",
+                                    &pane.session,
+                                    &pane.path,
+                                    "continued",
+                                    Some(used),
+                                    Some(config.max_turns),
+                                    &message,
+                                );
                                 if used >= config.max_turns {
                                     crate::store::auto_disable(&pane.session);
                                     eprintln!(
                                         "[auto] budget spent for {} ({used}/{}); auto off",
                                         pane.session, config.max_turns
+                                    );
+                                    crate::store::activity_append(
+                                        "auto",
+                                        &pane.session,
+                                        &pane.path,
+                                        "disabled",
+                                        Some(used),
+                                        Some(config.max_turns),
+                                        "budget spent",
                                     );
                                 } else {
                                     eprintln!(
@@ -4165,11 +4366,21 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
                             // pane problem, and the cooldown spaces out retries.
                             Err(error) => {
                                 eprintln!("[auto] delivery failed for {}: {error}", pane.id);
+                                crate::store::activity_append(
+                                    "auto",
+                                    &pane.session,
+                                    &pane.path,
+                                    "failed",
+                                    Some(config.used),
+                                    Some(config.max_turns),
+                                    &error,
+                                );
                             }
                         }
                     }
                 }
                 crate::serve::auto::Decision::Stop(reason) => {
+                    auto_reset_failures(&pane.session);
                     crate::store::auto_disable(&pane.session);
                     if reason.is_empty() {
                         eprintln!(
@@ -4179,12 +4390,57 @@ fn auto_tick(state: &AppState, panes: &[Pane]) {
                     } else {
                         eprintln!("[auto] stopped {} — model: {reason}", pane.session);
                     }
+                    crate::store::activity_append(
+                        "auto",
+                        &pane.session,
+                        &pane.path,
+                        "stopped",
+                        Some(config.used),
+                        Some(config.max_turns),
+                        if reason.is_empty() {
+                            "model saw nothing left to do"
+                        } else {
+                            &reason
+                        },
+                    );
                 }
-                crate::serve::auto::Decision::Unavailable => {
-                    // Could not ask — already logged. Leave it armed; the
-                    // cooldown spaces the retries, and `deepseek_api_key` is
-                    // checked up front so the persistent no-key case never
-                    // reaches here.
+                crate::serve::auto::Decision::Unavailable(reason) => {
+                    // Could not ask — the reason is also in the daemon log.
+                    // Retry a few times for transient CLI/network failures, but
+                    // do not keep burning requests forever on persistent
+                    // model-side refusals.
+                    let failures = auto_record_failure(&pane.session);
+                    crate::store::activity_append(
+                        "auto",
+                        &pane.session,
+                        &pane.path,
+                        "unavailable",
+                        Some(config.used),
+                        Some(config.max_turns),
+                        &reason,
+                    );
+                    if failures >= AUTO_MAX_CONSECUTIVE_FAILURES {
+                        crate::store::auto_disable(&pane.session);
+                        auto_reset_failures(&pane.session);
+                        eprintln!(
+                            "[auto] disabled {} after {failures} consecutive model failures",
+                            pane.session
+                        );
+                        crate::store::activity_append(
+                            "auto",
+                            &pane.session,
+                            &pane.path,
+                            "disabled",
+                            Some(config.used),
+                            Some(config.max_turns),
+                            &format!("{failures} consecutive model failures"),
+                        );
+                    } else {
+                        eprintln!(
+                            "[auto] decision unavailable for {} ({failures}/{})",
+                            pane.session, AUTO_MAX_CONSECUTIVE_FAILURES
+                        );
+                    }
                 }
             }
             AUTO_IN_FLIGHT
@@ -4359,6 +4615,115 @@ async fn api_auto_status(
         StatusCode::OK,
         json!({ "ok": true, "items": crate::store::auto_list() }),
     )
+}
+
+/// Run history for one source, newest first.
+///
+/// The daemon's stderr log is truncated on every restart; this is the part that
+/// survives, and it can be narrowed to one session. `source` is fixed by the
+/// route (`auto` or `timer`); `session` and `limit` come from the query.
+fn activity_log_response(source: &str, query: &HashMap<String, String>) -> Response<Body> {
+    let session = query
+        .get("session")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100);
+    json_response(
+        StatusCode::OK,
+        json!({
+            "ok": true,
+            "items": crate::store::activity_list(Some(source), session, limit),
+        }),
+    )
+}
+
+async fn api_auto_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    activity_log_response("auto", &query)
+}
+
+async fn api_timer_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    activity_log_response("timer", &query)
+}
+
+/// The configured MCP relay servers, their on/off state, and whether each is
+/// currently running.
+async fn api_mcp_servers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    json_response(
+        StatusCode::OK,
+        json!({ "ok": true, "items": crate::serve::mcp::servers_json() }),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct McpEnableRequest {
+    name: String,
+    enabled: bool,
+}
+
+async fn api_mcp_enable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+    Json(body): Json<McpEnableRequest>,
+) -> Response<Body> {
+    if !is_authed(&state, &headers, &query) {
+        return json_response(StatusCode::UNAUTHORIZED, json!({ "error": "unauthorized" }));
+    }
+    match crate::serve::mcp::set_enabled(&body.name, body.enabled) {
+        Ok(()) => json_response(StatusCode::OK, json!({ "ok": true })),
+        Err(error) => json_response(StatusCode::BAD_REQUEST, json!({ "error": error.to_string() })),
+    }
+}
+
+/// The Streamable-HTTP GET side: an SSE stream for unsolicited server→client
+/// messages.
+///
+/// amux never has any — it only answers requests — but the spec lets a client
+/// open this stream, and a client that does treats a 405 as "server is not
+/// listening" and reports the whole MCP server as disconnected (pi's adapter
+/// did exactly that). An empty stream that never ends is both more compliant
+/// and cheaper than explaining the 405 to every client.
+async fn api_mcp_sse() -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    Sse::new(stream::pending::<Result<Event, std::convert::Infallible>>()).keep_alive(KeepAlive::default())
+}
+
+async fn api_mcp_delete() -> Response<Body> {
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// One JSON-RPC message. A notification (no reply) is acknowledged with 202.
+///
+/// Runs on a blocking thread: the relay talks to upstream servers over stdio,
+/// which is synchronous by nature.
+async fn api_mcp_post(Json(body): Json<serde_json::Value>) -> Response<Body> {
+    match tokio::task::spawn_blocking(move || crate::serve::mcp::handle(body)).await {
+        Ok(Some(value)) => json_response(StatusCode::OK, value),
+        _ => StatusCode::ACCEPTED.into_response(),
+    }
 }
 
 async fn api_timer_enable(
@@ -5782,6 +6147,9 @@ async fn api_kill_session(
             return json_response(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": error }));
         }
 
+        let agents =
+            crate::config::resolve_agents().unwrap_or_else(|_| crate::config::builtin_agents());
+        crate::commands::sessions::auto_save(&agents);
         broadcast_snapshot(&state);
         return json_response(StatusCode::OK, json!({ "ok": true }));
     }
@@ -5877,6 +6245,7 @@ const OPENCODE_LOG_REFRESH: Duration = Duration::from_millis(1000);
 enum LogSource {
     Terminal,
     Opencode {
+        agent: &'static str,
         session: String,
         cwd: String,
         cached: String,
@@ -5890,6 +6259,7 @@ fn pane_log_text(source: &mut LogSource, pane_id: &str, line_count: usize) -> St
     match source {
         LogSource::Terminal => capture_pane_lines(pane_id, line_count),
         LogSource::Opencode {
+            agent,
             session,
             cwd,
             cached,
@@ -5901,7 +6271,7 @@ fn pane_log_text(source: &mut LogSource, pane_id: &str, line_count: usize) -> St
             if stale {
                 *built_at = Some(Instant::now());
                 if let Some(log) =
-                    crate::commands::session_ids::opencode_history(session, cwd, line_count)
+                    crate::commands::session_ids::opencode_history(agent, session, cwd, line_count)
                 {
                     *cached = log;
                 }
@@ -5938,8 +6308,11 @@ async fn handle_pane_log_socket(
         .ok()
         .and_then(|panes| panes.into_iter().find(|pane| pane.id == pane_id))
     {
-        Some(pane) if session_agent_name(&pane.session) == Some("opencode") => {
+        // Both opencode versions keep their transcript in SQLite, not the
+        // terminal, so both read their log from the store.
+        Some(pane) if matches!(session_agent_name(&pane.session), Some("opencode" | "opencode2")) => {
             LogSource::Opencode {
+                agent: session_agent_name(&pane.session).unwrap_or("opencode"),
                 session: pane.session,
                 cwd: pane.path,
                 cached: String::new(),
@@ -6325,9 +6698,55 @@ mod tests {
     }
 
     #[test]
+    fn codex_ready_prompt_beats_fresh_session_file() {
+        let tail = "─ Worked for 1m 50s ─────────────────────────────
+
+
+› Run /review on my current changes
+
+  gpt-5.6-sol high · ~/projects/devs/opensource/xhshub";
+        let (s, reason) = infer_status(&pane("cx_proj_1a2b3c4d"), tail, false, Some(1.0));
+        assert_eq!(s, PaneStatus::Idle, "{reason}");
+    }
+
+    #[test]
+    fn codex_working_spinner_still_beats_ready_prompt_text() {
+        let tail = "• Working (4s • esc to interrupt) · /ps to view
+
+
+› Improve documentation in @filename
+
+  gpt-5.5 high · ~/projects/devs/opensource/amux";
+        let mut p = pane("cx_proj_1a2b3c4d");
+        p.title = "⠏ amux".into();
+        let (s, reason) = infer_status(&p, tail, true, Some(600.0));
+        assert_eq!(s, PaneStatus::Running, "{reason}");
+    }
+
+    #[test]
+    fn stale_codex_working_line_does_not_beat_ready_prompt() {
+        let tail = "• Working (6s • esc to interrupt) · 1 background terminal running · /ps to view\n\n\n› Improve documentation in @filename\n\n  gpt-5.5 high · ~/projects/devs/opensource/amux";
+        let mut p = pane("cx_proj_1a2b3c4d");
+        p.title = "amux".into();
+        let (s, reason) = infer_status(&p, tail, false, Some(0.1));
+        assert_eq!(s, PaneStatus::Idle, "{reason}");
+    }
+
+    #[test]
     fn fresh_session_file_means_running() {
         let (s, _) = infer_status(&pane("cx_proj_1a2b3c4d"), "", false, Some(2.0));
         assert_eq!(s, PaneStatus::Running);
+    }
+
+    #[test]
+    fn stale_running_hook_yields_to_non_running_inference() {
+        let old = chrono::Utc::now().timestamp() - RUNNING_HOOK_GRACE_SECS - 5;
+        assert!(running_hook_is_stale(Some(old), &PaneStatus::Idle));
+        assert!(running_hook_is_stale(None, &PaneStatus::Done));
+
+        let fresh = chrono::Utc::now().timestamp();
+        assert!(!running_hook_is_stale(Some(fresh), &PaneStatus::Idle));
+        assert!(!running_hook_is_stale(Some(old), &PaneStatus::Running));
     }
 
     #[test]
@@ -6575,6 +6994,11 @@ mod tests {
         // the two markers must be on the SAME line, not merely both present
         assert!(!agent_actively_working(
             "done… (earlier)\n❯ \nsubagent used 2.2k tokens)"
+        ));
+        // Claude's completed task summary also has an elapsed time and token
+        // count, but starts with a plain bullet, not the live spinner glyph.
+        assert!(!agent_actively_working(
+            "· Handling the dead github_token_shared… (3m 16s · ↓ 6.9k tokens)\n❯\n-- INSERT --"
         ));
         // a finished / idle pane must NOT read as working
         assert!(!agent_actively_working(
