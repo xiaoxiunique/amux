@@ -17,3 +17,6 @@ key.properties
 keystore.properties
 *_session.json
 *_cookies.json
+
+# serena 工具目录（含本地 project.yml）
+.serena/
