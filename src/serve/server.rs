@@ -1513,11 +1513,19 @@ fn infer_status(
         return (PaneStatus::Running, "agent reports active work".to_string());
     }
 
+    // Codex renders its composer and model footer only when it is ready for the
+    // next message, so their presence is authoritative: whatever the previous
+    // turn printed — including a genuine "error: …" line — stays on screen
+    // above it, and the failure scan below would latch the pane as Failed for
+    // as long as it sits quiet. (The same latch the live-spinner check above
+    // was added to fix.)
+    let codex_ready = is_codex_pane(pane, tail) && codex_ready_prompt_present(tail);
+
     // A crash or an on-screen prompt at the bottom of the pane needs the user's
     // attention and takes priority even over active work — check these first,
     // but only against `prompt_zone` so scrollback that merely mentions the
     // words doesn't trip them.
-    if contains_any(
+    if !codex_ready && contains_any(
         &prompt_zone,
         &[
             "failed",
@@ -1563,7 +1571,7 @@ fn infer_status(
     // Codex's idle composer is a stronger stop signal than a freshly touched
     // rollout file: the file can be written right as the turn ends, but the
     // visible `›` prompt means the agent is ready for the next message.
-    if is_codex_pane(pane, tail) && codex_ready_prompt_present(tail) {
+    if codex_ready {
         return (
             PaneStatus::Idle,
             "codex prompt is ready — waiting for you".to_string(),
@@ -6790,6 +6798,34 @@ mod tests {
             Some(1.0),
         );
         assert_eq!(s, PaneStatus::Failed);
+    }
+
+    /// A codex pane sitting at its composer is Idle even when the previous turn
+    /// left a failure on screen: the error stays visible above the composer, so
+    /// the keyword scan used to latch the pane as Failed for as long as it sat
+    /// quiet. Real tail from a social-controller session.
+    #[test]
+    fn codex_ready_prompt_beats_a_lingering_error() {
+        let tail = "■ unexpected status 401 Unauthorized: API keys are not supported by this\n\
+             endpoint., url: http://127.0.0.1:4202/_codex-router/…/v1/responses,\n\
+             auth error: 401, auth error code: api_key_not_supported\n\n\
+             › Write tests for @filename\n\n\
+             \x20 gpt-5.6-sol high · ~/projects/devs/opensource/social-controller";
+        let (s, reason) = infer_status(&pane("cx_social-controller_a5073ae8"), tail, false, None);
+        assert_eq!(s, PaneStatus::Idle, "{reason}");
+    }
+
+    /// A dsh pane is an agent pane, not an anonymous `node` process: quiet at
+    /// its composer it is Idle, never Running "node is active".
+    #[test]
+    fn dsh_pane_is_idle_at_its_composer() {
+        let tail = "  ╭────────────────────────────────────────╮\n\
+             \x20 ❯                                        \n\
+             \x20 ╰────────────────────────────────────────╯\n\
+             \x20  deepseek-v4.1-flash · max · cache 91.1% · qzapps   ctx 5.6% (15k/262k)";
+        let (s, reason) = infer_status(&pane("dsh_qzapps_65b8ae58"), tail, false, None);
+        assert_eq!(s, PaneStatus::Idle, "{reason}");
+        assert!(!reason.contains("node is active"), "{reason}");
     }
 
     /// A working agent must not be reported as Waiting/Failed because of text
